@@ -172,7 +172,7 @@ function accountAgentIds(acc) {
   return ids.filter((id) => S.agents.has(id));          // the Switchboard desk is not shown as an agent
 }
 function accountHint(acc) {
-  return [KIND_LABEL[acc.kind] || acc.kind, acc.auth === 'key' ? 'API key' : 'login', acc.kind === 'api' ? acc.model : ''].filter(Boolean).join(' · ');
+  return [KIND_LABEL[acc.kind] || acc.kind, { key: 'API key', none: 'no key' }[acc.auth] || 'login', acc.kind === 'api' ? acc.model : ''].filter(Boolean).join(' · ');
 }
 function modelList(acc) { return 'models-' + (acc && acc.kind === 'api' ? 'acct-' + acc.name : (acc ? acc.kind : 'claude')); }
 function lsJSON(k) { try { return JSON.parse(lsGet(k) || 'null'); } catch (e) { return null; } }
@@ -256,7 +256,7 @@ function poolPanel() {
     el,
     update(acc) {
       setText(name, acc.name); setText(kind, KIND_LABEL[acc.kind] || acc.kind);
-      const n = [acc.auth === 'key' ? 'API key' : 'login', acc.model].filter(Boolean).join(' · ');
+      const n = [{ key: 'API key', none: 'no key' }[acc.auth] || 'login', acc.model].filter(Boolean).join(' · ');
       setText(note, n); setAttr(note, 'title', acc.label || n);
       const ids = accountAgentIds(acc);
       ags.sync(ids); none.hidden = ids.length > 0;

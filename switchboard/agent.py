@@ -345,7 +345,9 @@ class Agent:
         except ImportError:
             pass
         host = re.sub(r"^https?://", "", self.base).split("/")[0]
-        print(f"{BOLD}Switchboard agent{RESET} {DIM}· {self.model or 'no model set'} · {host} · {self.cwd}{RESET}")
+        home = os.path.expanduser("~")
+        where = "~" + self.cwd[len(home):] if self.cwd == home or self.cwd.startswith(home + os.sep) else self.cwd
+        print(f"{BOLD}Switchboard agent{RESET} {DIM}· {self.model or 'no model set'} · {host} · {where}{RESET}")
         print(f"{DIM}/model <name> · /auto (stop asking before commands) · /clear · /exit · Ctrl+C stops a turn{RESET}")
         if len(self.messages) > 1:
             print(f"{DIM}resumed session {self.sid} ({len(self.messages) - 1} messages){RESET}")

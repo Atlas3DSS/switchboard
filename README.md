@@ -6,6 +6,8 @@ Switchboard runs your agents (Claude Code, Codex, Gemini CLI, or its own built-i
 API) as real terminals in your browser, grouped by project. Agents can message each other, read each other's
 context on demand, and ask you questions without you juggling a dozen terminal tabs.
 
+![Overview: the Switchboard chat, your accounts, and project cards with their agents](docs/screenshots/overview.png)
+
 - **Bring the subscriptions and keys you already have.** Claude Pro/Max, ChatGPT Plus/Pro, a Google account,
   Anthropic / OpenAI / Gemini / OpenRouter API keys, or any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio,
   a company gateway). A setup page asks what you have the first time you open it.
@@ -22,6 +24,14 @@ context on demand, and ask you questions without you juggling a dozen terminal t
 
 Everything stays on your machine: the hub listens on `127.0.0.1` only and keeps its state in
 `~/.local/state/switchboard`.
+
+| A project with two agents side by side | First-run setup |
+|---|---|
+| ![Two agent terminals on one project, each on a different account and model](docs/screenshots/project.png) | ![Setup page: subscriptions detected on this machine, plus an Ollama endpoint tested and an OpenRouter key being added](docs/screenshots/setup.png) |
+
+| Agents ask you things in the Inbox |
+|---|
+| ![Inbox: an agent's question with one-click answers](docs/screenshots/inbox.png) |
 
 ## Quick start
 
@@ -108,7 +118,8 @@ sessions.
 | `~/switchboard-projects/` | default parent folder for new projects (change it in Setup) |
 
 Environment overrides: `SB_PORT` (8802), `SB_CONFIG`, `SB_STATE`, `SB_WORKSPACE`, `SB_HUB` (for `sb`),
-`SB_ALLOWED_HOSTS` (extra `host:port` names to accept, e.g. behind a reverse proxy).
+`SB_ALLOWED_HOSTS` (extra `host:port` names to accept, e.g. behind a reverse proxy), `SB_DISCOVER=0` (don't list
+Claude / Codex sessions that were started outside Switchboard).
 
 ## Security
 

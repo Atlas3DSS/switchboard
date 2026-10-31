@@ -25,7 +25,7 @@ def accounts():
     out = []
     for a in config.accounts():
         out.append({"name": a["name"], "kind": a["kind"], "label": a.get("label") or "", "model": a.get("model"),
-                    "auth": "key" if a.get("api_key") else "login", "base_url": a.get("base_url"),
+                    "auth": "key" if a.get("api_key") else ("none" if a["kind"] == "api" else "login"), "base_url": a.get("base_url"),
                     "config_dir": os.path.expanduser(a.get("config_dir") or "")})
     return out
 

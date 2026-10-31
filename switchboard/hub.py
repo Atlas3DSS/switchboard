@@ -512,6 +512,8 @@ class Hub:
             self.s.set_agent(a["id"], **upd)
 
     def start(self):
+        if os.environ.get("SB_DISCOVER") == "0":  # do not list Claude/Codex sessions started outside Switchboard
+            self.sync_observed = lambda: None
         for fn, every in ((self.refresh_usage, 30), (self.delivery, 1.5), (self.sync_observed, 8), (self.probe_sources, 60),
                           (self.terminal_tick, 1.0), (self.refresh_replies, 5), (self.index_sessions, 120)):
             threading.Thread(target=self.loop, args=(fn, every), daemon=True).start()
