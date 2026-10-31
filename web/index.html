@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Switchboard</title>
+  <link rel="icon" type="image/svg+xml" href="logo.svg">
+  <link rel="stylesheet" href="vendor/xterm.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar" id="topbar">
+    <a class="brand" href="#/" aria-label="Switchboard overview">
+      <img src="logo.svg" alt="" width="28" height="28">
+      <span>Switchboard</span>
+    </a>
+    <span class="tb-sum" id="tb-sum"></span>
+    <button class="pbtn" id="tb-inbox" type="button" title="What agents need from you (sb ask, sb notify)">Inbox </button>
+    <button class="pbtn" id="tb-setup" type="button" title="Your AI subscriptions and API keys">Setup</button>
+    <button class="pbtn" id="tb-shell" type="button" title="Open a plain shell (for example to log in to a CLI)">Shell</button>
+    <button class="pbtn" id="tb-restart" type="button" title="Restart the Switchboard hub on the code on disk (terminals keep running)">Restart</button>
+    <span class="conn" id="conn" title="Connection to the hub"><i class="conn-dot"></i><span>connecting</span></span>
+  </header>
+  <div class="stale-banner" id="stale-banner" hidden><span id="stale-text"></span>
+    <button class="btn small" id="stale-restart" type="button">Restart now</button></div>
+  <main class="app" id="app"><p class="muted pad">Loading…</p></main>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  <noscript><p class="pad">Switchboard needs JavaScript.</p></noscript>
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="setup.js"></script>
+  <script src="inbox.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

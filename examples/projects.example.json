@@ -1,0 +1,16 @@
+[
+ {
+  "id": "webapp",
+  "name": "Web app",
+  "goal": "Ship the checkout redesign",
+  "next_step": "Finish the payment form and its tests",
+  "match": {"cwd": ["~/code/webapp"]},
+  "sources": [
+   {"kind": "git", "path": "~/code/webapp", "label": "repo"},
+   {"kind": "file", "path": "~/code/webapp/STATUS.md", "label": "status notes"},
+   {"kind": "recent", "path": "~/code/webapp", "label": "recently changed"},
+   {"kind": "cmd", "path": "cd ~/code/webapp && npm test --silent 2>&1 | tail -3", "label": "tests"},
+   {"kind": "url", "path": "http://127.0.0.1:3000/health", "label": "dev server"}
+  ]
+ }
+]

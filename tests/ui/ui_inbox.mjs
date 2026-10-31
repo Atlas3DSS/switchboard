@@ -1,0 +1,30 @@
+// Inbox in the top bar: `sb ask` decisions are answered in place, `sb notify` pages can be dismissed.
+// Run against a test-mode hub (SB_BASE, default :8899; see README "Tests").
+import { launch, reporter, sleep } from './lib.mjs';
+const BASE = process.env.SB_BASE || 'http://127.0.0.1:8899';
+const post = async (p, body) => (await fetch(BASE + '/api' + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+const b = await launch(); const { check, done } = reporter();
+const tag = Date.now();
+const d = await post('/decisions', { project: 'switchboard', agent: 'fake-2', question: `ship it ${tag}?`, options: ['yes', 'no'] });
+await post('/notifications', { agent: 'fake-1', text: `build finished ${tag}`, level: 'info' });
+await b.view(1300, 900);
+await b.go(BASE + '/', 2500);
+await sleep(4500);
+check('inbox count shows', /\d/.test(await b.ev(`document.querySelector('#tb-inbox .ib-n').textContent`)));
+check('a question makes the inbox button stand out', await b.ev(`document.querySelector('#tb-inbox').classList.contains('alert')`));
+await b.ev(`document.querySelector('#tb-inbox').click()`);
+await sleep(300);
+const txt = await b.ev(`document.querySelector('.ib-panel').textContent`);
+check('question and page listed', txt.includes(`ship it ${tag}?`) && txt.includes(`build finished ${tag}`), txt.slice(0, 160));
+await b.shot('inbox.png');
+await b.ev(`[...document.querySelectorAll('.ib-item')].find((e) => e.textContent.includes(${JSON.stringify(`ship it ${tag}?`)})).querySelector('button').click()`);
+await sleep(1500);
+const dec = (await (await fetch(BASE + '/api/projects/switchboard')).json()).decisions.find((x) => x.id === d.id);
+check('answering a question records the answer', dec && dec.state === 'answered' && dec.answer === 'yes', JSON.stringify(dec && dec.state));
+const msgs = (await (await fetch(BASE + '/api/messages?agent=fake-2&limit=5')).json()).messages;
+check('the answer goes to the asking agent', msgs.some((m) => m.body.includes(`ship it ${tag}?`) && m.body.includes('yes')));
+await b.ev(`[...document.querySelectorAll('.ib-item')].find((e) => e.textContent.includes(${JSON.stringify(`build finished ${tag}`)})).querySelector('.ib-acts button:last-child').click()`);
+await sleep(800);
+check('dismiss removes the page', !(await b.ev(`document.querySelector('.ib-panel').textContent`)).includes(`build finished ${tag}`));
+done(b);
+b.close();

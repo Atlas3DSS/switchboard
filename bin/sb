@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""sb — talk to the switchboard hub (127.0.0.1:8802; SB_HUB overrides).
+
+  sb setup                          tell Switchboard which AI subscriptions / API keys you have (or use the web page)
+  sb agents                         list agents and their state
+  sb projects                       list projects
+  sb send <agent|project> "text"     type into that terminal exactly once (project -> its lead); --wait prints the reply
+  sb dispatch <project> "task"      start a new agent on a project with this task
+  sb sessions ["words"] [--all]     search past Claude/Codex sessions (the owner's asks, titles, folders)
+  sb resume <session-id>            make a past session an agent (reuses its agent; new project if none fits)
+  sb clear [agent]                  start the Switchboard chat (or another headless agent) over
+  sb context [agent] [--n N]        your project's agents (last ask/reply) + shared notes; or one agent's recent talk
+  sb context --search "words"       search every conversation on your project
+  sb note "text"                    leave a short note for the other agents on your project
+  sb summon <agent> "task" [--fork] side agent beside <agent> (--fork: a copy of its whole conversation)
+  sb ask "question" [--options a,b] file a decision for the owner on your project
+  sb notify "text" [--info]         put a note in the owner's Switchboard inbox (--info: FYI, no action needed)
+  sb reply <turn> "text"            answer a pane pointer you received
+  sb status <message-id>            show one message
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+HUB = os.environ.get("SB_HUB", "http://127.0.0.1:8802")
+
+
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(HUB + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error")
+        except ValueError:
+            msg = str(e)
+        sys.exit(f"sb: {msg}")
+    except urllib.error.URLError as e:
+        sys.exit(f"sb: hub not reachable at {HUB} ({e.reason}); is switchboard.service running?")
+
+
+def me():
+    if os.environ.get("SB_AGENT"):
+        return os.environ["SB_AGENT"]
+    pane = os.environ.get("TMUX_PANE")
+    if pane:
+        try:
+            name = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{session_name}"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+            if name:
+                return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "owner"
+
+
+def ask(q, default=""):
+    try:
+        v = input(f"{q}{f' [{default}]' if default else ''}: ").strip()
+    except EOFError:
+        sys.exit(1)
+    return v or default
+
+
+def yes(q, default=True):
+    a = ask(q + (" (Y/n)" if default else " (y/N)")).lower()
+    return a.startswith("y") if a else default
+
+
+def setup():
+    """The setup page as questions in the terminal. Saves through the hub when it runs, else writes the file."""
+    import getpass
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    from switchboard import config
+    det = config.detect()
+    print("Switchboard setup: which AI subscriptions and API keys do you have?")
+    if config.accounts():
+        print("(This replaces your current accounts: " + ", ".join(a["name"] for a in config.accounts()) +
+              ". To change one, use the Setup page instead.)")
+    print()
+    accounts = []
+    subs = [("claude", "claude", "Anthropic: Claude Pro/Max subscription (Claude Code)", "claude, then /login"),
+            ("codex", "chatgpt", "OpenAI: ChatGPT subscription (Codex CLI)", "codex login"),
+            ("gemini", "gemini", "Google: Google account (Gemini CLI)", "gemini, then Login with Google")]
+    for kind, name, label, login in subs:
+        c = det["clis"][kind]
+        state = ("logged in" if c["logged_in"] else "installed, not logged in") if c["installed"] else "not installed"
+        if yes(f"Use {label}? [{state}]", default=c["logged_in"]):
+            accounts.append({"name": name, "kind": kind, "label": label})
+            if not c["installed"]:
+                print(f"  install it: {c['install']}")
+            if not c["logged_in"]:
+                print(f"  then log in once: {login}")
+    presets = list(config.PRESETS)
+    while True:
+        print("\nAdd an API key? " + "  ".join(f"{i + 1}) {config.PRESETS[p]['label']}" for i, p in enumerate(presets)))
+        pick = ask("number, or Enter to finish")
+        if not pick:
+            break
+        if not pick.isdigit() or not 1 <= int(pick) <= len(presets):
+            continue
+        preset = presets[int(pick) - 1]
+        p = config.PRESETS[preset]
+        base = p["base_url"] or ask("Base URL (for example http://localhost:11434/v1)")
+        env = p["env"]
+        key = ""
+        if env and os.environ.get(env) and yes(f"Use the key in ${env}?"):
+            key = os.environ[env]
+        if not key:
+            key = getpass.getpass(f"API key{' (blank if none)' if preset == 'custom' else ''} (hidden): ").strip()
+        r = config.test_api({"preset": preset, "base_url": base, "api_key": key})
+        models = r.get("models") or p["models"]
+        if models:
+            print(f"  {len(models)} models: " + ", ".join(models[:30]) + (" …" if len(models) > 30 else ""))
+        elif not r["ok"]:
+            print(f"  could not list models: {r.get('error')}")
+        model = ask("Model", models[0] if len(models) == 1 or preset == "anthropic" else "")
+        r = config.test_api({"preset": preset, "base_url": base, "api_key": key, "model": model})
+        print("  works" if r["ok"] else f"  test failed: {r.get('error')} (saved anyway; fix it later on the setup page)")
+        kind = "api"
+        cli = {"anthropic": "claude", "openai": "codex", "google": "gemini"}.get(preset)
+        if cli and det["clis"][cli]["installed"] and not yes(f"Run it on Switchboard's built-in agent? (no = {cli} CLI)"):
+            kind = cli
+        name = config.slug(ask("Name for this account", {"custom": "local"}.get(preset, preset + "-api")))
+        a = {"name": name, "kind": kind, "label": p["label"], "api_key": key, "model": model}
+        if kind == "api":
+            a.update(preset=preset, base_url=base, models=models)
+        accounts.append(a)
+    if not accounts:
+        print("Nothing chosen; nothing saved.")
+        return 1
+    ws = ask("\nFolder for project folders", config.load().get("workspace") or config.DEFAULT_WORKSPACE)
+    body = {"accounts": accounts, "workspace": ws}
+    try:
+        call("GET", "/api/overview")
+    except SystemExit:
+        config.set_accounts(accounts, ws)
+        print(f"Saved to {config.PATH}. Start Switchboard (./install.sh) and open {HUB}/")
+        return 0
+    call("POST", "/api/setup", body)
+    print(f"Saved. Open {HUB}/ , add a project, then '+ Agent' on its card.")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("setup")
+    sub.add_parser("agents")
+    sub.add_parser("projects")
+    s = sub.add_parser("send")
+    s.add_argument("to")
+    s.add_argument("text", nargs="?", help="message text; '-' or omitted reads stdin")
+    s.add_argument("--from", dest="frm")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=int, default=3600)
+    d = sub.add_parser("dispatch")
+    d.add_argument("project")
+    d.add_argument("task")
+    d.add_argument("--cwd")
+    d.add_argument("--title")
+    d.add_argument("--model")
+    d.add_argument("--idem")
+    ss = sub.add_parser("sessions")
+    ss.add_argument("query", nargs="*")
+    ss.add_argument("--limit", type=int, default=15)
+    ss.add_argument("--all", action="store_true", help="include headless claude -p / codex exec runs")
+    rs = sub.add_parser("resume")
+    rs.add_argument("session_id")
+    rs.add_argument("--project")
+    rs.add_argument("--title")
+    cl = sub.add_parser("clear")
+    cl.add_argument("agent", nargs="?", default="desk")
+    cx = sub.add_parser("context")
+    cx.add_argument("agent", nargs="?")
+    cx.add_argument("--project")
+    cx.add_argument("--n", type=int, default=12)
+    cx.add_argument("--tools", action="store_true")
+    cx.add_argument("--search")
+    no = sub.add_parser("note")
+    no.add_argument("text")
+    no.add_argument("--project")
+    sm = sub.add_parser("summon")
+    sm.add_argument("agent")
+    sm.add_argument("task")
+    sm.add_argument("--fork", action="store_true")
+    sm.add_argument("--model")
+    sm.add_argument("--title")
+    nt = sub.add_parser("notify")
+    nt.add_argument("text")
+    nt.add_argument("--info", action="store_true")
+    a = sub.add_parser("ask")
+    a.add_argument("question")
+    a.add_argument("--options", default="")
+    a.add_argument("--project")
+    r = sub.add_parser("reply")
+    r.add_argument("turn")
+    r.add_argument("text")
+    st = sub.add_parser("status")
+    st.add_argument("id")
+    args = ap.parse_args()
+    if args.cmd == "setup":
+        return setup()
+
+    if args.cmd == "agents":
+        for x in call("GET", "/api/agents")["agents"]:
+            print(f"{x['id']:<28} {x['state']:<9} {x['provider']}/{x['account'] or '-':<8} {x['mode']:<9} "
+                  f"{x['project'] or '-':<18} {(x['last_text'] or '').splitlines()[-1][:60] if x['last_text'] else ''}")
+    elif args.cmd == "projects":
+        for p in call("GET", "/api/overview")["projects"]:
+            print(f"{p['id']:<22} {len(p['agent_ids'])} agents  {p['next_step'][:80]}")
+    elif args.cmd == "send":
+        text = args.text if args.text not in (None, "-") else sys.stdin.read()
+        sender = args.frm or me()
+        res = call("POST", "/api/messages", {"to": args.to, "body": text, "from": sender,
+                                             "idem": os.environ.get("SB_IDEM") or str(uuid.uuid4()),
+                                             "wait": args.wait,
+                                             "hop": int(os.environ.get("SB_HOP", "-1")) + 1})
+        m = res["message"]
+        print(f"{m['id']} {m['state']}{' (already sent — not sent again)' if res['duplicate'] else ''}")
+        if args.wait:
+            end = time.time() + args.timeout
+            while time.time() < end:
+                m = call("GET", f"/api/messages/{m['id']}")
+                if m["state"] in ("done", "failed", "held"):
+                    print(m["state"])
+                    print(m.get("reply") or m.get("error") or "")
+                    return 0 if m["state"] == "done" else 1
+                time.sleep(3)
+            print("still running; check later with: sb status " + m["id"])
+            return 2
+    elif args.cmd == "dispatch":
+        res = call("POST", "/api/dispatch", {"project": args.project, "task": args.task, "cwd": args.cwd,
+                                             "title": args.title, "model": args.model, "from": me(),
+                                             "idem": args.idem or str(uuid.uuid4())})
+        a = res["agent"]
+        print(f"{a['id']} on {a['project']} ({a['model']}, {a['account']})"
+              f"{' (already dispatched — not started again)' if res['duplicate'] else ''}")
+    elif args.cmd == "sessions":
+        q = urllib.parse.urlencode({"q": " ".join(args.query), "limit": args.limit, "headless": int(args.all)})
+        res = call("GET", f"/api/sessions?{q}")
+        for x in res["sessions"]:
+            where = f"agent {x['agent']}" if x["agent"] else (f"-> {x['project']}" if x["project"] else "-> new project")
+            what = " ".join((x["title"] or x["first_ask"] or "").split())[:60]
+            print(f"{x['id']}  {x['provider']:<6} {(x['last_ts'] or '')[:10]}  {what:<60}  {x['cwd']}  [{where}]")
+            if x.get("snippet"):
+                print(f"    {' '.join(x['snippet'].split())[:150]}")
+        if not res["sessions"]:
+            print(f"no match among {res['indexed']} sessions" + (" (still indexing)" if res["indexing"] else ""))
+    elif args.cmd == "resume":
+        res = call("POST", "/api/sessions/resume", {"session_id": args.session_id, "project": args.project,
+                                                     "title": args.title})
+        a = res["agent"]
+        how = "already an agent" if not res["created"] else (
+            "new agent on new project" if res["created_project"] else "new agent")
+        print(f"{a['id']} on {a['project']} ({how}); open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "clear":
+        a = call("POST", f"/api/agents/{args.agent}/clear", {})
+        print(f"{a['id']} cleared; its next message starts a new conversation")
+    elif args.cmd == "context":
+        q = {"from": me()}
+        if args.agent:
+            q.update(n=args.n, tools=int(args.tools))
+            print(call("GET", f"/api/agents/{args.agent}/context?{urllib.parse.urlencode(q)}")["text"])
+            return 0
+        if args.search:
+            q["q"] = args.search
+        base = f"/api/projects/{args.project}/context" if args.project else "/api/context"
+        res = call("GET", f"{base}?{urllib.parse.urlencode(q)}")
+        if args.search:
+            for x in res["hits"]:
+                print(f"[{(x['ts'] or '')[:16]}] {x['agent']} {'ASKED' if x['role'] == 'user' else 'SAID'}: {x['text']}")
+            if not res["hits"]:
+                print(f"nothing on project {res['project']} mentions that")
+            return 0
+        print(f"PROJECT {res['project']}")
+        for a in res["agents"]:
+            fork = f", fork of {a['forked_from']}" if a["forked_from"] else ""
+            print(f"\n{a['id']}{' (you)' if a['you'] else ''} - {a['title']} ({a['provider']} {a['model'] or ''}, "
+                  f"{a['state']}{fork})")
+            if a["asked"]:
+                print(f"  last asked: {a['asked']}")
+            if a["said"]:
+                print(f"  last said:  {a['said']}")
+        if res["notes"]:
+            print("\nNOTES")
+            for n in res["notes"]:
+                print(f"  [{n['created_at'][:16]}] {n['agent']}: {n['text']}")
+    elif args.cmd == "note":
+        call("POST", "/api/notes", {"text": args.text, "from": me(), "project": args.project})
+        print("noted for the project's agents")
+    elif args.cmd == "summon":
+        res = call("POST", "/api/summon", {"beside": args.agent, "task": args.task, "fork": args.fork,
+                                           "model": args.model, "title": args.title, "from": me(),
+                                           "idem": str(uuid.uuid4())})
+        a = res["agent"]
+        print(f"{a['id']} on {a['project']}{' (forked)' if res['forked'] else ''}; open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "notify":
+        n = call("POST", "/api/notifications", {"agent": me(), "text": args.text, "level": "info" if args.info else "need"})
+        print(f"{n['id']} in the owner's Switchboard inbox")
+    elif args.cmd == "ask":
+        opts = [o.strip() for o in args.options.split(",") if o.strip()]
+        d = call("POST", "/api/decisions", {"agent": me(), "project": args.project, "question": args.question,
+                                            "options": opts})
+        print(f"{d['id']} filed for the owner; the answer arrives as a message to {me()}")
+    elif args.cmd == "reply":
+        call("POST", "/api/reply", {"turn": args.turn, "body": args.text})
+        print("reply recorded")
+    elif args.cmd == "status":
+        print(json.dumps(call("GET", f"/api/messages/{args.id}"), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
