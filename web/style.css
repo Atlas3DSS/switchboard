@@ -78,6 +78,11 @@ pre { margin: 0; font: 12px/1.4 var(--mono); white-space: pre-wrap; word-break: 
 .brand:hover { text-decoration: none; }
 .brand img { display: block; }
 .tb-sum { font-size: 12.5px; color: #aab3b7; margin-left: auto; }
+@media (max-width: 600px) {  /* phone: logo only, no summary, buttons wrap instead of running off the screen */
+  .topbar { gap: 8px; flex-wrap: wrap; row-gap: 6px; }
+  .brand span, .tb-sum { display: none; }
+  .tb-sum + * { margin-left: auto; }
+}
 .stale-banner {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   background: var(--warn-bg); color: var(--warn); border-bottom: 1px solid var(--warn); padding: 6px 18px; font-size: 13.5px;
@@ -327,6 +332,17 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 @media (max-width: 900px) { .side { display: none; } .pv-goal { display: none; } }
 
 /* toasts */
+.ph-dlg { width: min(92vw, 420px); padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); color: var(--ink); }
+.ph-dlg::backdrop { background: rgba(0, 0, 0, .45); }
+.ph-h { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.ph-status { margin: 0 0 10px; }
+.ph-addr { display: grid; gap: 4px; margin-bottom: 10px; font-size: 12.5px; color: var(--muted); }
+.ph-addr[hidden] { display: none; }
+.ph-addr input { font: inherit; font-size: 14px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--ink); }
+.ph-qr { background: #fff; padding: 8px; border-radius: 8px; width: min(100%, 280px); margin: 4px auto 8px; }
+.ph-qr svg { display: block; width: 100%; height: auto; }
+.ph-note { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; }
+.ph-actions { display: flex; gap: 8px; }
 .toasts { position: fixed; right: 14px; bottom: 14px; display: grid; gap: 8px; z-index: 50; max-width: min(92vw, 380px); }
 .toast {
   background: #222629; color: #f3f5f4; padding: 8px 12px; border-radius: 8px; font-size: 13px;
@@ -365,6 +381,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .cm-note { font-style: italic; }
 .cm.failed .cm-note { color: var(--danger); font-style: normal; }
 .cm.me .cm-body { padding: 3px 8px; border-left: 2px solid var(--line); color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.cm.peer .cm-who { color: var(--warn); }
+.cm.peer .cm-body { border-left-color: var(--warn); }
 .cm.pending .cm-body { opacity: .7; }
 .cm-text p { margin: 2px 0 4px; word-break: break-word; }
 .cm-text ul, .cm-text ol { margin: 2px 0 4px; padding-left: 20px; }

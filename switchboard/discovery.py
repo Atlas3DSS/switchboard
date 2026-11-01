@@ -133,8 +133,9 @@ _path_cache = {}
 
 
 def transcript_format(provider):
-    """Which transcript parser reads this provider: the built-in agent writes Claude-format lines."""
-    return {"claude": "claude", "api": "claude", "codex": "codex"}.get(provider)
+    """Which transcript parser reads this provider: the built-in agent writes Claude-format lines; Hermes sessions
+    are rows in its state.db (switchboard/hermes.py)."""
+    return {"claude": "claude", "api": "claude", "codex": "codex", "hermes": "hermes"}.get(provider)
 
 
 def api_transcript(session_id):
@@ -152,6 +153,12 @@ def transcript_path(provider, session_id):
         return codex_rollout(session_id)
     if provider == "api":
         return api_transcript(session_id)
+    if provider == "hermes":  # a session in Hermes' state.db: hermes:<db>#<id>
+        from . import hermes
+        for d in [a["config_dir"] for a in accounts() if a["kind"] == "hermes" and a["config_dir"]] + [None]:
+            p = hermes.path_for(session_id, d)
+            if p:
+                return p
     return None
 
 
@@ -177,6 +184,68 @@ def codex_rollout(thread_id):
         _path_cache[("x", thread_id)] = hits[-1]
         return hits[-1]
     return None
+
+
+def claude_project_roots():
+    """Every Claude transcript root (the default one, each account's, test roots), each real directory once."""
+    roots = [CLAUDE_PROJECTS] + [os.path.join(a["config_dir"], "projects") for a in accounts()
+                                 if a["kind"] == "claude" and a["config_dir"]] + EXTRA_PROJECTS
+    seen, out = set(), []
+    for r in roots:
+        real = os.path.realpath(r)
+        if real not in seen and os.path.isdir(real):
+            seen.add(real)
+            out.append(r)
+    return out
+
+
+def subagents(hours=72, model=None):
+    """Subagents Claude sessions started with the Agent tool (<session>/subagents/agent-*.jsonl) and touched in
+    the last `hours`, newest first. `model` keeps those whose model alias or actual model contains it."""
+    from .store import iso_from_epoch
+    cutoff = time.time() - hours * 3600
+    out = []
+    for root in claude_project_roots():
+        for path in glob.glob(os.path.join(root, "*", "*", "subagents", "agent-*.jsonl")):
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            try:
+                meta = json.load(open(path[:-len(".jsonl")] + ".meta.json"))
+            except (OSError, ValueError):
+                meta = {}
+            first, used = {}, None
+            try:
+                with open(path, errors="replace") as f:
+                    for i, line in enumerate(f):
+                        if i == 0 or '"type":"assistant"' in line:
+                            e = json.loads(line)
+                            if i == 0:
+                                first = e
+                            else:
+                                used = (e.get("message") or {}).get("model")
+                                if used and not used.startswith("<"):
+                                    break
+                                used = None
+                        if i > 400:
+                            break
+            except (OSError, ValueError):
+                pass
+            alias = meta.get("model") or ""
+            if model and model.lower() not in f"{alias} {used or ''}".lower():
+                continue
+            out.append({"id": os.path.basename(path)[len("agent-"):-len(".jsonl")],
+                        "model": used or alias or None, "alias": alias or None,
+                        "type": meta.get("agentType"), "description": meta.get("description") or "",
+                        "finished": meta.get("finished"), "background": meta.get("requestShape") == "background",
+                        "parent_session": first.get("sessionId") or os.path.basename(os.path.dirname(os.path.dirname(path))),
+                        "cwd": first.get("cwd"), "started_at": first.get("timestamp"),
+                        "updated_at": iso_from_epoch(mtime), "_m": mtime})
+    out.sort(key=lambda x: -x.pop("_m"))
+    return out
 
 
 def recent_codex_rollouts(days=7):
@@ -227,6 +296,9 @@ def _text(content):
 
 def last_assistant_text(path, provider):
     """Last assistant text in a transcript (Claude jsonl or Codex rollout)."""
+    if provider == "hermes":
+        from . import transcript
+        return transcript.last_reply(path, provider)[0]
     for line in reversed(_tail_lines(path)):
         try:
             e = json.loads(line)
@@ -250,6 +322,9 @@ def last_assistant_text(path, provider):
 
 def last_model(path, provider):
     """Model of the newest main-thread reply (Claude) or turn (Codex): follows /model switches made in the TUI."""
+    if provider == "hermes":
+        from . import hermes
+        return hermes.last_model(path)
     from .transcript import _reverse_lines
     for line in _reverse_lines(path, 16 << 20):
         if provider != "codex":  # Claude and built-in agent transcripts share a format
@@ -273,6 +348,9 @@ def last_model(path, provider):
 
 def transcript_has_user_text(path, provider, needle, since_epoch):
     """True if a user turn containing `needle` was written to the transcript after since_epoch."""
+    if provider == "hermes":
+        from . import hermes
+        return hermes.has_user_text(path, needle, since_epoch)
     from .store import epoch
     from .transcript import _reverse_lines
     needle = " ".join(needle.split())[:80]

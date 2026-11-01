@@ -65,7 +65,15 @@ ROUTER_NOTE = (
     "SIDE AGENTS: when the owner wants a side question or task handled beside a working agent without disturbing it "
     "(\"btw, ask a copy of the api agent…\", \"summon a helper for the web agent\"), run `sb summon <agent> \"<task>\" --fork` "
     "once (drop --fork for a fresh agent that pulls context only when needed) and reply with the [[open:…]] it "
-    "prints.")
+    "prints.\n\n"
+    "RELAUNCH: when the owner wants an agent restarted or relaunched, or running on another model (\"relaunch the "
+    "api agent on opus\", \"put the web agent on sonnet\"), run `sb relaunch <agent> --model <model>` once (--effort "
+    "<level> for reasoning effort; no flag restarts it as is). It exits the CLI and starts it again on the same "
+    "conversation. If it answers that the agent is working, ask the owner whether to interrupt it; on yes, run it "
+    "again with --confirm. Other CLI flags cannot be set this way; say so.\n\n"
+    "SUBAGENTS: when the owner asks which agent spawned a subagent, or what subagents ran and on which model (\"who "
+    "spawned that haiku agent\"), run `sb subagents` (--model haiku, --hours N, --agent <id>) and answer from it: "
+    "the agent (or past session) that spawned it, its description and when, linked as [[open:<project-id>/<agent-id>]].")
 
 
 def turn_command(agent, prompt_file, first_turn, images=()):

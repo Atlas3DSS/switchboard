@@ -2,5 +2,6 @@ Vendored browser builds (no CDN at runtime). Fetched 2026-10-30 with `npm pack` 
 
   @xterm/xterm      6.0.0   lib/xterm.js (UMD, sets window.Terminal), css/xterm.css   MIT (LICENSE.xterm)
   @xterm/addon-fit  0.11.0  lib/addon-fit.js (UMD, sets window.FitAddon.FitAddon)    MIT
+  qrcode-generator  1.4.4   qrcode.js (sets window.qrcode; phone pairing code)          MIT (header)
 
 To update: npm pack @xterm/xterm @xterm/addon-fit; copy the same three files over these.

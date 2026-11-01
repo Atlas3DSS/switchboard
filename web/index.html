@@ -19,6 +19,7 @@
     <button class="pbtn" id="tb-inbox" type="button" title="What agents need from you (sb ask, sb notify)">Inbox </button>
     <button class="pbtn" id="tb-setup" type="button" title="Your AI subscriptions and API keys">Setup</button>
     <button class="pbtn" id="tb-shell" type="button" title="Open a plain shell (for example to log in to a CLI)">Shell</button>
+    <button class="pbtn" id="tb-phone" type="button" title="Pair your phone so it can open Switchboard from anywhere" hidden>Phone</button>
     <button class="pbtn" id="tb-restart" type="button" title="Restart the Switchboard hub on the code on disk (terminals keep running)">Restart</button>
     <span class="conn" id="conn" title="Connection to the hub"><i class="conn-dot"></i><span>connecting</span></span>
   </header>
@@ -29,6 +30,7 @@
   <noscript><p class="pad">Switchboard needs JavaScript.</p></noscript>
   <script src="vendor/xterm.js"></script>
   <script src="vendor/addon-fit.js"></script>
+  <script src="vendor/qrcode.js"></script>
   <script src="setup.js"></script>
   <script src="inbox.js"></script>
   <script src="app.js"></script>

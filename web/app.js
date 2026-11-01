@@ -107,11 +107,19 @@ async function openShell(pid) {
   } catch (e) { alert('Could not open a shell: ' + (e.message || e)); }
 }
 
+/* true if the hub answers HTTP at all (any status); false while it is down or restarting */
+async function hubAnswers() {
+  try { await fetch('/', { method: 'HEAD', cache: 'no-store' }); return true; } catch (e) { return false; }
+}
+
 async function api(method, path, body, raw) {
   const opt = { method, cache: 'no-store', headers: {} };
   if (raw) { opt.headers['Content-Type'] = raw.type || 'application/octet-stream'; opt.body = raw; }
   else if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch('/api' + path, opt);
+  if (r.status === 401 && r.headers.get('X-Gate')) {  // phone session ended: the gate signs this phone in again
+    location.href = '/gate/?next=' + encodeURIComponent(location.pathname + location.search + location.hash);
+  }
   const txt = await r.text();
   let data = null;
   try { data = txt ? JSON.parse(txt) : null; } catch (e) { /* non-JSON */ }
@@ -154,8 +162,8 @@ const S = { ov: null, agents: new Map(), projects: new Map(), accounts: [], desk
 window.__sbTerms = {};
 
 /* model suggestions for the CLIs; API accounts suggest the models their endpoint listed during setup */
-const MODEL_HINTS = { claude: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'], codex: [], gemini: [] };
-const KIND_LABEL = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI', api: 'built-in agent', shell: 'shell' };
+const MODEL_HINTS = { claude: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'], codex: [], gemini: [], hermes: [] };
+const KIND_LABEL = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI', hermes: 'Hermes Agent', api: 'built-in agent', shell: 'shell' };
 const STATE_WORD = { busy: 'working', idle: 'idle', starting: 'starting', stopped: 'stopped' };
 
 const agentName = (a) => (a && (a.title || a.id)) || '';
@@ -332,10 +340,13 @@ function chatEntry() {
   return {
     el,
     update(e) {
-      setCls(el, 'cm ' + (e.role === 'user' ? 'me' : 'sb') + (e.pending ? ' pending' : '') + (e.failed ? ' failed' : ''));
-      setText(who, e.role === 'user' ? 'you' : 'switchboard');
+      const byAgent = e.role === 'user' && e.from && e.from !== 'owner';  // another agent wrote it (sb send)
+      const peer = byAgent ? S.agents.get(e.from) : null;
+      setCls(el, 'cm ' + (e.role !== 'user' ? 'sb' : byAgent ? 'me peer' : 'me') + (e.pending ? ' pending' : '') + (e.failed ? ' failed' : ''));
+      setText(who, e.role !== 'user' ? 'switchboard' : byAgent ? (peer ? agentName(peer) : e.from) : 'you');
+      setAttr(who, 'title', byAgent ? `agent ${e.from}${peer ? ' · ' + projName(peer.project) : ''}` : '');
       setText(when, ago(e.ts)); setAttr(when, 'title', absTime(e.ts));
-      setText(note, e.note || '');
+      setText(note, e.note || (e.reply ? 'reply' : ''));
       const s = e.text + '|' + S.agents.size;
       if (s !== sig) { sig = s; body.replaceChildren(e.role === 'user' ? h('div', { class: 'cm-text', text: e.text }) : renderChatText(e.text)); }
     },
@@ -367,12 +378,12 @@ function makeChat() {
     const pend = [];
     for (const m of msgs) {
       if (inTranscript(m.body)) continue;
-      if (m.state === 'queued' || m.state === 'delivering') pend.push({ key: 'm' + m.id, role: 'user', text: m.body, ts: m.created_at, pending: true, note: m.state === 'queued' ? 'queued' : 'sent' });
-      else if (m.state === 'failed' && parseTime(m.created_at) > Date.now() + clockSkew - 30 * 60e3) pend.push({ key: 'm' + m.id, role: 'user', text: m.body, ts: m.created_at, failed: true, note: 'failed: ' + (m.error || 'not delivered') });
+      if (m.state === 'queued' || m.state === 'delivering') pend.push({ key: 'm' + m.id, role: 'user', from: m.from, text: m.body, ts: m.created_at, pending: true, note: m.state === 'queued' ? 'queued' : 'sent' });
+      else if (m.state === 'failed' && parseTime(m.created_at) > Date.now() + clockSkew - 30 * 60e3) pend.push({ key: 'm' + m.id, role: 'user', from: m.from, text: m.body, ts: m.created_at, failed: true, note: 'failed: ' + (m.error || 'not delivered') });
     }
     for (const o of optimistic) if (!pend.some((p) => p.key === 'm' + o.id) && !inTranscript(o.body)) pend.push({ key: 'm' + o.id, role: 'user', text: o.body, ts: o.ts, pending: true, note: 'sending' });
     const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
-    const all = entries.filter((e) => e.role === 'user' || e.role === 'assistant').map((e) => ({ ...e, key: 'e' + e.id })).concat(pend);
+    const all = entries.filter((e) => e.role === 'user' || e.role === 'assistant').map((e) => ({ ...e, key: 'e' + e.id + (e.part ? '.' + e.part : '') })).concat(pend);
     list.sync(all);
     const d = S.desk;
     empty.hidden = all.length > 0 || !loaded || !d;
@@ -827,17 +838,21 @@ function makePane(idx, pid, view) {
       try { m = JSON.parse(ev.data); } catch (e) { return; }
       onStatus(m);
     };
-    sock.onclose = () => {
+    sock.onclose = async () => {
       if (sock !== ws) return;
       ws = null;
       if (!visible || halted || killed) { setConn(''); return; }
-      if (!opened && ++refused >= 2) {   // refused before opening (404 / no such route / hub down): say so, stop
+      // A hub that does not answer at all is restarting: keep trying. Only a hub that answers and still turns the
+      // terminal away (404 / no such route) counts as a refusal.
+      const down = !opened && !(await hubAnswers());
+      if (ws || !visible || halted || killed) return;   // reconnected or closed while we asked
+      if (!opened && !down && ++refused >= 2) {
         halted = true; setConn('refused');
         showOverlay('offline', 'The hub refused this terminal twice, so it stopped retrying. If a red banner says the hub is running old code, restart switchboard.service first.', 'Retry', () => { refused = 0; reconnect(); });
         return;
       }
-      const delay = Math.min(10000, 400 * 2 ** retry++);
-      setConn('reconnecting…');
+      const delay = Math.min(down ? 2000 : 10000, 400 * 2 ** retry++);
+      setConn(down ? 'hub restarting…' : 'reconnecting…');
       retryTimer = setTimeout(connect, delay);
     };
   }
@@ -1310,6 +1325,65 @@ async function restartHub() {
 }
 $('#tb-restart').addEventListener('click', restartHub);
 $('#stale-restart').addEventListener('click', restartHub);
+
+/* ---------- phone: pair exactly one phone through the gate (only from this computer; the gate refuses /api/phone) ---------- */
+function phoneDialog() {
+  const status = h('p', { class: 'ph-status' });
+  const addr = h('input', { type: 'url', placeholder: 'https://sb.example.com', 'aria-label': 'Phone address', autocomplete: 'off' });
+  const addrRow = h('label', { class: 'ph-addr' }, h('span', { text: 'Address the phone opens' }), addr);
+  const pairBtn = h('button', { class: 'btn primary', type: 'button', text: 'Pair a phone' });
+  const unpairBtn = h('button', { class: 'btn', type: 'button', text: 'Unpair' });
+  const qr = h('div', { class: 'ph-qr', hidden: true });
+  const qrNote = h('p', { class: 'ph-note', hidden: true });
+  const closeBtn = h('button', { class: 'pbtn', type: 'button', text: '✕', title: 'Close' });
+  const dlg = h('dialog', { class: 'ph-dlg', 'aria-label': 'Phone' },
+    h('div', { class: 'ph-h' }, h('strong', { text: 'Phone' }), h('span', { class: 'spacer' }), closeBtn),
+    status, addrRow, qr, qrNote, h('div', { class: 'ph-actions' }, pairBtn, unpairBtn));
+  let countdown = null;
+  const stopQr = () => { clearInterval(countdown); qr.hidden = true; qrNote.hidden = true; qr.replaceChildren(); };
+  async function refresh() {
+    const st = await api('GET', '/phone');
+    setText(status, st.paired ? `Paired ${ago(st.paired_at)} · ${st.sessions ? 'signed in' : 'not signed in now'}. Pairing again replaces it.` : 'No phone is paired.');
+    setAttr(status, 'title', st.browser || '');
+    addr.value = addr.value || st.origin || '';
+    addrRow.hidden = !!st.origin && !addrRow.dataset.edit;
+    setText(pairBtn, st.paired ? 'Pair a new phone' : 'Pair a phone');
+    unpairBtn.hidden = !st.paired;
+    return st;
+  }
+  status.addEventListener('dblclick', () => { addrRow.dataset.edit = '1'; addrRow.hidden = false; });
+  pairBtn.addEventListener('click', async () => {
+    try {
+      const st = await api('POST', '/phone/pair', addrRow.hidden ? {} : { origin: addr.value.trim() });
+      const q = window.qrcode(0, 'M'); q.addData(st.url); q.make();
+      qr.innerHTML = q.createSvgTag({ cellSize: 6, margin: 4, scalable: true });
+      qr.hidden = false; qrNote.hidden = false; addrRow.hidden = true; delete addrRow.dataset.edit;
+      const end = Date.now() + st.expires_in * 1000;
+      const tick = () => {
+        const s = Math.max(0, Math.round((end - Date.now()) / 1000));
+        setText(qrNote, s ? `Scan with the phone's camera within ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}. The code works once. On iPhone, then tap Share → Add to Home Screen and open it from there (Safari clears sites you don't visit for a week).` : 'This code expired. Make a new one.');
+        if (!s) { clearInterval(countdown); qr.replaceChildren(); }
+      };
+      clearInterval(countdown); tick(); countdown = setInterval(tick, 1000);
+      const was = st.paired_at;
+      const wait = setInterval(async () => {  // close the code once the phone has paired
+        if (!dlg.open) return clearInterval(wait);
+        const now2 = await refresh().catch(() => null);
+        if (now2 && now2.paired && now2.paired_at !== was) { clearInterval(wait); stopQr(); toast('Phone paired'); }
+      }, 2000);
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  unpairBtn.addEventListener('click', async () => {
+    if (!confirm('Unpair the phone? It is signed out at once and needs a new code to get back in.')) return;
+    try { await api('POST', '/phone/unpair', {}); stopQr(); await refresh(); toast('Phone unpaired'); } catch (e) { toast(e.message, 'err'); }
+  });
+  closeBtn.addEventListener('click', () => dlg.close());
+  dlg.addEventListener('close', () => { stopQr(); dlg.remove(); });
+  document.body.append(dlg);
+  refresh().then(() => dlg.showModal()).catch((e) => { dlg.remove(); toast(e.message, 'err'); });
+}
+api('GET', '/phone').then(() => { $('#tb-phone').hidden = false; }).catch(() => {});  // hidden on the phone itself
+$('#tb-phone').addEventListener('click', phoneDialog);
 
 /* ---------- routing + polling ---------- */
 function parseRoute() {

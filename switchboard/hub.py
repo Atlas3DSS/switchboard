@@ -12,7 +12,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import config, discovery, sessions, shared, sources, transcript, ws
+from . import config, discovery, phone, sessions, shared, sources, transcript, ws
 from .runner import Runner
 from .terminals import PROVIDERS, NeedsConfirm, Terminals
 from .store import STATE, Store, epoch, iso_from_epoch, new_id, now, save_upload, upload_path
@@ -303,6 +303,50 @@ class Hub:
         return {"sessions": [self.session_view(x) for x in self.ix.search(q, limit, headless)],
                 "indexed": self.ix.count(), "indexing": self.ix.busy}
 
+    def subagents(self, hours=72, model=None, agent=None, limit=20):
+        """Subagents (Claude's Agent/Task tool) started recently, newest first, each with the agent or past
+        session that spawned it."""
+        parents = {}
+        if agent:
+            a = self.s.agent(agent)
+            if not a:
+                raise LookupError(agent)
+            if not a["session_id"]:
+                return {"subagents": []}
+        out = []
+        for x in discovery.subagents(hours, model):
+            sid = x["parent_session"]
+            if agent and sid != a["session_id"]:
+                continue
+            if sid not in parents:
+                row = self.s.one("SELECT id, project FROM agents WHERE session_id=? ORDER BY gone LIMIT 1", (sid,))
+                sess = None if row or self.ix.busy else self.ix.find(sid)  # never wait on a full re-index
+                parents[sid] = {"agent": row["id"] if row else None, "project": row["project"] if row else None,
+                                "session_title": (sess or {}).get("title") or (sess or {}).get("first_ask") or ""}
+            out.append({**x, **parents[sid]})
+            if len(out) >= limit:
+                break
+        return {"subagents": out}
+
+    def relaunch(self, aid, b):
+        """Restart an agent's CLI on the same session, optionally with another model or effort
+        (like `codex --model X`). A headless agent takes them on its next turn."""
+        a = self.s.agent(aid)
+        if not a:
+            raise LookupError(aid)
+        if a.get("role") == "desk" or a["provider"] not in PROVIDERS or a["provider"] == "shell":
+            raise ValueError("only agent CLIs can be relaunched (not the Switchboard chat or a shell)")
+        upd = {k: (b[k] or None) for k in ("model", "effort") if k in b}
+        if a["mode"] == "managed":
+            self.s.set_agent(aid, **upd)
+            self.s.event(aid, "system", "settings for the next turn: " + (", ".join(f"{k} {v}" for k, v in upd.items())
+                                                                           or "unchanged"))
+        elif a["mode"] == "terminal":
+            self.t.relaunch(aid, upd, bool(b.get("confirm")))
+        else:
+            raise ValueError("this agent runs in a tmux pane the switchboard does not own; adopt it first")
+        return self.agent_view(self.s.agent(aid))
+
     def resume_session(self, b):
         """Make a past session an agent (or find the agent it already is). With no matching project, a new
         project is made for it."""
@@ -422,7 +466,7 @@ class Hub:
         starts fresh and pulls the source's context with `sb context` when it needs it."""
         src = self.s.agent(b.get("beside") or "")
         task = (b.get("task") or "").strip()
-        if not src or src["gone"] or src["provider"] not in ("claude", "codex", "api", "gemini"):
+        if not src or src["gone"] or src["provider"] not in ("claude", "codex", "api", "gemini", "hermes"):
             raise ValueError("beside must be an agent (not a shell)")
         if not task:
             raise ValueError("task is required")
@@ -1020,6 +1064,11 @@ def make_handler(hub):
                     return 200, hub.notifications()
                 if path == "/api/setup":
                     return 200, hub.setup_view()
+                if path == "/api/phone":  # never reachable through the gate (it refuses /api/phone*)
+                    return 200, phone.status()
+                if path == "/api/subagents":
+                    return 200, hub.subagents(max(1, min(float(qs.get("hours", 72)), 24 * 60)), qs.get("model"),
+                                              qs.get("agent"), max(1, min(int(qs.get("limit", 20)), 200)))
                 if path == "/api/sessions":
                     return 200, hub.search_sessions(qs.get("q", ""), int(qs.get("limit", 30)),
                                                     qs.get("headless") in ("1", "true"))
@@ -1050,10 +1099,18 @@ def make_handler(hub):
                     p = discovery.transcript_path(a["provider"], a["session_id"])
                     chat = transcript.read_chat(p, a["provider"], int(qs.get("limit", 40)),
                                                 qs.get("before"), qs.get("after"))
+                    out = []
                     for ent in chat["entries"]:
                         n = ent.pop("n_images", 0)
                         ent["images"] = [{"url": f"/api/agents/{a['id']}/image?entry={ent['id']}&n={k}"}
                                          for k in range(n)]
+                        if ent["role"] != "user":
+                            out.append(ent)
+                            continue
+                        for k, (frm, reply, text) in enumerate(transcript.senders(ent["text"])):  # who said it
+                            out.append({**ent, "text": text, "from": frm, "reply": reply, "part": k,
+                                        "images": ent["images"] if k == 0 else []})
+                    chat["entries"] = out
                     return 200, chat
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/image", path)
                 if m:
@@ -1174,6 +1231,19 @@ def make_handler(hub):
                             cur[prov] = name
                         hub.s.set_setting("default_account", cur)
                     return 200, {"default_account": hub.default_accounts()}
+                if path == "/api/phone/pair":  # a one-time code for the QR (from this computer only)
+                    if b.get("origin"):
+                        phone.set_origin(b["origin"])
+                    if not phone.origin():
+                        raise ValueError("set the phone address first (https://<your hostname>)")
+                    token, ttl = phone.new_pairing()
+                    return 200, {"url": f"{phone.origin()}/gate/#pair={token}", "expires_in": ttl, **phone.status()}
+                if path == "/api/phone/unpair":
+                    phone.unpair()
+                    return 200, phone.status()
+                m = re.fullmatch(r"/api/agents/([\w.-]+)/relaunch", path)
+                if m:
+                    return 200, hub.relaunch(m.group(1), b)
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/(start|stop|account)", path)
                 if m:
                     aid, act = m.groups()

@@ -9,10 +9,12 @@ const SUBS = [
     login: 'codex login' },
   { kind: 'gemini', vendor: 'Google', plan: 'Google account (free tier or Google AI plan)', cli: 'Gemini CLI', name: 'gemini',
     login: 'gemini   (then choose "Login with Google")' },
+  { kind: 'hermes', vendor: 'Nous Research', plan: 'Hermes Agent, with the models and providers in its own config', cli: 'Hermes Agent', name: 'hermes',
+    login: 'hermes setup' },
 ];
 /* API presets that a vendor CLI can also run with the same key */
 const CLI_FOR_PRESET = { anthropic: 'claude', openai: 'codex', google: 'gemini' };
-const CLI_NAME = { claude: 'Claude Code', codex: 'Codex CLI', gemini: 'Gemini CLI' };
+const CLI_NAME = { claude: 'Claude Code', codex: 'Codex CLI', gemini: 'Gemini CLI', hermes: 'Hermes Agent' };
 
 function setupView() {
   let data = null;
@@ -145,7 +147,7 @@ function setupView() {
 
   function refreshRouter() {
     const cur = router.value || (data && data.router_account);
-    const opts = collect().filter((a) => a.kind !== 'gemini' && a.name);
+    const opts = collect().filter((a) => a.kind !== 'gemini' && a.kind !== 'hermes' && a.name);
     router.replaceChildren(...(opts.length ? opts.map((a) => h('option', { value: a.name, text: `${a.name} (${a.kind === 'api' ? 'built-in agent' : CLI_NAME[a.kind]})` }))
       : [h('option', { value: '', text: 'add a Claude, ChatGPT or API account first' })]));
     if (opts.some((a) => a.name === cur)) router.value = cur;

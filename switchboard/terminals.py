@@ -3,13 +3,16 @@ process. The hub keeps one connection per running holder: it mirrors the screen 
 whether the composer is empty, fans the output out to browser WebSockets, and types `sb send` messages in exactly
 once, confirming each one from the session transcript.
 """
+import fcntl
 import json
 import os
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -22,10 +25,25 @@ from .vtscreen import Screen
 PTY_DIR = os.path.join(STATE, "pty")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIRM_S = 180  # a typed message must show up in the transcript within this long
+
+
+def cli_size(pid):
+    """(cols, rows) of the CLI's own terminal, or None. Read from the pty it has as stdin."""
+    try:
+        fd = os.open(f"/proc/{int(pid)}/fd/0", os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        rows, cols = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return (cols, rows) if cols > 1 and rows > 1 else None
 EXIT_WAIT_S = 30
 
 
-PROVIDERS = ("claude", "codex", "gemini", "api", "shell")
+PROVIDERS = ("claude", "codex", "gemini", "hermes", "api", "shell")
 SB_BIN = os.path.join(ROOT, "bin")
 
 
@@ -53,6 +71,15 @@ def launch_argv(agent):
         if agent.get("permission_mode") in ("auto", "bypassPermissions"):
             argv += ["--auto"]
         return argv + ["--append-system-prompt", shared.launch_note(agent)]
+    if agent["provider"] == "hermes":  # the note travels in HERMES_EPHEMERAL_SYSTEM_PROMPT (launch_env)
+        argv = [cli_bin("hermes"), "chat"] + (["--resume", agent["session_id"]] if agent.get("session_id") else [])
+        if agent.get("model"):
+            argv += ["-m", agent["model"]]
+        if agent.get("effort"):
+            argv += ["--reasoning", agent["effort"]]
+        if agent.get("permission_mode") in ("auto", "bypassPermissions"):
+            argv += ["--yolo"]
+        return argv
     if agent["provider"] == "gemini":
         argv = [cli_bin("gemini")]
         if agent.get("model"):
@@ -105,6 +132,8 @@ def launch_env(agent):
     if agent["provider"] == "api":  # the built-in agent writes its transcript under the hub's state dir
         env["PYTHONPATH"] = ROOT + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         env["SB_STATE"] = STATE
+    if agent["provider"] == "hermes":  # Hermes' --append-system-prompt: sent with every call, never stored
+        env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = shared.launch_note(agent)
     return env
 
 
@@ -123,15 +152,21 @@ def processes_with(needle):
     return out
 
 
-BUSY_MARKERS = [
+# A running turn: nothing can be typed in until it ends.
+TURN_MARKERS = [
     (re.compile(r"esc to interrupt", re.I), "a turn is running"),
-    (re.compile(r"\b\d+\s+shells?\b", re.I), "background shells are running"),
-    (re.compile(r"\b\d+\s+(background\s+)?(tasks?|monitors?)\b", re.I), "background tasks are running"),
-    (re.compile(r"^\s*[◯◐●]\s+\S+.*\d+\s*[ms]\b.*tokens", re.M), "subagents are running"),
     (re.compile(r"Waiting for \d+ background", re.I), "waiting on background agents"),
     (re.compile(r"\bWorking\b.*\(\d+s", re.I), "codex is working"),
     (re.compile(r"esc to cancel", re.I), "gemini is working"),
+    (re.compile(r"enter interrupt\b|type to redirect this turn", re.I), "hermes is working"),
 ]
+# Background work under an idle composer: a message may be typed in, but exiting the CLI would kill it.
+BACKGROUND_MARKERS = [
+    (re.compile(r"\b\d+\s+shells?\b", re.I), "background shells are running"),
+    (re.compile(r"\b\d+\s+(background\s+)?(tasks?|monitors?)\b", re.I), "background tasks are running"),
+    (re.compile(r"^\s*[◯◐●]\s+\S+.*\d+\s*[ms]\b.*tokens", re.M), "subagents are running"),
+]
+BUSY_MARKERS = TURN_MARKERS + BACKGROUND_MARKERS
 PLACEHOLDERS = re.compile(r"^(Try \"|Ask Codex|Implement \{|Find and fix|Explain this|Summarize|Write tests|"
                           r"Type your message)")
 
@@ -151,6 +186,7 @@ class Term:
     def __init__(self, aid, state):
         self.aid = aid
         self.state = state
+        self.provider = None
         self.sock = None
         self.lock = threading.RLock()
         self.screen = Screen(120, 40)
@@ -185,20 +221,35 @@ class Term:
         with self.lock:
             return "\n".join(self.screen.lines(dim=False))
 
+    def _composer(self):
+        """(screen lines, index of the composer line or None). Gemini draws its composer in a box: "│ > text │"."""
+        lines = [re.sub(r"^\s*[│┃]\s?(.*?)\s*[│┃]?\s*$", r"\1", l) for l in self.text().splitlines()]
+        return lines, max((i for i, l in enumerate(lines) if re.match(r"^\s*[❯›]\s?", l) or re.match(r"^\s*>\s", l)),
+                          default=None)
+
     def view(self):
-        """(ready, busy, composer text) from the mirrored screen."""
+        """(ready, busy, composer text) from the mirrored screen. busy = a turn is running; background shells and
+        monitors under an idle composer do not count (a message can be typed in), see background()."""
         title = self.screen.title
         if title.startswith("sb:") and title != "sb:idle":  # the built-in agent says when it is working
             return True, True, ""
-        # Gemini draws its composer inside a box: "│ > text │"
-        lines = [re.sub(r"^\s*[│┃]\s?(.*?)\s*[│┃]?\s*$", r"\1", l) for l in self.text().splitlines()]
-        idx = max((i for i, l in enumerate(lines) if re.match(r"^\s*[❯›]\s?", l) or re.match(r"^\s*>\s", l)),
-                  default=None)
+        lines, idx = self._composer()
         if idx is None:
             return False, False, ""
         tail = "\n".join(lines[max(0, idx - 4):])
-        busy = any(rx.search(tail) for rx, _ in BUSY_MARKERS)
-        return True, busy, composer_text("\n".join(lines[:idx + 1]))
+        busy = any(rx.search(tail) for rx, _ in TURN_MARKERS)
+        comp = composer_text("\n".join(lines[:idx + 1]))
+        if comp and self.provider == "hermes":  # Hermes greys a suggestion in after the cursor of an empty composer
+            y, x = self.screen.cursor
+            if y == idx and x <= len(lines[idx]) - len(lines[idx].lstrip()) + 2:
+                comp = ""
+        return True, busy, comp
+
+    def background(self):
+        """True if the footer shows background shells, monitors or subagents, which exiting the CLI would end."""
+        lines, idx = self._composer()
+        tail = "\n".join(lines[max(0, idx - 4):] if idx is not None else lines[-12:])
+        return any(rx.search(tail) for rx, _ in BACKGROUND_MARKERS)
 
 
 class Terminals:
@@ -249,6 +300,13 @@ class Terminals:
         sock.connect(p["sock"])
         t = Term(aid, st)
         t.sock = sock
+        t.provider = (self.s.agent(aid) or {}).get("provider")
+        # mirror at the CLI's real size: a relaunch keeps the old size and a reattached CLI has whatever the browser
+        # set; a 120x40 mirror of a 227x71 screen wraps every line and hides both the footer and the composer
+        old = self.terms.get(aid)
+        size = cli_size(st.get("pid")) or (old.size if old else None)
+        if size:
+            t.size, t.screen = size, Screen(*size)
         with self.lock:
             old = self.terms.get(aid)
             if old:
@@ -391,7 +449,7 @@ class Terminals:
             time.sleep(0.3)
             t.write("exit\r")
         else:
-            t.write("/exit" if agent["provider"] in ("claude", "api") else "/quit")
+            t.write("/exit" if agent["provider"] in ("claude", "api", "hermes") else "/quit")
             time.sleep(0.4)
             t.write("\r")
         for sig, wait in ((None, EXIT_WAIT_S), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
@@ -412,11 +470,11 @@ class Terminals:
         if not t or (self.s.agent(aid) or {}).get("provider") == "shell":
             return False
         ready, busy, comp = t.view()
-        return busy or bool(comp)
+        return busy or bool(comp) or t.background()
 
     def stop(self, aid, confirm=False):
         if self.busy(aid) and not confirm:
-            raise NeedsConfirm("the agent is working (or has unsent text); interrupt and stop it?")
+            raise NeedsConfirm("the agent is working (or has unsent text or background jobs, which stopping ends); interrupt and stop it?")
         threading.Thread(target=self.exit_cli, args=(aid, True), daemon=True).start()
 
     def switch_account(self, aid, account, confirm=False):
@@ -426,7 +484,7 @@ class Terminals:
             self.s.event(aid, "system", f"account set to {account}")
             return
         if self.busy(aid) and not confirm:
-            raise NeedsConfirm("the agent is working (or has unsent text); interrupt it and switch accounts?")
+            raise NeedsConfirm("the agent is working (or has unsent text or background jobs, which a relaunch ends); interrupt it and switch accounts?")
         self.switching[aid] = {"to": account, "note": "exiting the CLI"}
 
         def run():
@@ -442,6 +500,37 @@ class Terminals:
                 self.launch(self.s.agent(aid))
             except Exception as e:
                 self.s.event(aid, "error", f"account switch failed: {e}")
+            finally:
+                self.switching.pop(aid, None)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def relaunch(self, aid, upd, confirm=False):
+        """Exit the CLI and start it again on the same session with upd (model/effort) applied; a stopped
+        terminal just starts with them."""
+        what = ", ".join(f"{k} {v or 'default'}" for k, v in upd.items()) or "same settings"
+        if not self.running(aid):
+            self.s.set_agent(aid, **upd)
+            self.s.event(aid, "system", f"relaunch ({what})")
+            self.launch(self.s.agent(aid))
+            return
+        if self.busy(aid) and not confirm:
+            raise NeedsConfirm("the agent is working (or has unsent text); interrupt it and relaunch?")
+        self.switching[aid] = {"to": upd.get("model") or "relaunch", "note": "exiting the CLI"}
+
+        def run():
+            try:
+                if not self.exit_cli(aid, interrupt=True):
+                    self.switching[aid]["note"] = "the CLI did not exit; relaunch abandoned"
+                    time.sleep(10)
+                    return
+                self.s.set_agent(aid, **upd)
+                self.s.event(aid, "system", f"relaunching the same session ({what})")
+                self.switching[aid]["note"] = "relaunching"
+                time.sleep(0.5)
+                self.launch(self.s.agent(aid))
+            except Exception as e:
+                self.s.event(aid, "error", f"relaunch failed: {e}")
             finally:
                 self.switching.pop(aid, None)
 
@@ -484,6 +573,8 @@ class Terminals:
                     self.s.set_agent(t.aid, **upd)
                     if cur["provider"] == "codex" and not cur.get("session_id"):
                         self._find_codex_thread(cur, t)
+                    elif cur["provider"] == "hermes" and not cur.get("session_id"):
+                        self._find_hermes_session(cur, t)
                     self._check_waiting(t)
             elif self.waiting.pop(t.aid, None) and self.on_waiting:
                 self.on_waiting(t.aid, False)
@@ -616,6 +707,14 @@ class Terminals:
                 if not self.s.one("SELECT 1 n FROM agents WHERE session_id=?", (meta["id"],)):
                     self.s.set_agent(agent["id"], session_id=meta["id"])
                     return
+
+    def _find_hermes_session(self, agent, t):
+        from . import hermes
+        taken = {r["session_id"] for r in self.s.q("SELECT session_id FROM agents WHERE session_id IS NOT NULL")}
+        home = next((a["config_dir"] for a in discovery.accounts() if a["name"] == agent["account"]), None)
+        sid = hermes.new_session(agent["cwd"], t.state.get("started_at") or 0, taken, home or None)
+        if sid:
+            self.s.set_agent(agent["id"], session_id=sid)
 
 
 class NeedsConfirm(Exception):

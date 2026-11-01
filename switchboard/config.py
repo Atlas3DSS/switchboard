@@ -7,6 +7,7 @@ Account kinds (an agent's `provider` is its account's kind):
   claude  Claude Code CLI      a Claude subscription login, or an Anthropic API key
   codex   Codex CLI            a ChatGPT subscription login, or an OpenAI API key
   gemini  Gemini CLI           a Google account login, or a Gemini API key
+  hermes  Hermes Agent         Nous Research's agent, with whatever models and providers its own config has
   api     built-in agent       any OpenAI-compatible endpoint: Anthropic, OpenAI, Google, OpenRouter, Ollama, vLLM, ...
 """
 import json
@@ -19,12 +20,13 @@ import urllib.request
 
 PATH = os.path.expanduser(os.environ.get("SB_CONFIG", "~/.config/switchboard/accounts.json"))
 CONFIG_DIR = os.path.dirname(PATH)
-KINDS = ("claude", "codex", "gemini", "api")
-CLI = {"claude": "claude", "codex": "codex", "gemini": "gemini"}
+KINDS = ("claude", "codex", "gemini", "hermes", "api")
+CLI = {"claude": "claude", "codex": "codex", "gemini": "gemini", "hermes": "hermes"}
 KEY_ENV = {"claude": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
 INSTALL = {"claude": "curl -fsSL https://claude.ai/install.sh | bash",
            "codex": "npm install -g @openai/codex",
-           "gemini": "npm install -g @google/gemini-cli"}
+           "gemini": "npm install -g @google/gemini-cli",
+           "hermes": "see https://github.com/NousResearch/hermes-agent"}
 DEFAULT_WORKSPACE = "~/switchboard-projects"
 
 # OpenAI-compatible endpoints the built-in agent knows out of the box. `models` are suggestions only: the setup page
@@ -179,6 +181,9 @@ def env_for(a, env):
     elif kind == "gemini":
         if a.get("api_key"):
             env["GEMINI_API_KEY"] = a["api_key"]
+    elif kind == "hermes":
+        if a.get("config_dir"):
+            env["HERMES_HOME"] = os.path.expanduser(a["config_dir"])
     elif kind == "api":
         env["SB_API_BASE"] = a.get("base_url") or ""
         env["SB_API_KEY"] = a.get("api_key") or ""
@@ -206,7 +211,8 @@ def detect():
                 version = None
         login = {"claude": _exists("~/.claude/.credentials.json") or _claude_oauth(),
                  "codex": _exists("~/.codex/auth.json"),
-                 "gemini": _exists("~/.gemini/oauth_creds.json", "~/.gemini/google_accounts.json")}[kind]
+                 "gemini": _exists("~/.gemini/oauth_creds.json", "~/.gemini/google_accounts.json"),
+                 "hermes": _exists(os.path.join(os.environ.get("HERMES_HOME") or "~/.hermes", "config.yaml"))}[kind]
         clis[kind] = {"installed": bool(path), "version": version, "logged_in": bool(login), "install": INSTALL[kind]}
     env = {k: bool(os.environ.get(k)) for k in
            ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY")}

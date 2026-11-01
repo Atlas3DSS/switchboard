@@ -124,6 +124,18 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(runner.compose_prompt([{"id": "m1", "from_agent": "owner", "body": "hi", "is_reply": 0}]),
                          "hi")
 
+    def test_chat_shows_who_wrote_each_message(self):
+        from switchboard import transcript
+        p = runner.compose_prompt([{"id": "m1", "from_agent": "owner", "body": "relay this", "is_reply": 0},
+                                   {"id": "m2", "from_agent": "reviewer", "body": "Delivery check\nplease",
+                                    "is_reply": 0},
+                                   {"id": "m3", "from_agent": "agent-3", "body": "done", "is_reply": 1}])
+        self.assertEqual(transcript.senders(p), [(None, False, "relay this"),
+                                                 ("reviewer", False, "Delivery check\nplease"),
+                                                 ("agent-3", True, "done")])
+        self.assertEqual(transcript.senders("[from peer via sb] hello"), [("peer", False, "hello")])
+        self.assertEqual(transcript.senders("open the payroll agent"), [(None, False, "open the payroll agent")])
+
 
 class ScreenViewTests(unittest.TestCase):
     """Term.view(): whether a terminal is ready for a typed message, from its mirrored screen."""

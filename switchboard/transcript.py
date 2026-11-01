@@ -5,11 +5,36 @@ Cursors are byte offsets of transcript lines, so paging is stable while the file
 import base64
 import json
 import os
+import re
 
 BLOCK = 1 << 20
 SKIP_USER_PREFIXES = ("<system-reminder", "<command-", "<local-command", "Caveat:", "# AGENTS.md",
                       "<environment_context", "<user_instructions", "<turn_aborted", "[Request interrupted")
 TEXT_CAP = 30000
+
+
+SENDER = re.compile(r"^\[switchboard message \S+ from (?:the owner|agent ([\w.-]+))( \(reply[^)\]]*\))?\]\n", re.M)
+VIA_SB = re.compile(r"^\[from ([\w.-]+) via sb\] ")
+FOOTER = "\n\n(Your final answer to this turn is delivered back"
+
+
+def senders(text):
+    """Who wrote a user turn: [(agent id, or None for the owner; is a reply; text)]. A headless turn can bundle
+    several messages, each under a "[switchboard message … from …]" header; a terminal gets "[from X via sb] …"."""
+    text = text.split(FOOTER, 1)[0]
+    if text.startswith("[You are agent '") and "]\n\n" in text:  # Codex turns carry the Switchboard note first
+        text = text.split("]\n\n", 1)[1]
+    m = VIA_SB.match(text)
+    if m:
+        return [(m.group(1), False, text[m.end():])]
+    heads = list(SENDER.finditer(text))
+    if not heads:
+        return [(None, False, text)]
+    out = [(None, False, text[:heads[0].start()].strip())] if text[:heads[0].start()].strip() else []
+    for i, h in enumerate(heads):
+        body = text[h.end():heads[i + 1].start() if i + 1 < len(heads) else len(text)].strip()
+        out.append((h.group(1), bool(h.group(2)), body))
+    return out
 
 
 def _claude_entries(e):
@@ -86,6 +111,9 @@ def _codex_entries(e):
 
 
 def _parse(line, provider):
+    if provider == "hermes":
+        from . import hermes
+        return hermes.entries(line)
     if '"type"' not in line:
         return []
     try:
@@ -112,6 +140,9 @@ def _mk(off, k, role, text, ts, n_img=0):
 
 def read_chat(path, provider, limit=40, before=None, after=None):
     """Entries oldest→newest. `before`/`after` are entry ids from an earlier call."""
+    if provider == "hermes" and path:
+        from . import hermes
+        return hermes.read_chat(path, limit, before, after)
     if not path or not os.path.exists(path):
         return {"entries": [], "before": None, "latest": None}
     size = os.path.getsize(path)
@@ -175,7 +206,11 @@ def last_reply(path, provider):
 
 
 def _reverse_lines(path, max_bytes=256 << 20):
-    """Complete lines newest first (bounded)."""
+    """Complete lines newest first (bounded). A Hermes session yields one JSON line per message."""
+    if path.startswith("hermes:"):
+        from . import hermes
+        yield from hermes.lines_newest_first(path)
+        return
     with open(path, "rb") as f:
         f.seek(0, 2)
         pos = f.tell()
@@ -204,6 +239,9 @@ def usage_stats(path, provider, since_epoch):
     tokens_24h counts input + cache writes + output (cache reads excluded: cheap and re-counted every call)."""
     from .store import epoch
     out = {"context_tokens": None, "context_window": None, "tokens_24h": 0, "last_turn": None}
+    if provider == "hermes" and path:
+        from . import hermes
+        return hermes.usage_stats(path, since_epoch)
     if not path or not os.path.exists(path):
         return out
     seen = set()

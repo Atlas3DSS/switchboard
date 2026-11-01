@@ -26,6 +26,8 @@ browser ──HTTP/WebSocket──▶ hub (hub.py) ──unix socket──▶ pt
 | `shared.py` | `sb context` / `sb note`: project-scoped shared context, pulled on demand |
 | `sources.py` | live project sources on the cards: git log, file excerpts, recently changed files, commands, URLs |
 | `store.py` | SQLite (WAL) tables: projects, agents, messages, events, notes, decisions, notifications, settings |
+| `hermes.py` | Hermes Agent sessions: reads `$HERMES_HOME/state.db` (read-only) as if it were a transcript |
+| `gate.py`, `phone.py` | the phone gate: one paired phone in, everything else refused (see [PHONE.md](PHONE.md)) |
 
 ## Accounts and providers
 
@@ -36,11 +38,12 @@ An agent's `provider` is its account's `kind`:
 | `claude` | `claude [--resume ID / --session-id ID] --model M --append-system-prompt NOTE` | Claude session id | the session jsonl |
 | `codex` | `codex [resume ID / fork ID] --model M -c developer_instructions=NOTE` | Codex thread id | the rollout jsonl |
 | `gemini` | `gemini --model M [--yolo]` | — | the screen (input box clears) |
+| `hermes` | `hermes chat [--resume ID] -m M [--reasoning E]`, note in `HERMES_EPHEMERAL_SYSTEM_PROMPT` | Hermes session id (found in `state.db` by folder and start time) | its `messages` rows |
 | `api` | `python3 -m switchboard.agent [--resume ID] --model M --append-system-prompt NOTE` | its own session id | its jsonl (Claude format) |
 
 Account settings reach the CLI as environment: `CLAUDE_CONFIG_DIR` / `ANTHROPIC_API_KEY`, `CODEX_HOME` (an
-API-key Codex account gets its own home, logged in with `codex login --with-api-key`), `GEMINI_API_KEY`, and
-`SB_API_BASE` / `SB_API_KEY` / `SB_API_MODEL` for the built-in agent. Several logins of the same CLI are several
+API-key Codex account gets its own home, logged in with `codex login --with-api-key`), `GEMINI_API_KEY`,
+`HERMES_HOME`, and `SB_API_BASE` / `SB_API_KEY` / `SB_API_MODEL` for the built-in agent. Several logins of the same CLI are several
 accounts with different config dirs; the control bar's account switch exits the CLI and resumes the same session
 under the other account.
 
@@ -49,7 +52,9 @@ under the other account.
 1. `POST /api/messages {to, body, idem}` enqueues it. The same idempotency key, or the same sender + body within
    10 minutes, returns the existing message instead of a second one. Hop limit: 6 agent-to-agent hops.
 2. The terminal loop waits until the agent's screen shows it **idle** with an **empty input box** (for the
-   built-in agent: window title `sb:idle`), then types the text once as a bracketed paste plus Enter.
+   built-in agent: window title `sb:idle`), then types the text once as a bracketed paste plus Enter. Background
+   shells or monitors under an idle input box don't block a message, but stopping, relaunching or switching the
+   agent's account asks first, since exiting the CLI would end them.
 3. The message is `delivered` when the text appears as a user turn in the session transcript, and `done` when a
    reply follows. Nothing is ever retyped; a message not seen within 3 minutes is marked `failed`.
 4. A reply to an agent's message is routed back to the sender once (`Reply from …`); replies never trigger replies.
@@ -66,7 +71,10 @@ POST /api/projects {name, ...}         PATCH /api/projects/<id> {name, goal, nex
 POST /api/agents {project, account, model?, cwd?, title?, session_id?, prompt?}
 PATCH /api/agents/<id> {project?, title?, model?, ...}       DELETE /api/agents/<id>
 POST /api/agents/<id>/start|stop|account|interrupt|clear
-GET  /api/agents/<id>/chat?limit=N     conversation read from the transcript
+POST /api/agents/<id>/relaunch {model?, effort?, confirm?}   exit the CLI, start it again on the same session
+GET  /api/agents/<id>/chat?limit=N     conversation read from the transcript; user turns carry `from` (which agent wrote it)
+GET  /api/subagents?model=&hours=&agent=   recent Claude subagents and the agent or session that spawned each
+GET  /api/phone   POST /api/phone/pair {origin?} | /api/phone/unpair      (never through the gate)
 WS   /ws/agents/<id>                   the terminal: output bytes out; {"t":"i","d":keys} / {"t":"r",cols,rows} in
 POST /api/messages {to, body, from?, idem?, wait?}            GET /api/messages?agent=&state=&limit=
 POST /api/decisions {project, agent, question, options}       POST /api/decisions/<id>/answer {answer}

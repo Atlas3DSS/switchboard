@@ -8,6 +8,11 @@
   sb dispatch <project> "task"      start a new agent on a project with this task
   sb sessions ["words"] [--all]     search past Claude/Codex sessions (the owner's asks, titles, folders)
   sb resume <session-id>            make a past session an agent (reuses its agent; new project if none fits)
+  sb relaunch <agent> [--model M] [--effort E] [--confirm]
+                                    exit an agent's CLI and start it again on the same session with that model
+                                    (--confirm: interrupt it if it is working)
+  sb subagents [--model haiku] [--hours 72] [--agent a]
+                                    recent subagents (Agent tool) and the agent or session that spawned each
   sb clear [agent]                  start the Switchboard chat (or another headless agent) over
   sb context [agent] [--n N]        your project's agents (last ask/reply) + shared notes; or one agent's recent talk
   sb context --search "words"       search every conversation on your project
@@ -91,7 +96,8 @@ def setup():
     accounts = []
     subs = [("claude", "claude", "Anthropic: Claude Pro/Max subscription (Claude Code)", "claude, then /login"),
             ("codex", "chatgpt", "OpenAI: ChatGPT subscription (Codex CLI)", "codex login"),
-            ("gemini", "gemini", "Google: Google account (Gemini CLI)", "gemini, then Login with Google")]
+            ("gemini", "gemini", "Google: Google account (Gemini CLI)", "gemini, then Login with Google"),
+            ("hermes", "hermes", "Nous Research: Hermes Agent (its own models and providers)", "hermes setup")]
     for kind, name, label, login in subs:
         c = det["clis"][kind]
         state = ("logged in" if c["logged_in"] else "installed, not logged in") if c["installed"] else "not installed"
@@ -179,6 +185,16 @@ def main():
     rs.add_argument("session_id")
     rs.add_argument("--project")
     rs.add_argument("--title")
+    rl = sub.add_parser("relaunch")
+    rl.add_argument("agent")
+    rl.add_argument("--model")
+    rl.add_argument("--effort")
+    rl.add_argument("--confirm", action="store_true")
+    sa = sub.add_parser("subagents")
+    sa.add_argument("--model")
+    sa.add_argument("--hours", type=float, default=72)
+    sa.add_argument("--agent")
+    sa.add_argument("--limit", type=int, default=15)
     cl = sub.add_parser("clear")
     cl.add_argument("agent", nargs="?", default="desk")
     cx = sub.add_parser("context")
@@ -264,6 +280,25 @@ def main():
         how = "already an agent" if not res["created"] else (
             "new agent on new project" if res["created_project"] else "new agent")
         print(f"{a['id']} on {a['project']} ({how}); open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "relaunch":
+        b = {k: getattr(args, k) for k in ("model", "effort") if getattr(args, k) is not None}
+        a = call("POST", f"/api/agents/{args.agent}/relaunch", dict(b, confirm=args.confirm))
+        how = "next turn" if a["mode"] == "managed" else "relaunching on the same session"
+        print(f"{a['id']}: {how} (model {b.get('model') or a['model'] or 'default'}); "
+              f"open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "subagents":
+        q = {"hours": args.hours, "limit": args.limit}
+        q.update({k: getattr(args, k) for k in ("model", "agent") if getattr(args, k)})
+        res = call("GET", "/api/subagents?" + urllib.parse.urlencode(q))
+        for x in res["subagents"]:
+            who = (f"agent {x['agent']} ({x['project']})" if x["agent"]
+                   else f"session {x['parent_session'][:8]}" + (f" \"{' '.join(x['session_title'].split())[:50]}\""
+                                                                  if x["session_title"] else ""))
+            state = "done" if x["finished"] else "running?"
+            print(f"{(x['started_at'] or '')[:16].replace('T', ' ')}Z  {x['model'] or '-':<18} {state:<8} "
+                  f"\"{x['description'][:50]}\"  spawned by {who} [session {x['parent_session']}]  {x['cwd'] or ''}")
+        if not res["subagents"]:
+            print(f"no subagents in the last {args.hours:g} h" + (f" matching {args.model}" if args.model else ""))
     elif args.cmd == "clear":
         a = call("POST", f"/api/agents/{args.agent}/clear", {})
         print(f"{a['id']} cleared; its next message starts a new conversation")

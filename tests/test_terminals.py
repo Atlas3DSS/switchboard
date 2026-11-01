@@ -28,7 +28,7 @@ from switchboard.store import Store  # noqa: E402
 discovery.CLAUDE_PROJECTS = os.environ["FAKE_PROJECTS"]
 json.dump({"accounts": [{"name": "one", "kind": "claude", "config_dir": os.path.join(TMP, "cfg-one")},
                          {"name": "two", "kind": "claude", "config_dir": os.path.join(TMP, "cfg-two")},
-                         {"name": "oai", "kind": "codex", "config_dir": os.path.join(TMP, "codex")}]},
+                         {"name": "chatgpt", "kind": "codex", "config_dir": os.path.join(TMP, "codex")}]},
           open(os.environ["SB_CONFIG"], "w"))
 
 
@@ -94,6 +94,7 @@ class TerminalTests(unittest.TestCase):
         self.t = t2m
         t2 = t2m.term(self.aid)
         self.assertIsNotNone(t2)
+        self.assertEqual(t2.size, (100, 30))  # mirror at the CLI's real size, not the 120x40 default
         self.assertTrue(wait_for(lambda: b"ok: hello there" in bytes(t2.buf)))  # scrollback replayed
         t2.write("again\r")
         self.assertTrue(wait_for(lambda: "ok: again" in t2.text()))
@@ -138,7 +139,7 @@ class AccountToggleTests(unittest.TestCase):
         env = terminals.launch_env(a)
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], os.path.join(TMP, "cfg-two"))
         self.assertEqual(env["SB_AGENT"], "x")
-        c = {"id": "y", "provider": "codex", "account": "oai", "session_id": "th-1", "model": None}
+        c = {"id": "y", "provider": "codex", "account": "chatgpt", "session_id": "th-1", "model": None}
         self.assertEqual(terminals.launch_argv(c)[1:3], ["resume", "th-1"])
         self.assertTrue(terminals.launch_argv(c)[4].startswith("developer_instructions=\""))
         self.assertEqual(terminals.launch_env(c)["CODEX_HOME"], os.path.join(TMP, "codex"))
@@ -164,6 +165,118 @@ class AccountToggleTests(unittest.TestCase):
         self.assertEqual(s.agent("sw")["account"], "two")
         self.assertTrue(wait_for(lambda: tm.running("sw") and not tm.switching.get("sw")))
         tm.exit_cli("sw")
+
+
+class BackgroundJobTests(unittest.TestCase):
+    """An agent that finished its turn but left a shell or monitor running takes messages; exiting it needs a
+    confirm (it would end those jobs). Footers as Claude Code and Codex draw them."""
+    def screen(self, *lines):
+        t = terminals.Term("x", {})
+        t.screen.feed("\r\n".join(lines).encode())
+        return t
+
+    def test_idle_with_background_jobs(self):
+        t = self.screen("✻ Baked for 21m 28s · done 10:39 AM · 1 shell, 1 monitor still running", "─" * 40, "❯ ",
+                        "─" * 40, "  ⏵⏵ auto mode on · 1 shell, 1 monitor · ↓ to manage")
+        self.assertEqual(t.view(), (True, False, ""))
+        self.assertTrue(t.background())
+
+    def test_running_turn_and_plain_idle(self):
+        t = self.screen("✶ Pondering… (12s · ↓ 300 tokens · esc to interrupt)", "─" * 40, "❯ ", "─" * 40,
+                        "  ⏵⏵ auto mode on · 1 shell · ↓ to manage")
+        self.assertEqual(t.view()[:2], (True, True))
+        t = self.screen("• Working (8s • esc to interrupt)", "", "› Ask Codex to do anything", "  gpt-6 medium")
+        self.assertTrue(t.view()[1])
+        t = self.screen("done.", "─" * 40, "❯ ", "─" * 40, "  ⏵⏵ auto mode on")
+        self.assertEqual(t.view(), (True, False, ""))
+        self.assertFalse(t.background())
+
+    def test_message_typed_into_idle_agent_with_a_shell(self):
+        s = Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db"))
+        tm = terminals.Terminals(s)
+        s.add_agent({"id": "bg", "project": "p", "title": "x", "provider": "claude", "account": "one",
+                     "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        t = tm.launch(s.agent("bg"))
+        self.assertTrue(wait_for(lambda: t.view()[0]))
+        with t.lock:  # the fake CLI cannot draw Claude's footer: add it to the mirrored screen
+            t.screen.feed("\r\n  ⏵⏵ auto mode on · 1 shell · ↓ to manage".encode())
+        self.assertTrue(t.background())
+        with self.assertRaises(terminals.NeedsConfirm):  # stopping would end the shell
+            tm.stop("bg")
+        s.enqueue("bg", "hello from a peer", frm="peer")
+        time.sleep(2)  # past the 1.5 s settle guard
+        self.assertTrue(t.background())  # still showing the shell when the message goes in
+        tm._deliver_one(s.agent("bg"))
+        self.assertTrue(wait_for(lambda: "[from peer via sb] hello from a peer" in t.text()))
+        tm.exit_cli("bg")
+
+
+class RelaunchTests(unittest.TestCase):
+    def test_relaunch_running_agent_with_model(self):
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": "rl", "project": "p", "title": "x", "provider": "claude", "account": "one",
+                       "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        t = h.t.launch(h.s.agent("rl"))
+        self.assertTrue(wait_for(lambda: t.view()[0]))
+        t.write("hello\r")
+        self.assertTrue(wait_for(lambda: "ok: hello" in t.text() and not t.view()[1]))
+        sid = h.s.agent("rl")["session_id"]
+        t.write("unsent")
+        self.assertTrue(wait_for(lambda: t.view()[2] == "unsent"))
+        with self.assertRaises(terminals.NeedsConfirm):
+            h.relaunch("rl", {"model": "claude-sonnet-5-5"})
+        h.relaunch("rl", {"model": "claude-sonnet-5-5", "confirm": True})
+        self.assertTrue(wait_for(lambda: "claude-sonnet-5-5" in launches()[-1]["argv"], 20))
+        argv = launches()[-1]["argv"]
+        self.assertEqual(argv[1:5], ["--resume", sid, "--model", "claude-sonnet-5-5"])
+        self.assertEqual(h.s.agent("rl")["model"], "claude-sonnet-5-5")
+        self.assertTrue(wait_for(lambda: h.t.running("rl") and not h.t.switching.get("rl")))
+        h.t.exit_cli("rl")
+        h.relaunch("rl", {"model": "claude-opus-5-5"})  # a stopped terminal just starts with it
+        self.assertTrue(wait_for(lambda: "claude-opus-5-5" in launches()[-1]["argv"]))
+        h.t.exit_cli("rl")
+
+    def test_codex_model_and_other_modes(self):
+        c = {"id": "y", "provider": "codex", "account": "chatgpt", "session_id": None, "model": "gpt-6.2"}
+        self.assertEqual(terminals.launch_argv(c)[1:3], ["--model", "gpt-6.2"])
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": "mg", "project": "p", "title": "x", "provider": "codex", "account": "chatgpt",
+                       "mode": "managed", "session_id": None, "cwd": TMP, "state": "idle"})
+        self.assertEqual(h.relaunch("mg", {"model": "gpt-6.2", "effort": "high"})["model"], "gpt-6.2")
+        self.assertEqual(h.s.agent("mg")["effort"], "high")
+        with self.assertRaises(ValueError):
+            h.relaunch("desk", {"model": "claude-haiku-5-5"})
+        with self.assertRaises(LookupError):
+            h.relaunch("nobody", {})
+
+
+class SubagentTests(unittest.TestCase):
+    def test_who_spawned_a_subagent(self):
+        def sub(sid, aid, alias, model, desc):
+            d = os.path.join(os.environ["FAKE_PROJECTS"], "-sub", sid, "subagents")
+            os.makedirs(d, exist_ok=True)
+            rows = [{"type": "user", "sessionId": sid, "agentId": aid, "isSidechain": True, "cwd": "/w",
+                     "timestamp": "2026-11-01T15:14:03.512Z", "message": {"role": "user", "content": "go"}},
+                    {"type": "assistant", "sessionId": sid, "timestamp": "2026-11-01T15:14:05.000Z",
+                     "message": {"model": model, "content": [{"type": "text", "text": "ok"}]}}]
+            with open(os.path.join(d, f"agent-{aid}.jsonl"), "w") as f:
+                f.write("\n".join(json.dumps(r, separators=(",", ":")) for r in rows) + "\n")
+            json.dump({"agentType": "general-purpose", "description": desc, "model": alias, "finished": True},
+                      open(os.path.join(d, f"agent-{aid}.meta.json"), "w"))
+
+        sub("sid-parent", "a1", "haiku", "claude-haiku-5-5", "Lit review")
+        time.sleep(0.02)
+        sub("sid-other", "a2", None, "claude-opus-5-5", "Audit pins")  # model inherited: no alias in meta
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": "research", "project": "neuro", "title": "R", "provider": "claude", "account": "one",
+                       "mode": "terminal", "session_id": "sid-parent", "cwd": TMP, "state": "idle"})
+        got = h.subagents(model="haiku")["subagents"]
+        self.assertEqual([(x["id"], x["agent"], x["project"], x["model"], x["description"]) for x in got],
+                         [("a1", "research", "neuro", "claude-haiku-5-5", "Lit review")])
+        everything = h.subagents()["subagents"]
+        self.assertEqual([x["id"] for x in everything[:2]], ["a2", "a1"])  # newest first
+        self.assertEqual(everything[0]["model"], "claude-opus-5-5")
+        self.assertEqual([x["id"] for x in h.subagents(agent="research")["subagents"]], ["a1"])
 
 
 class SendTests(unittest.TestCase):
