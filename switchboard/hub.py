@@ -12,7 +12,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import config, discovery, hosts, jobs, phone, sessions, shared, sources, transcript, ws
+from . import config, discovery, hosts, inbox, jobs, phone, sessions, shared, sources, transcript, ws
 from .runner import Runner
 from .terminals import PROVIDERS, NeedsConfirm, Terminals
 from .store import STATE, Store, epoch, iso_from_epoch, new_id, now, save_upload, upload_path
@@ -636,7 +636,7 @@ class Hub:
                 "started_at": iso_from_epoch(STARTED_AT)}
         return {"ts": now(), "code": code, "router": "desk" if self.router_account() else None,
                 "setup_needed": not config.configured(), "focus": self.focus, "projects": projects, "agents": agents, "accounts": accts,
-                "fleet": hosts.summary(self), "decisions": self.s.decisions(open_only=True)}
+                "fleet": hosts.summary(self), "inbox": inbox.badge(self), "decisions": self.s.decisions(open_only=True)}
 
     def msg_view(self, m):
         return {"id": m["id"], "to": m["to_agent"], "from": m["from_agent"], "body": m["body"], "state": m["state"],
@@ -1167,6 +1167,8 @@ def make_handler(hub):
                     if not a:
                         raise LookupError(m.group(1))
                     return 200, hub.agent_view(a)
+                if path == "/api/inbox":  # the owner's inbox: open decisions and needs, per project
+                    return 200, inbox.items(hub, qs.get("project") or None)
                 if path == "/api/fleet":  # the inventory: every host, its capacity, jobs, untracked work (docs/FLEET.md)
                     return 200, hosts.fleet_view(hub)
                 if path == "/api/fleet/guards":
@@ -1348,6 +1350,9 @@ def make_handler(hub):
                 m = re.fullmatch(r"/api/decisions/([\w.-]+)/answer", path)
                 if m:
                     return 200, hub.answer(m.group(1), (b.get("answer") or "").strip())
+                m = re.fullmatch(r"/api/inbox/([\w.-]+)/done", path)  # cross one inbox item off (answer, ack or dismiss)
+                if m:
+                    return 200, inbox.done(hub, m.group(1), (b.get("answer") or "").strip() or None, b.get("from") or "owner")
                 if path == "/api/reply":  # observed agent answering a pane pointer: sb reply <turn> "text"
                     turn = b.get("turn")
                     rows = hub.s.q("SELECT * FROM messages WHERE turn_id=?", (turn,))
