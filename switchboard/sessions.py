@@ -13,7 +13,7 @@ import sqlite3
 import threading
 
 from . import discovery
-from .store import STATE, epoch
+from .store import STATE, epoch, private_db, private_dir
 
 DB_PATH = os.path.join(STATE, "sessions.db")
 CODEX_INDEX = os.path.expanduser("~/.codex/session_index.jsonl")
@@ -167,6 +167,8 @@ class Index:
         self.path = path
         self.lock = threading.Lock()
         self.busy = False
+        private_dir(os.path.dirname(path))
+        private_db(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")

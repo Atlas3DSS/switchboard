@@ -4,6 +4,7 @@ Run: python3 -m unittest tests.test_terminals
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -22,6 +23,7 @@ os.environ["FAKE_CLI_LOG"] = os.path.join(TMP, "cli.jsonl")
 os.environ["FAKE_BUSY_S"] = "0.5"
 
 from switchboard import discovery, terminals  # noqa: E402
+from switchboard import hub as hubmod  # noqa: E402
 from switchboard.hub import Hub  # noqa: E402
 from switchboard.store import Store  # noqa: E402
 
@@ -141,7 +143,11 @@ class AccountToggleTests(unittest.TestCase):
         self.assertEqual(env["SB_AGENT"], "x")
         c = {"id": "y", "provider": "codex", "account": "chatgpt", "session_id": "th-1", "model": None}
         self.assertEqual(terminals.launch_argv(c)[1:3], ["resume", "th-1"])
-        self.assertTrue(terminals.launch_argv(c)[4].startswith("developer_instructions=\""))
+        self.assertIn("--no-alt-screen", terminals.launch_argv(c))  # inline, so its tab scrolls
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", terminals.launch_argv(c))  # only if asked
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox",
+                      terminals.launch_argv({**c, "permission_mode": "bypassPermissions"}))
+        self.assertTrue(terminals.launch_argv(c)[-1].startswith("developer_instructions=\""))
         self.assertEqual(terminals.launch_env(c)["CODEX_HOME"], os.path.join(TMP, "codex"))
 
     def test_switch_running_agent(self):
@@ -181,6 +187,20 @@ class BackgroundJobTests(unittest.TestCase):
         self.assertEqual(t.view(), (True, False, ""))
         self.assertTrue(t.background())
 
+    def test_codex_0166_prompt(self):
+        # codex-cli 0.166 draws '» ' with a dim placeholder; an idle Codex must read as ready
+        t = self.screen("  Worked for 41s • 12:30 PM", "", "» \x1b[2mAsk Codex to do anything\x1b[22m", "",
+                        "  gpt-6 high · ~/project · weekly 97% left", "  ? for shortcuts")
+        self.assertEqual(t.view(), (True, False, ""))
+        t = self.screen("» fix the parser", "", "  ? for shortcuts")
+        self.assertEqual(t.view(), (True, False, "fix the parser"))
+
+    def test_waiting_for_background_agents_is_not_a_turn(self):
+        t = self.screen("✻ Waiting for 1 background agent to finish", "─" * 40, "❯ ", "─" * 40,
+                        "  ⏵⏵ auto mode on · 1 shell · ↓ to manage", "  ◯ general-purpose  Rebasing")
+        self.assertEqual(t.view(), (True, False, ""))  # a message can go in; exiting would still ask first
+        self.assertTrue(t.background())
+
     def test_running_turn_and_plain_idle(self):
         t = self.screen("✶ Pondering… (12s · ↓ 300 tokens · esc to interrupt)", "─" * 40, "❯ ", "─" * 40,
                         "  ⏵⏵ auto mode on · 1 shell · ↓ to manage")
@@ -204,6 +224,7 @@ class BackgroundJobTests(unittest.TestCase):
         with self.assertRaises(terminals.NeedsConfirm):  # stopping would end the shell
             tm.stop("bg")
         s.enqueue("bg", "hello from a peer", frm="peer")
+        t.steady_for()  # the hub's tick reads this every second
         time.sleep(2)  # past the 1.5 s settle guard
         self.assertTrue(t.background())  # still showing the shell when the message goes in
         tm._deliver_one(s.agent("bg"))
@@ -331,6 +352,159 @@ class SendTests(unittest.TestCase):
         finally:
             h.t.exit_cli("w1")
 
+    def test_paused_project_holds_typed_messages(self):
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.upsert_project({"id": "held", "name": "Held", "paused": True})
+        h.s.add_agent({"id": "hp", "project": "held", "title": "w", "provider": "claude", "account": "one",
+                       "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        mid = h.send({"to": "hp", "body": "after the pause", "idem": "k-held"})["message"]["id"]
+        try:
+            for _ in range(3):
+                h.t.tick()
+            self.assertFalse(h.t.running("hp"))  # not started, nothing typed
+            self.assertEqual(h.s.message(mid)["state"], "queued")
+            h.s.upsert_project({"id": "held", "paused": False})
+            self.assertTrue(wait_for(lambda: (h.t.tick(), h.s.message(mid)["state"])[1] == "done", 30, 0.3))
+            self.assertEqual(transcript_users(h.s.agent("hp")["session_id"]), ["after the pause"])
+        finally:
+            if h.t.running("hp"):
+                h.t.exit_cli("hp")
+
+
+class QueueTests(unittest.TestCase):
+    """A queue drains on what the CLI shows now: not old words in the scrollback, not a footer that keeps
+    repainting; a real choice holds it (and is never answered for the owner), and the view says why it waits."""
+    def hub_with(self, aid, env=None):
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": aid, "project": "q", "title": aid, "provider": "claude", "account": "one",
+                       "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        old = {k: os.environ.get(k) for k in (env or {})}
+        os.environ.update(env or {})
+        try:
+            h.t.launch(h.s.agent(aid))
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+        self.addCleanup(lambda: h.t.running(aid) and h.t.exit_cli(aid))
+        return h
+
+    def deliver(self, h, aid, body, key, seconds=30):
+        mid = h.send({"to": aid, "body": body, "idem": key})["message"]["id"]
+        wait_for(lambda: (h.t.tick(), h.s.message(mid)["state"])[1] == "done", seconds, 0.3)
+        return h.s.message(mid)
+
+    def test_old_words_in_the_scrollback_do_not_hold_the_queue(self):
+        h = self.hub_with("hist")
+        self.assertEqual(self.deliver(h, "hist", "do you trust this folder? one you trust", "k1")["state"], "done")
+        self.assertIn("trust this folder", h.t.term("hist").text())  # now part of the history on screen
+        self.assertEqual(self.deliver(h, "hist", "next thing", "k2")["state"], "done")
+
+    def test_a_real_choice_holds_the_queue_until_the_owner_answers(self):
+        h = self.hub_with("menu", {"FAKE_TRUST_MENU": "1"})
+        t = h.t.term("menu")
+        self.assertTrue(wait_for(lambda: "trust this folder" in t.text()))
+        mid = h.send({"to": "menu", "body": "after the choice", "idem": "k3"})["message"]["id"]
+        for _ in range(4):
+            h.t.tick()
+            time.sleep(0.6)
+        m = h.s.message(mid)
+        self.assertEqual(m["state"], "queued")
+        self.assertIn("asks whether to trust its folder", m["error"])
+        self.assertEqual(h.agent_view(h.s.agent("menu"))["queue_reason"],
+                         "the CLI asks whether to trust its folder; answer it in the terminal")
+        t.write("\r")  # the owner answers in the terminal
+        self.assertTrue(wait_for(lambda: (h.t.tick(), h.s.message(mid)["state"])[1] == "done", 30, 0.3))
+        self.assertEqual(transcript_users(h.s.agent("menu")["session_id"]), ["after the choice"])
+
+    def test_a_constantly_repainting_idle_screen_still_takes_messages(self):
+        h = self.hub_with("clock", {"FAKE_REPAINT_S": "0.3"})
+        m = self.deliver(h, "clock", "while the clock ticks", "k4")
+        self.assertEqual((m["state"], m["reply"]), ("done", "ok: while the clock ticks"))
+
+    def test_view_says_why_and_since_when(self):
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": "zz", "project": "q", "title": "zz", "provider": "claude", "account": "one",
+                       "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle", "paused": 1})
+        h.send({"to": "zz", "body": "held", "idem": "k5"})
+        h.t.tick()
+        v = h.agent_view(h.s.agent("zz"))
+        self.assertEqual((v["queued"], v["paused"]), (1, True))
+        self.assertIn("paused", v["queue_reason"])
+        self.assertTrue(v["queued_since"])
+
+
+class BatchTests(unittest.TestCase):
+    """Everything waiting for an agent goes in as one attributed batch backed by an owner-only file; an agent busy
+    past the threshold gets one Esc first; each message is answered exactly once."""
+    hub_with = QueueTests.hub_with
+
+    def test_waiting_messages_go_in_as_one_batch(self):
+        h = self.hub_with("bat")
+        t = h.t.term("bat")
+        self.assertTrue(wait_for(lambda: t.view()[0]))
+        ids = [h.send({"to": "bat", "body": f"item {i}: lorem ipsum", "from": f"peer{i}", "idem": f"b{i}"})["message"]["id"]
+               for i in range(3)]
+        self.assertTrue(wait_for(lambda: (h.t.tick(), all(h.s.message(i)["state"] == "done" for i in ids))[1], 30, 0.3))
+        users = transcript_users(h.s.agent("bat")["session_id"])
+        self.assertEqual(len(users), 1)  # typed once, as one batch
+        self.assertTrue(users[0].startswith("[sb batch batch-"))
+        for i in range(3):
+            self.assertIn(f"from peer{i} ({ids[i]})", users[0])
+        replies = {h.s.message(i)["reply"] for i in ids}
+        self.assertEqual(len(replies), 1)  # one reply answers each message once
+        path = re.search(r"in full in (\S+)\]", users[0]).group(1)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        text = open(path).read()
+        for i in range(3):
+            self.assertIn(ids[i], text)
+            self.assertIn(f"item {i}: lorem ipsum", text)
+
+    def test_no_second_esc_after_a_hub_restart(self):
+        s = Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db"))
+        s.add_agent({"id": "w", "project": "q", "title": "w", "provider": "claude", "account": "one",
+                     "mode": "terminal", "session_id": None, "cwd": TMP, "state": "busy"})
+        mid = s.enqueue("w", "old news", frm="peer")[0]["id"]
+        s.x("UPDATE messages SET created_at=? WHERE id=?", ("2026-01-01T00:00:00Z", mid))
+
+        class Busy:
+            writes = []
+
+            def dialog(self):
+                return None
+
+            def write(self, data):
+                self.writes.append(data)
+
+        first = terminals.Terminals(s)
+        first._maybe_interrupt(s.agent("w"), Busy())
+        self.assertEqual(Busy.writes, ["\x1b"])
+        restarted = terminals.Terminals(s)  # a new hub process: nothing in memory
+        restarted._maybe_interrupt(s.agent("w"), Busy())
+        self.assertEqual(Busy.writes, ["\x1b"])  # still one
+
+    def test_a_long_busy_agent_gets_one_esc_then_the_batch(self):
+        old = terminals.INTERRUPT_AFTER_S
+        terminals.INTERRUPT_AFTER_S = 2
+        try:
+            h = self.hub_with("busy", {"FAKE_BUSY_S": "120"})
+            t = h.t.term("busy")
+            self.assertTrue(wait_for(lambda: t.view()[0]))
+            first = h.send({"to": "busy", "body": "start the long job", "idem": "j0"})["message"]["id"]
+            self.assertTrue(wait_for(lambda: (h.t.tick(), t.view()[1])[1], 20, 0.3))  # now in a long turn
+            ids = [h.send({"to": "busy", "body": f"while you work {i}", "from": "peer", "idem": f"j{i}"})["message"]["id"]
+                   for i in (1, 2)]
+            # typed and seen in the transcript (the fake takes 120 s to answer anything, the batch included)
+            self.assertTrue(wait_for(lambda: (h.t.tick(), all(h.s.message(i)["state"] in ("delivered", "done")
+                                                              for i in ids))[1], 40, 0.3))
+            users = transcript_users(h.s.agent("busy")["session_id"])
+            self.assertEqual(users[0], "start the long job")
+            self.assertIn("interrupted so these could reach you", users[1])
+            esc = [e for e in h.s.q("SELECT text FROM events WHERE agent=?", ("busy",)) if "interrupted:" in e["text"]]
+            self.assertEqual(len(esc), 1)  # one Esc, no storm
+            self.assertIn(h.s.message(first)["state"], ("delivered", "done"))
+        finally:
+            terminals.INTERRUPT_AFTER_S = old
+
 
 class ShellTests(unittest.TestCase):
     def test_plain_shell_terminal(self):
@@ -348,6 +522,194 @@ class ShellTests(unittest.TestCase):
             self.assertNotIn(a["id"], h.router_summary())
         finally:
             self.assertTrue(h.t.exit_cli(a["id"]))
+
+
+class SlowReaderTests(unittest.TestCase):
+    def test_stalled_holder_client_is_dropped_and_the_hub_keeps_up(self):
+        import socket
+        os.environ["SB_SHELL_BIN"] = "/bin/bash"
+        s = Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db"))
+        tm = terminals.Terminals(s)
+        s.add_agent({"id": "fl", "project": "p", "title": "x", "provider": "shell", "account": None,
+                     "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        t = tm.launch(s.agent("fl"))
+        stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stalled.connect(tm.paths("fl")["sock"])  # connects and never reads
+        try:
+            t.write("head -c 6000000 /dev/zero | tr '\\0' a; echo; echo flood-$((40+2))\r")
+            # the hub may itself be dropped and reattach during the flood: always read its current mirror
+            self.assertTrue(wait_for(lambda: "flood-42" in tm.term("fl").text(), 40))
+            stalled.settimeout(5)
+            got = 0
+            while True:
+                chunk = stalled.recv(1 << 20)
+                if not chunk:
+                    break  # the holder hung up on it
+                got += len(chunk)
+            self.assertLess(got, 6_000_000)
+            # the hub restarts: a fresh manager reattaches to the same holder and gets the scrollback
+            t = tm.term("fl")  # the current mirror, after any reattach during the flood
+            holder_pid = t.state["holder_pid"]
+            t.sock.shutdown(socket.SHUT_RDWR)
+            self.assertTrue(wait_for(lambda: not t.alive))
+            tm = terminals.Terminals(s)
+            tm.reattach_all()
+            t2 = tm.term("fl")
+            self.assertEqual(t2.state["holder_pid"], holder_pid)
+            self.assertTrue(wait_for(lambda: b"flood-42" in bytes(t2.buf)))
+            t2.write("echo still-$((1+1))\r")
+            self.assertTrue(wait_for(lambda: "still-2" in t2.text()))
+        finally:
+            stalled.close()
+            tm.exit_cli("fl")
+
+    class Browser:
+        """A page whose socket can stall: send blocks while `stall` is set, until the hub aborts the connection."""
+        def __init__(self, stall_on=None):
+            import threading
+            self.closed, self.aborts, self.sent = False, 0, []
+            self.stall_on, self.unblock, self.sending_since = stall_on, threading.Event(), 0.0
+
+        def send(self, data, opcode=None):
+            if self.closed:
+                raise ConnectionError("closed")
+            self.sending_since = time.time()
+            try:
+                if self.stall_on is not None and self.stall_on(data):
+                    self.unblock.wait()  # stuck in send; only the hub's abort (a socket shutdown) gets it out
+                if self.closed:
+                    raise ConnectionError("aborted")
+                self.sent.append(data)
+            finally:
+                self.sending_since = 0.0
+
+        def recv(self):
+            while not self.closed:
+                time.sleep(0.02)
+            raise ConnectionError("closed")
+
+        def abort(self):
+            self.aborts += 1
+            self.closed = True
+            self.unblock.set()
+
+        def close(self):
+            self.abort()
+
+    def session_for(self, t, b):
+        import threading
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": t.aid, "project": "p", "title": "x", "provider": "claude", "account": "one",
+                       "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        h.t.terms[t.aid] = t
+        session = threading.Thread(target=h.terminal_session, args=(b, h.s.agent(t.aid), False), daemon=True)
+        session.start()
+        return session
+
+    def test_browser_that_falls_behind_is_closed_not_skipped(self):
+        t = terminals.Term("br", {"started_at": time.time()})
+        t.buf += b"earlier output"
+        b = self.Browser(stall_on=lambda d: d == b"slow")
+        session = self.session_for(t, b)
+        self.assertTrue(wait_for(lambda: t.listeners and len(b.sent) == 2))  # scrollback + status
+        fn = next(iter(t.listeners))
+        fn("o", b"slow")
+        for _ in range(5000):
+            fn("o", b"more")
+        session.join(10)  # nobody releases the stalled send: the hub's own watchdog aborts it
+        self.assertFalse(session.is_alive())
+        self.assertEqual(b.aborts, 1)
+        self.assertEqual(b.sent[0], b"earlier output")
+        self.assertNotIn(b"more", b.sent)
+        self.assertEqual(t.listeners, set())
+
+    def test_a_browser_stuck_in_its_first_replay_is_cut_off(self):
+        old = hubmod.SEND_TIMEOUT_S
+        hubmod.SEND_TIMEOUT_S = 1
+        try:
+            t = terminals.Term("first", {"started_at": time.time()})
+            t.buf += b"x" * 1000
+            b = self.Browser(stall_on=lambda d: True)  # never takes even the replay
+            session = self.session_for(t, b)
+            session.join(10)
+            self.assertFalse(session.is_alive())
+            self.assertEqual((b.aborts, b.sent), (1, []))
+            self.assertEqual(t.listeners, set())  # nothing left registered
+        finally:
+            hubmod.SEND_TIMEOUT_S = old
+
+    def test_a_live_holder_is_never_reported_exited(self):
+        import socket
+        os.environ["SB_SHELL_BIN"] = "/bin/bash"
+        old = terminals.REATTACH_FIRST_S
+        terminals.REATTACH_FIRST_S = 3
+        s = Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db"))
+        tm = terminals.Terminals(s)
+        s.add_agent({"id": "rc", "project": "p", "title": "x", "provider": "shell", "account": None,
+                     "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        tm.launch(s.agent("rc"))
+        try:
+            for i in range(4):  # the holder drops us four times in a row
+                t = tm.term("rc")
+                t.sock.shutdown(socket.SHUT_RDWR)
+                if i < 3:
+                    self.assertTrue(wait_for(lambda: tm.term("rc") is not t and tm.running("rc")), i)
+            self.assertTrue(wait_for(lambda: tm.status(s.agent("rc"))["state"] == "reconnecting", 2))  # not "exited"
+            self.assertTrue(wait_for(lambda: tm.term("rc") is not t and tm.running("rc"), 10))  # backoff got it back
+            tm.term("rc").write("echo back-$((2+2))\r")
+            self.assertTrue(wait_for(lambda: "back-4" in tm.term("rc").text()))
+            self.assertFalse([e for e in s.q("SELECT text FROM events WHERE agent='rc'") if "exited" in e["text"]])
+        finally:
+            terminals.REATTACH_FIRST_S = old
+            tm.exit_cli("rc")
+
+    def test_a_reattach_resyncs_open_browsers(self):
+        t = terminals.Term("rs", {"started_at": time.time()})
+        t.buf += b"before"
+        b = self.Browser()
+        session = self.session_for(t, b)
+        self.assertTrue(wait_for(lambda: t.listeners and len(b.sent) == 2))
+        next(iter(t.listeners))("resync", None)  # what a reattached reader sends once the holder's replay is in
+        session.join(10)
+        self.assertFalse(session.is_alive())
+        self.assertEqual(b.aborts, 1)  # the page reconnects and gets the whole scrollback, no gap, no repeat
+
+    def test_a_browser_that_reconnects_before_the_replay_arrives_is_resynced(self):
+        import socket
+        import threading
+        os.environ["SB_SHELL_BIN"] = "/bin/bash"
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db")))
+        h.s.add_agent({"id": "rp", "project": "p", "title": "x", "provider": "shell", "account": None,
+                       "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        h.t.launch(h.s.agent("rp")).write("echo mark-$((1+1))\r")
+        self.assertTrue(wait_for(lambda: b"mark-2" in bytes(h.t.term("rp").buf)))
+
+        def page():
+            b = self.Browser()
+            threading.Thread(target=h.terminal_session, args=(b, h.s.agent("rp"), False), daemon=True).start()
+            self.assertTrue(wait_for(lambda: b.sent))  # its replay (if any) and status are out
+            return b
+
+        first = page()
+        gate, reader = threading.Event(), h.t._reader
+        h.t._reader = lambda t: (gate.wait(10) if getattr(t, "quiet", False) else None, reader(t))
+        try:
+            old = h.t.term("rp")
+            old.sock.shutdown(socket.SHUT_RDWR)  # the holder drops us; its replay to our new socket is late
+            self.assertTrue(wait_for(lambda: h.t.terms["rp"] is not old))
+            early = page()  # a page that connects in the gap reads the new, still empty buffer
+            self.assertNotIn(b"mark-2", b"".join(x for x in early.sent if isinstance(x, bytes)))
+            time.sleep(2.5)  # a told page is aborted within about a second
+            self.assertEqual((first.aborts, early.aborts), (0, 0))  # nobody is told to reconnect before the replay
+        finally:
+            gate.set()
+        try:
+            # once the replay is in, both are told to reconnect, and a page connecting now gets all of it
+            self.assertTrue(wait_for(lambda: first.aborts == 1 and early.aborts == 1))
+            late = page()
+            self.assertIn(b"mark-2", b"".join(x for x in late.sent if isinstance(x, bytes)))
+        finally:
+            h.t.exit_cli("rp")
 
 
 class ModelFollowTests(unittest.TestCase):

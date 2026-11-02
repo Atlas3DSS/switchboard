@@ -39,6 +39,49 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(dup)
         self.assertNotEqual(a["id"], b["id"])
 
+    def test_enqueue_joins_an_outer_transaction(self):
+        with self.assertRaises(RuntimeError):
+            with self.s.tx():
+                self.s.enqueue("x", "one", idem="t1")
+                self.s.enqueue("y", "two", idem="t2")
+                raise RuntimeError("fail between them")
+        self.assertEqual(self.s.messages(), [])
+        with self.s.tx():
+            self.s.enqueue("x", "one", idem="t1")
+        self.assertEqual(len(self.s.messages()), 1)
+
+
+class PrivateStateTests(unittest.TestCase):
+    def test_state_and_databases_are_owner_only(self):
+        from switchboard import sessions, store
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "hub.db")
+        first = Store(path)
+        first.enqueue("x", "hello", idem="k1")
+        ix = sessions.Index(os.path.join(d, "sessions.db"))
+        files = [path, path + "-wal", path + "-shm", ix.path, ix.path + "-wal", ix.path + "-shm"]
+        for p in files:
+            os.chmod(p, 0o644)  # as an older hub left them
+        os.chmod(d, 0o775)
+        os.chmod(store.STATE, 0o775)
+        mask = os.umask(0o022)
+        try:
+            again = Store(path)
+            sessions.Index(ix.path)
+            self.assertEqual(os.umask(0o022), 0o022)  # agents spawned from the hub keep making normal files
+        finally:
+            os.umask(mask)
+        for p in (d, store.STATE):
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o700, p)
+        for p in files:
+            self.assertEqual(os.stat(p).st_mode & 0o777, 0o600, p)
+        fresh = os.path.join(tempfile.mkdtemp(), "new", "hub.db")
+        Store(fresh).enqueue("x", "hi", idem="k2")
+        self.assertEqual(os.stat(fresh).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(fresh + "-wal").st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(fresh)).st_mode & 0o777, 0o700)
+        self.assertEqual(again.messages()[0]["body"], "hello")  # same user reads it as before
+
 
 class HubTests(unittest.TestCase):
     def setUp(self):

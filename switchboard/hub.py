@@ -30,6 +30,7 @@ SIMPLE_TYPES = ("application/x-www-form-urlencoded", "multipart/form-data", "tex
 # Router (Switchboard chat) model per provider; the built-in agent uses its account's own model.
 ROUTER_MODELS = {"claude": "claude-sonnet-5-5"}
 STALE_S = 3 * 86400
+SEND_TIMEOUT_S = 20  # one send to a browser terminal taking longer ends that connection (the page reconnects)
 
 
 def code_fingerprint():
@@ -571,18 +572,25 @@ class Hub:
         return mine[0] if len(mine) == 1 else None
 
     def agent_view(self, a, leads=None):
-        q = self.s.one("SELECT COUNT(*) n FROM messages WHERE to_agent=? AND state='queued'", (a["id"],))["n"]
+        qr = self.s.one("SELECT COUNT(*) n, MIN(created_at) since, (SELECT error FROM messages WHERE to_agent=? AND "
+                        "state='queued' ORDER BY created_at LIMIT 1) why FROM messages WHERE to_agent=? AND "
+                        "state='queued'", (a["id"], a["id"]))
+        q, why = qr["n"], qr["why"] or ""
         st = self.t.status(a)
         if a["mode"] == "managed":  # a headless turn from before v2 is still finishing
             st["state"] = a["state"]
         block = None if st["running"] else self.t.launch_block(a)
+        term = self.t.term(a["id"]) if st["running"] else None
+        asking = term.dialog() if term and a["provider"] != "shell" else None
         leads = leads if leads is not None else {a["project"]: self.lead_of(a["project"])}
         return {"id": a["id"], "project": a["project"], "title": a["title"], "provider": a["provider"],
                 "account": a["account"], "model": a["model"],
                 "session_id": a["session_id"], "cwd": a["cwd"], "mode": a["mode"],
                 "lead": leads.get(a["project"]) == a["id"], "role": a.get("role"), "state": st["state"], "running": st["running"],
                 "pid": st["pid"], "started_at": st["started_at"], "last_activity": a["last_activity"],
-                "last_text": a["last_text"] or "", "launch_block": block, "queued": q,
+                "last_text": a["last_text"] or "", "launch_block": block, "queued": q, "paused": bool(a.get("paused")),
+                "queued_since": qr["since"], "asking": asking,
+                "queue_reason": why[len("waiting: "):] if why.startswith("waiting: ") else why or None,
                 "switching": self.t.switching.get(a["id"]),
                 "context_tokens": a.get("context_tokens"), "context_window": a.get("context_window")}
 
@@ -909,26 +917,32 @@ class Hub:
             except Exception as e:
                 sock.send(json.dumps({"t": "blocked", "reason": f"launch failed: {e}"}))
         t = self.t.term(aid)
+        behind = threading.Event()
+
+        def watchdog():  # a browser that stops reading is cut off: never a writer stuck in send forever
+            while not sock.closed:
+                time.sleep(1)
+                if behind.is_set() or (sock.sending_since and time.time() - sock.sending_since > SEND_TIMEOUT_S):
+                    sock.abort()
+
+        threading.Thread(target=watchdog, daemon=True).start()
 
         def listener(kind, payload):
+            if behind.is_set():
+                return
+            if kind == "resync":  # we reattached to the holder: the page reconnects and gets the full scrollback
+                behind.set()
+                return
             try:
                 out.put_nowait((kind, payload))
             except queue.Full:
-                pass
-
-        if t:
-            with t.lock:
-                replay = bytes(t.buf)
-                t.listeners.add(listener)
-            for i in range(0, len(replay), 256 * 1024):
-                sock.send(replay[i:i + 256 * 1024])
-            sock.send(status())
-        elif not start or self.t.launch_block(self.s.agent(aid)) is None:
-            sock.send(self.t.scrollback(aid))
-            sock.send(status())
+                behind.set()  # never skip bytes: close it, the page reconnects and gets the scrollback again
 
         def writer():
             while not sock.closed:
+                if behind.is_set():
+                    sock.abort()
+                    return
                 try:
                     kind, payload = out.get(timeout=1)
                 except queue.Empty:
@@ -941,8 +955,18 @@ class Hub:
                 except (OSError, ConnectionError):
                     return
 
-        threading.Thread(target=writer, daemon=True).start()
-        try:
+        try:  # from the first replay on: whatever happens, the listener goes and the socket is closed
+            if t:
+                with t.lock:
+                    replay = bytes(t.buf)
+                    t.listeners.add(listener)
+                for i in range(0, len(replay), 256 * 1024):
+                    sock.send(replay[i:i + 256 * 1024])
+                sock.send(status())
+            elif not start or self.t.launch_block(self.s.agent(aid)) is None:
+                sock.send(self.t.scrollback(aid))
+                sock.send(status())
+            threading.Thread(target=writer, daemon=True).start()
             while True:
                 op, data = sock.recv()
                 if op != ws.TEXT:
@@ -1328,7 +1352,7 @@ def make_handler(hub):
             self.end_headers()
             self.wfile.flush()
             self.close_connection = True
-            sock = ws.WebSocket(self.rfile, self.wfile)
+            sock = ws.WebSocket(self.rfile, self.wfile, self.connection)
             hub.terminal_session(sock, a, start)
 
         def do_PATCH(self):

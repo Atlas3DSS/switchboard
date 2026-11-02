@@ -22,6 +22,9 @@ PATH = os.path.join(STATE, "phone.json")
 PAIR_TTL_S = 600
 CHALLENGE_TTL_S = 60
 SESSION_TTL_S = 24 * 3600
+MAX_CHALLENGES = 1024  # outstanding sign-in challenges in all; when full, new ones are refused (never evicted)
+MAX_CHALLENGES_PER_CLIENT = 4  # a client's own oldest give way, so nobody can push out another's challenge
+MAX_SESSIONS = 8     # signed-in sessions of the paired phone; the oldest give way
 LOGIN_CONTEXT = "switchboard-phone-login"
 
 
@@ -45,7 +48,8 @@ def _state():
         st.setdefault("challenges", {})
         st.setdefault("sessions", {})
         now = time.time()
-        st["challenges"] = {k: v for k, v in st["challenges"].items() if v > now}
+        st["challenges"] = {k: (v if isinstance(v, dict) else {"exp": v, "client": ""})
+                            for k, v in st["challenges"].items() if (v["exp"] if isinstance(v, dict) else v) > now}
         st["sessions"] = {k: v for k, v in st["sessions"].items() if v["expires"] > now}
         before = json.dumps(st, sort_keys=True)
         yield st
@@ -112,12 +116,26 @@ def unpair():
         st["device"], st["pairing"], st["sessions"], st["challenges"] = None, None, {}, {}
 
 
-def challenge():
+def _keep_newest(table, n, key):
+    for k in sorted(table, key=lambda k: key(table[k]))[:max(0, len(table) - n)]:
+        del table[k]
+
+
+class Busy(Exception):
+    pass
+
+
+def challenge(client=""):
     nonce = secrets.token_urlsafe(32)
     with _state() as st:
         if not st["device"]:
             raise PermissionError("no phone is paired")
-        st["challenges"][_h(nonce)] = time.time() + CHALLENGE_TTL_S
+        mine = {k: v for k, v in st["challenges"].items() if v["client"] == client}
+        for k in sorted(mine, key=lambda k: mine[k]["exp"])[:max(0, len(mine) - MAX_CHALLENGES_PER_CLIENT + 1)]:
+            del st["challenges"][k]
+        if len(st["challenges"]) >= MAX_CHALLENGES:
+            raise Busy("too many sign-ins in progress; try again in a minute")
+        st["challenges"][_h(nonce)] = {"exp": time.time() + CHALLENGE_TTL_S, "client": client}
     return nonce
 
 
@@ -132,22 +150,30 @@ def login(nonce, sig_b64, origin):
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
     from cryptography.hazmat.primitives.serialization import load_der_public_key
-    with _state() as st:
+    with _state() as st:  # the challenge is used up (and saved) before the signature is even looked at
         d = st["device"]
-        if not d or st["challenges"].pop(_h(nonce or ""), None) is None:  # single use, even when it fails
-            raise PermissionError("challenge expired; try again")
-        raw = base64.b64decode(sig_b64 or "")
-        if len(raw) != 64:
-            raise PermissionError("bad signature")
-        try:
-            load_der_public_key(base64.b64decode(d["spki"])).verify(
-                encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")),
-                login_message(nonce, origin), ec.ECDSA(hashes.SHA256()))
-        except InvalidSignature:
+        fresh = st["challenges"].pop(_h(nonce or ""), None) is not None
+    if not d or not fresh:
+        raise PermissionError("challenge expired; try again")
+    try:
+        raw = base64.b64decode(sig_b64 or "", validate=True)
+    except ValueError:
+        raw = b""
+    if len(raw) != 64:
+        raise PermissionError("bad signature")
+    try:
+        load_der_public_key(base64.b64decode(d["spki"])).verify(
+            encode_dss_signature(int.from_bytes(raw[:32], "big"), int.from_bytes(raw[32:], "big")),
+            login_message(nonce, origin), ec.ECDSA(hashes.SHA256()))
+    except InvalidSignature:
+        raise PermissionError("this browser is not the paired phone")
+    sid = secrets.token_urlsafe(32)
+    with _state() as st:
+        if not st["device"] or st["device"]["id"] != d["id"]:  # unpaired or replaced while we checked
             raise PermissionError("this browser is not the paired phone")
-        sid = secrets.token_urlsafe(32)
         st["sessions"][_h(sid)] = {"device": d["id"], "expires": time.time() + SESSION_TTL_S}
-        return sid, SESSION_TTL_S
+        _keep_newest(st["sessions"], MAX_SESSIONS, lambda s: s["expires"])
+    return sid, SESSION_TTL_S
 
 
 def session_ok(sid):

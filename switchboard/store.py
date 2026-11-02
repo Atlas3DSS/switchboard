@@ -67,9 +67,26 @@ def new_id(prefix):
     return f"{prefix}-{time.strftime('%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
 
+def private_dir(d):
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+
+
+def private_db(path):
+    """Owner-only database files. SQLite gives a new -wal/-shm the database file's mode."""
+    os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            os.chmod(p, 0o600)
+        except FileNotFoundError:
+            pass
+
+
 class Store:
     def __init__(self, path=DB_PATH):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        private_dir(STATE)
+        private_dir(os.path.dirname(path))
+        private_db(path)
         os.makedirs(TURNS, exist_ok=True)
         os.makedirs(INBOX, exist_ok=True)
         os.makedirs(UPLOADS, exist_ok=True)
@@ -111,18 +128,26 @@ class Store:
             return self.db.execute(sql, args)
 
     def tx(self):
-        """Context manager for an IMMEDIATE transaction under the hub lock."""
+        """Context manager for an IMMEDIATE transaction under the hub lock. Inside another tx() on the same thread it
+        joins that one, and the outer block commits or rolls back everything."""
         store = self
 
         class _Tx:
             def __enter__(self_):
                 store.lock.acquire()
-                store.db.execute("BEGIN IMMEDIATE")
+                self_.outer = not store.db.in_transaction
+                if self_.outer:
+                    try:
+                        store.db.execute("BEGIN IMMEDIATE")
+                    except BaseException:
+                        store.lock.release()
+                        raise
                 return store
 
             def __exit__(self_, exc_type, *_):
                 try:
-                    store.db.execute("ROLLBACK" if exc_type else "COMMIT")
+                    if self_.outer:
+                        store.db.execute("ROLLBACK" if exc_type else "COMMIT")
                 finally:
                     store.lock.release()
                 return False

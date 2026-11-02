@@ -22,6 +22,8 @@ import termios
 import time
 
 KEEP = 2 * 1024 * 1024
+BACKLOG = 4 * 1024 * 1024  # a client this far behind is dropped (a new one starts with up to KEEP of scrollback) ...
+STALL_S = 10  # ... as is one that takes nothing for this long; it reconnects and gets the scrollback again
 
 
 def frame(kind, payload=b""):
@@ -94,6 +96,7 @@ def main(spec_path):
     sel.register(master, selectors.EVENT_READ, "pty")
     sel.register(srv, selectors.EVENT_READ, "srv")
     clients = {}  # sock -> FrameReader
+    pending = {}  # sock -> [unsent output, last time it took some]; the loop never blocks on a client
 
     def drop(c):
         try:
@@ -101,13 +104,38 @@ def main(spec_path):
         except (KeyError, ValueError):
             pass
         clients.pop(c, None)
+        pending.pop(c, None)
         c.close()
+
+    def flush(c):
+        out = pending[c]
+        try:
+            n = c.send(out[0])
+        except BlockingIOError:
+            n = 0
+        except OSError:
+            drop(c)
+            return
+        if n:
+            del out[0][:n]
+            out[1] = time.time()
+        want = selectors.EVENT_READ | (selectors.EVENT_WRITE if out[0] else 0)
+        if sel.get_key(c).events != want:
+            sel.modify(c, want, "client")
 
     def send_all(data):
         for c in list(clients):
-            try:
-                c.sendall(data)
-            except OSError:
+            out = pending[c]
+            if not out[0]:
+                out[1] = time.time()
+            out[0] += data
+            flush(c)
+
+    def pace():
+        """Drop a client that has fallen BACKLOG behind or taken nothing for STALL_S. The CLI never waits for a
+        client, so one slow reader cannot hold up the others."""
+        for c, out in list(pending.items()):
+            if len(out[0]) > BACKLOG or (out[0] and time.time() - out[1] > STALL_S):
                 drop(c)
 
     def write_input(data):
@@ -124,7 +152,7 @@ def main(spec_path):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     eof = False
     while not eof:
-        for key, _ in sel.select(timeout=1.0):
+        for key, mask in sel.select(timeout=1.0):
             if key.data == "pty":
                 try:
                     data = os.read(master, 65536)
@@ -153,18 +181,22 @@ def main(spec_path):
                     c, _ = srv.accept()
                 except OSError:
                     continue
-                c.setblocking(True)
-                try:
-                    c.sendall(frame(b"h", json.dumps(state).encode()) + frame(b"o", bytes(scroll)))
-                except OSError:
-                    c.close()
-                    continue
+                c.setblocking(False)
                 clients[c] = FrameReader()
+                pending[c] = [bytearray(frame(b"h", json.dumps(state).encode()) + frame(b"o", bytes(scroll))),
+                              time.time()]
                 sel.register(c, selectors.EVENT_READ, "client")
+                flush(c)
             else:
                 c = key.fileobj
+                if c in clients and mask & selectors.EVENT_WRITE:
+                    flush(c)
+                if c not in clients or not mask & selectors.EVENT_READ:
+                    continue
                 try:
                     data = c.recv(65536)
+                except BlockingIOError:
+                    continue
                 except OSError:
                     data = b""
                 if not data:
@@ -197,6 +229,7 @@ def main(spec_path):
             except OSError:
                 pass
             eof = True
+        pace()
     code = proc.wait()
     # keep the on-disk scrollback bounded
     logf.close()
@@ -213,7 +246,13 @@ def main(spec_path):
     json.dump(state, open(tmp, "w"))
     os.replace(tmp, state_path)
     send_all(frame(b"x", str(code).encode()))
+    end = time.time() + STALL_S
     for c in list(clients):
+        try:  # the last output and the exit code, to clients still reading
+            c.settimeout(max(0.1, end - time.time()))
+            c.sendall(pending[c][0])
+        except OSError:
+            pass
         drop(c)
     srv.close()
     try:

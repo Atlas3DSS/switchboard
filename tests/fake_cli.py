@@ -26,6 +26,7 @@ if not sid and args[:1] == ["resume"] and len(args) > 1:
     sid = args[1]
 sid = sid or str(uuid.uuid4())
 BUSY_S = float(os.environ.get("FAKE_BUSY_S", "1.0"))
+REPAINT_S = float(os.environ.get("FAKE_REPAINT_S", "0"))  # > 0: redraw the idle prompt this often, like a footer clock
 proj = os.environ.get("FAKE_PROJECTS")
 TRANSCRIPT = os.path.join(proj, "fake", sid + ".jsonl") if proj else None
 if os.environ.get("FAKE_CLI_LOG"):
@@ -81,9 +82,19 @@ w("\x1b[?2004h")
 w(f"\x1b[1;38;2;134;194;50mFAKE CLI\x1b[0m {' '.join(args)}\r\nsession {sid} size {size()}\r\n")
 composer()
 paste = False
+painted = time.time()
+if os.environ.get("FAKE_TRUST_MENU"):  # a folder-trust choice instead of the prompt until Enter
+    w("Do you trust the files in this folder?\r\n\x1b[1;32m❯\x1b[0m 1. Yes, I trust this folder\r\n  2. No, exit\r\n")
+    while os.read(0, 16) not in (b"\r", b"\n"):
+        pass
+    w("\x1b[2J\x1b[H")
+    composer()
 try:
     while True:
         r, _, _ = select.select([0], [], [], 0.05)
+        if REPAINT_S and not pending and time.time() - painted > REPAINT_S:
+            painted = time.time()
+            composer()
         if pending and time.time() >= busy_until:
             log("assistant", "ok: " + pending)
             w(f"\r\x1b[2K\x1b[1A\r\x1b[2K⏺ ok: {pending}\r\n")

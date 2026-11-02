@@ -164,7 +164,8 @@ window.__sbTerms = {};
 /* model suggestions for the CLIs; API accounts suggest the models their endpoint listed during setup */
 const MODEL_HINTS = { claude: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'], codex: [], gemini: [], hermes: [] };
 const KIND_LABEL = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI', hermes: 'Hermes Agent', api: 'built-in agent', shell: 'shell' };
-const STATE_WORD = { busy: 'working', idle: 'idle', starting: 'starting', stopped: 'stopped' };
+const STATE_WORD = { busy: 'working', idle: 'idle', starting: 'starting', stopped: 'stopped', reconnecting: 'reconnecting' };
+const queueWhy = (a) => `${a.paused ? 'paused' : a.queue_reason || 'waiting to type'}${a.queued_since ? ', oldest ' + ago(a.queued_since) : ''}`;
 
 const agentName = (a) => (a && (a.title || a.id)) || '';
 const agentHref = (a) => `#/p/${enc(a.project || '')}/${enc(a.id)}`;
@@ -605,7 +606,7 @@ function agentRow() {
       setText(acct, a.account); setAttr(acct, 'title', 'Account');
       setModelTag(mt, a);
       setText(st, a.switching ? '→ ' + a.switching.to : (STATE_WORD[a.state] || a.state));
-      setText(q, a.queued ? a.queued + ' queued' : ''); q.hidden = !a.queued;
+      setText(q, a.queued ? a.queued + ' queued' : ''); q.hidden = !a.queued; setAttr(q, 'title', a.queued ? queueWhy(a) : '');
       blk.hidden = !a.launch_block; setAttr(blk, 'title', a.launch_block || '');
     },
   };
@@ -882,7 +883,7 @@ function makePane(idx, pid, view) {
     setText(st, !id ? '' : a.switching ? `switching to ${a.switching.to}…` : (STATE_WORD[a.state] || a.state || ''));
     const bits = [];
     if (a.launch_block) bits.push('blocked: ' + a.launch_block);
-    if (a.queued) bits.push(a.queued + ' queued');
+    if (a.queued) bits.push(`${a.queued} queued · ${queueWhy(a)}`);
     if (a.switching && a.switching.note) bits.push(a.switching.note);
     setText(note, bits.join(' · ')); setAttr(note, 'title', bits.join('\n'));
     setText(meta, !id ? '' : [a.account, a.model ? a.model.replace(/^claude-/, '') : '', a.project !== pid && a.project ? projName(a.project) : ''].filter(Boolean).join(' · '));

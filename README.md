@@ -15,7 +15,10 @@ context on demand, and ask you questions without you juggling a dozen terminal t
   pseudo-terminal that outlives the hub and your browser tab. Up to four side by side, full keyboard, image paste.
 - **Messages land exactly once.** `sb send <agent> "text"` types into that agent's terminal only when it's idle
   with an empty input box (background jobs it left running don't count), then confirms the message from the session
-  transcript. It never types twice.
+  transcript. It never types twice. Messages that arrive while an agent works go in together, as one batch that
+  names each sender (every message in full in a private file), and if the oldest has waited 5 minutes the agent
+  gets one Esc so the batch can land. A queue that doesn't move says why: paused, mid-turn, a draft in its input
+  box, or a choice on screen that only you can answer (never answered for you).
 - **Shared context, pulled on demand.** Agents on a project can run `sb context` to see what the others were
   last asked and said, search their conversations, and leave notes. Nothing gets pushed into anyone's context.
 - **A chat that routes you.** The Switchboard chat (on whichever account you pick) opens the right agent, finds
@@ -131,7 +134,8 @@ relaunch, `sb context` and search work as they do for Claude and Codex.
 |---|---|
 | `~/.config/switchboard/accounts.json` | your accounts (mode 0600: it can hold API keys). Written by Setup / `sb setup` |
 | `~/.config/switchboard/projects.json` | optional: projects to create at start, with live sources (see `examples/`) |
-| `~/.local/state/switchboard/` | hub database, terminal scrollback, built-in agent sessions, uploads |
+| `~/.local/state/switchboard/` | hub database, terminal scrollback, built-in agent sessions, uploads (0700; databases 0600) |
+| `~/.local/state/switchboard/inbox/` | the full text of each batch of messages typed into an agent (0600, kept 7 days) |
 | `~/.local/state/switchboard/phone.json` | the paired phone's public key and hashed sessions (0600), if you use the phone gate |
 | `~/switchboard-projects/` | default parent folder for new projects (change it in Setup) |
 
@@ -146,7 +150,8 @@ Claude / Codex sessions that were started outside Switchboard).
   drive your agents, so don't expose the hub itself to a network. To reach it from your phone, use the phone gate
   ([docs/PHONE.md](docs/PHONE.md)): without the paired phone's key it serves only its pairing page.
 - Agents run as **you**, with your files and your shell. Claude Code, Codex and Gemini CLI apply their own
-  permission modes. The built-in agent asks before each command or edit unless you switch on `/auto`.
+  permission modes; an agent set to auto or bypass runs Codex with full access, since an approval prompt would hold
+  its queue until you answer it. The built-in agent asks before each command or edit unless you switch on `/auto`.
 - API keys stay in `accounts.json` (0600) and in the environment of the agents that use them. The web API never
   sends them back, only a masked hint.
 
@@ -154,7 +159,7 @@ Claude / Codex sessions that were started outside Switchboard).
 
 ```bash
 python3 -m unittest tests.test_core tests.test_sessions tests.test_shared tests.test_vtscreen tests.test_agent \
-  tests.test_phone tests.test_hermes
+  tests.test_phone tests.test_hermes tests.test_boundary
 python3 -m unittest tests.test_terminals      # real ptys with a fake CLI; ~1 minute
 ```
 
