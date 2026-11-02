@@ -23,10 +23,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .store import now
 
-CONFIG = os.path.expanduser(os.environ.get("SB_HOSTS", "~/.config/switchboard/hosts.json"))
+CONFIG = os.path.expanduser(os.environ.get("SB_HOSTS", "~/.config/switchboard/hosts.json"))  # default; read again per call
+
+
+def config_path():
+    return os.path.expanduser(os.environ.get("SB_HOSTS", CONFIG))
+
+
+def ssh_bin():
+    return os.environ.get("SB_SSH", "ssh")
 PROBE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe.py")
 PROBE_S = float(os.environ.get("SB_FLEET_PROBE_S", "30"))
-SSH = os.environ.get("SB_SSH", "ssh")
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2"]
 HALT_REL = ".local/state/switchboard/HALT"  # under $HOME on every host; the drop-ins name it with %h
 SAMPLES_KEPT = 120
@@ -54,7 +61,7 @@ def local_name():
 
 def load_config(path=None):
     """The hosts file with defaults filled in; the local machine is always present."""
-    path = path or CONFIG
+    path = path or config_path()
     cfg = {}
     if os.path.exists(path):
         with open(path) as f:
@@ -89,7 +96,7 @@ def load_config(path=None):
 
 def save_host(entry, path=None):
     """Add or replace one host in the file (sb fleet add-host). Keeps everything else in the file as it is."""
-    path = path or CONFIG
+    path = path or config_path()
     cfg = {}
     if os.path.exists(path):
         with open(path) as f:
@@ -121,7 +128,7 @@ def run_on(h, script, timeout=30, interpreter="bash -s"):
         if argv[:2] == ["python3", "-"]:
             argv = [sys.executable, "-"]
     else:
-        argv = [SSH] + SSH_OPTS + [h["ssh"], interpreter]
+        argv = [ssh_bin()] + SSH_OPTS + [h["ssh"], interpreter]
     try:
         p = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr

@@ -19,6 +19,8 @@
   sb note "text"                    leave a short note for the other agents on your project
   sb summon <agent> "task" [--fork] side agent beside <agent> (--fork: a copy of its whole conversation)
   sb ask "question" [--options a,b] file a decision for the owner on your project
+  sb inbox [--project p] [--json]   (owner / Switchboard chat) every open request agents filed for the owner, per project
+  sb inbox done <id> ["answer"]     cross one off: answer a decision, or dismiss it / acknowledge a need with no answer
   sb notify "text" [--info]         put a note in the owner's Switchboard inbox (--info: FYI, no action needed)
   sb reply <turn> "text"            answer a pane pointer you received
   sb status <message-id>            show one message
@@ -40,10 +42,6 @@
   sb stop <id> [--reason "..."]     stop a job (queued or running)
   sb adopt <unit|pid> --name NAME [--host H] [--threads N --mem GIB --gpu GIB]
                                     watch an existing unit as a job without relaunching it (never halted)
-  sb ask "question" [--options a,b] file a decision for the owner on your project
-  sb notify "text" [--info]         page the owner on the taskbar ticker (--info: FYI, no action needed)
-  sb reply <turn> "text"            answer a pane pointer you received
-  sb status <message-id>            show one message
 """
 import argparse
 import json
@@ -374,6 +372,34 @@ def adopt_cmd(args):
     return 0
 
 
+def inbox_cmd(args):
+    if args.action == "done":
+        if not args.arg:
+            sys.exit("sb: sb inbox done <id> [\"answer\"]")
+        r = call("POST", f"/api/inbox/{args.arg}/done", {"answer": args.answer or "", "from": me()})
+        print(f"{r['id']}: {r['kind']} {r['state']}" + (f" ({r['answer']})" if r.get("answer") else ""))
+        return 0
+    res = call("GET", "/api/inbox" + (f"?project={urllib.parse.quote(args.project)}" if args.project else ""))
+    if args.json:
+        print(json.dumps(res, indent=1))
+        return 0
+    if not res["items"]:
+        print("nothing waits for the owner" + (f" on {args.project}" if args.project else ""))
+        return 0
+    cur = None
+    for x in res["items"]:
+        if x["project"] != cur:
+            cur = x["project"]
+            print(f"== {cur} ({res['by_project'].get(cur, 0)})")
+        age = x.get("age_s")
+        age_s = f"{age // 86400}d" if age and age >= 86400 else (f"{age // 3600}h" if age and age >= 3600 else f"{(age or 0) // 60}m")
+        print(f"{x['id']:<22} {x['kind']:<8} {age_s:>4}  {x['agent'] or '-'}: {x['text'][:160]}")
+        if x.get("options"):
+            print(f"{'':<22} options: {' | '.join(x['options'])}")
+    print(f"{res['count']} waiting; sb inbox done <id> [\"answer\"] crosses one off")
+    return 0
+
+
 def unhalt_cmd(args):
     res = call("POST", "/api/fleet/resume", {"from": me(), "hosts": args.host})
     for r in res["results"]:
@@ -440,6 +466,12 @@ def main():
     nt = sub.add_parser("notify")
     nt.add_argument("text")
     nt.add_argument("--info", action="store_true")
+    ib = sub.add_parser("inbox")
+    ib.add_argument("action", nargs="?", default="list", choices=["list", "done"])
+    ib.add_argument("arg", nargs="?", help="the item id (done)")
+    ib.add_argument("answer", nargs="?", help="the answer (done); none dismisses or acknowledges")
+    ib.add_argument("--project")
+    ib.add_argument("--json", action="store_true")
     a = sub.add_parser("ask")
     a.add_argument("question")
     a.add_argument("--options", default="")
@@ -496,15 +528,6 @@ def main():
     ad.add_argument("--threads", type=int, default=0)
     ad.add_argument("--mem", type=float, default=0.0)
     ad.add_argument("--gpu", type=float)
-    a = sub.add_parser("ask")
-    a.add_argument("question")
-    a.add_argument("--options", default="")
-    a.add_argument("--project")
-    r = sub.add_parser("reply")
-    r.add_argument("turn")
-    r.add_argument("text")
-    st = sub.add_parser("status")
-    st.add_argument("id")
     args = ap.parse_args()
     if args.cmd == "setup":
         return setup()
@@ -638,6 +661,8 @@ def main():
     elif args.cmd == "notify":
         n = call("POST", "/api/notifications", {"agent": me(), "text": args.text, "level": "info" if args.info else "need"})
         print(f"{n['id']} in the owner's Switchboard inbox")
+    elif args.cmd == "inbox":
+        return inbox_cmd(args)
     elif args.cmd == "ask":
         opts = [o.strip() for o in args.options.split(",") if o.strip()]
         d = call("POST", "/api/decisions", {"agent": me(), "project": args.project, "question": args.question,

@@ -29,7 +29,6 @@ from switchboard import hosts, jobs, placers  # noqa: E402
 from switchboard.hub import Hub  # noqa: E402
 from switchboard.store import Store  # noqa: E402
 
-os.environ["SB_HOSTS"] = hosts.CONFIG
 os.makedirs(os.environ["SB_SYSTEMD_USER_DIR"], exist_ok=True)
 FAKE_WB = os.path.join(HERE, "fake_workboard.py")
 FAKE_CPU = os.path.join(HERE, "fake_cpu_run.py")
@@ -44,7 +43,7 @@ def have_user_systemd():
 
 
 def write_hosts(hosts_list, **extra):
-    with open(hosts.CONFIG, "w") as f:
+    with open(os.environ["SB_HOSTS"], "w") as f:
         json.dump({"hosts": hosts_list, **extra}, f)
 
 

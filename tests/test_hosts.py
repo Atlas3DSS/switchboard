@@ -29,7 +29,6 @@ from switchboard import hosts  # noqa: E402
 from switchboard.hub import Hub  # noqa: E402
 from switchboard.store import Store  # noqa: E402
 
-os.environ["SB_HOSTS"] = hosts.CONFIG  # the path the module captured at import: shared when suites run together
 os.makedirs(os.environ["SB_SYSTEMD_USER_DIR"], exist_ok=True)
 
 
