@@ -433,6 +433,33 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(v["queued_since"])
 
 
+class ScreenOnlyCompletionTests(unittest.TestCase):
+    def test_done_only_at_a_real_idle_prompt(self):
+        """CLIs whose sessions cannot be read (Gemini) are confirmed from the screen: a message is not done while
+        an approval or other choice is open, or while text sits in the input box."""
+        s = Store(os.path.join(tempfile.mkdtemp(dir=TMP), "hub.db"))
+        tm = terminals.Terminals(s)
+        s.add_agent({"id": "gm", "project": "p", "title": "x", "provider": "gemini", "account": "g",
+                     "mode": "terminal", "session_id": None, "cwd": TMP, "state": "idle"})
+        t = terminals.Term("gm", {"started_at": time.time()})
+        tm.terms["gm"] = t
+        m, _ = s.enqueue("gm", "do the thing", idem="so-1")
+        s.x("UPDATE messages SET state='delivered', turn_id='pty-x', delivered_at=? WHERE id=?",
+            (terminals.iso_from_epoch(time.time() - 30), m["id"]))
+
+        def screen(*lines):
+            with t.lock:
+                t.screen.feed(("\x1b[2J\x1b[H" + "\r\n".join(lines)).encode())
+            t._sig, t._since = t.view(), time.time() - 30  # it has looked like this for 30 s
+            tm._confirm()
+            return s.message(m["id"])["state"]
+
+        self.assertEqual(screen("Allow this command?", "❯ 1. Yes", "  2. No", "Enter to confirm · Esc to cancel"),
+                         "delivered")  # an approval waits for the owner: not done
+        self.assertEqual(screen("result", "│ > half typed reply │"), "delivered")  # a draft in the input box: not done
+        self.assertEqual(screen("result", "│ > Type your message │"), "done")  # its empty input box
+
+
 class BatchTests(unittest.TestCase):
     """Everything waiting for an agent goes in as one attributed batch backed by an owner-only file; an agent busy
     past the threshold gets one Esc first; each message is answered exactly once."""

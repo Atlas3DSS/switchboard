@@ -879,7 +879,8 @@ class Terminals:
         quiet = t.steady_for() > 4
         if m["state"] == "delivering" and ready and not comp and time.time() - since > 2:
             self.s.x("UPDATE messages SET state='delivered' WHERE id=?", (m["id"],))
-        elif m["state"] == "delivered" and ready and not busy and quiet and time.time() - since > 6:
+        elif m["state"] == "delivered" and ready and not busy and not comp and not t.dialog() and quiet \
+                and time.time() - since > 6:  # done only at a real idle prompt: no draft, no approval or other choice
             self.s.x("UPDATE messages SET state='done', finished_at=? WHERE id=?", (now(), m["id"]))
 
     def _find_codex_thread(self, agent, t):
