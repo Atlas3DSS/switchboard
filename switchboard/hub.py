@@ -12,7 +12,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import config, discovery, phone, sessions, shared, sources, transcript, ws
+from . import config, discovery, hosts, jobs, phone, sessions, shared, sources, transcript, ws
 from .runner import Runner
 from .terminals import PROVIDERS, NeedsConfirm, Terminals
 from .store import STATE, Store, epoch, iso_from_epoch, new_id, now, save_upload, upload_path
@@ -560,8 +560,15 @@ class Hub:
         if os.environ.get("SB_DISCOVER") == "0":  # do not list Claude/Codex sessions started outside Switchboard
             self.sync_observed = lambda: None
         for fn, every in ((self.refresh_usage, 30), (self.delivery, 1.5), (self.sync_observed, 8), (self.probe_sources, 60),
-                          (self.terminal_tick, 1.0), (self.refresh_replies, 5), (self.index_sessions, 120)):
+                          (self.terminal_tick, 1.0), (self.refresh_replies, 5), (self.index_sessions, 120),
+                          (self.fleet_tick, hosts.PROBE_S)):
             threading.Thread(target=self.loop, args=(fn, every), daemon=True).start()
+
+    def fleet_tick(self):
+        """Probe every host (docs/FLEET.md); track jobs; a host that missed a HALT gets the flag when it answers."""
+        hosts.tick(self)
+        jobs.tick(self)
+        hosts.retry_pending_halt(self)
 
     # ---------- views ----------
     def lead_of(self, pid):
@@ -629,7 +636,7 @@ class Hub:
                 "started_at": iso_from_epoch(STARTED_AT)}
         return {"ts": now(), "code": code, "router": "desk" if self.router_account() else None,
                 "setup_needed": not config.configured(), "focus": self.focus, "projects": projects, "agents": agents, "accounts": accts,
-                "decisions": self.s.decisions(open_only=True)}
+                "fleet": hosts.summary(self), "decisions": self.s.decisions(open_only=True)}
 
     def msg_view(self, m):
         return {"id": m["id"], "to": m["to_agent"], "from": m["from_agent"], "body": m["body"], "state": m["state"],
@@ -1160,6 +1167,17 @@ def make_handler(hub):
                     if not a:
                         raise LookupError(m.group(1))
                     return 200, hub.agent_view(a)
+                if path == "/api/fleet":  # the inventory: every host, its capacity, jobs, untracked work (docs/FLEET.md)
+                    return 200, hosts.fleet_view(hub)
+                if path == "/api/fleet/guards":
+                    return 200, hosts.guards(hub, "list", qs["host"].split(",") if qs.get("host") else None)
+                if path == "/api/fleet/wsl-keepalive":
+                    return 200, {"text": hosts.wsl_keepalive(qs.get("distro") or "Ubuntu")}
+                if path == "/api/jobs":  # sb jobs
+                    return 200, jobs.list_jobs(hub, qs.get("all") == "1", qs.get("project"), qs.get("host"), qs.get("agent"))
+                m = re.fullmatch(r"/api/jobs/([\w-]+)", path)
+                if m:
+                    return 200, jobs.show(hub, m.group(1), int(qs.get("log", 40)))
                 if path == "/api/agents":
                     return 200, {"agents": [hub.agent_view(a) for a in hub.s.agents()]}
                 if path == "/api/messages":
@@ -1202,6 +1220,27 @@ def make_handler(hub):
                     if x["state"] in ("failed", "held"):
                         hub.s.x("UPDATE messages SET state='queued', error=NULL, turn_id=NULL WHERE id=?", (x["id"],))
                     return 200, hub.msg_view(hub.s.message(x["id"]))
+                if path == "/api/fleet/halt":  # sb halt: flag every host, stop tracked jobs, --workloads disables matches
+                    return 200, hosts.halt(hub, b.get("from") or "owner", b.get("reason") or "", b.get("hosts") or None,
+                                           bool(b.get("workloads")))
+                if path == "/api/fleet/resume":
+                    return 200, hosts.resume(hub, b.get("from") or "owner", b.get("hosts") or None)
+                if path == "/api/fleet/guards":
+                    act = b.get("action") or "install"
+                    if act not in ("install", "remove"):
+                        raise ValueError("action is install or remove")
+                    return 200, hosts.guards(hub, act, b.get("hosts") or None)
+                if path == "/api/fleet/probe":  # sb fleet check: probe now instead of waiting for the loop
+                    return 200, {"results": hosts.tick(hub), "fleet": hosts.fleet_view(hub)}
+                if path == "/api/fleet/hosts":  # sb fleet add-host: probe first, then write the hosts file
+                    return 200, hosts.add_host(b)
+                if path == "/api/jobs":  # sb run: the one way to launch work (docs/FLEET.md)
+                    return 200, jobs.submit(hub, b)
+                if path == "/api/jobs/adopt":
+                    return 200, jobs.adopt(hub, b)
+                m = re.fullmatch(r"/api/jobs/([\w-]+)/stop", path)
+                if m:
+                    return 200, jobs.stop(hub, m.group(1), b.get("from") or "owner", b.get("reason") or "")
                 if path == "/api/agents":
                     return 200, hub.create_agent(b)
                 if path == "/api/dispatch":

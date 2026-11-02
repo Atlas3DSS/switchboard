@@ -22,6 +22,28 @@
   sb notify "text" [--info]         put a note in the owner's Switchboard inbox (--info: FYI, no action needed)
   sb reply <turn> "text"            answer a pane pointer you received
   sb status <message-id>            show one message
+  sb fleet [--json]                 the fleet: every host, reachable or not, free threads/RAM/VRAM, jobs, untracked
+  sb fleet check                    probe every host now (what is unreachable, and why)
+  sb fleet show <host>              one host in full (top processes, units, GPUs, desktop lag numbers)
+  sb fleet add-host NAME --ssh ALIAS [--desktop] [--order N]   probe it, then add it to ~/.config/switchboard/hosts.json
+  sb fleet wsl-keepalive [DISTRO]   the Windows command that keeps a WSL host from stopping when its console closes
+  sb halt [--reason "..."] [--host H] [--workloads]
+                                    raise HALT on every host: tracked jobs stop, nothing launches; --workloads also
+                                    disables every unit matching workload_units (never protected_units)
+  sb halt --install-guards | --list-guards | --remove-guards   systemd drop-ins that refuse to start while HALT exists
+  sb unhalt [--host H]              lower HALT
+  sb run --name NAME [--host H] [--threads N] [--mem GIB] [--gpu GIB] [--hours H] [--cwd DIR] -- command args...
+                                    the one way to launch work: placed on the fleet, run as a bounded systemd
+                                    unit, tracked under your name (queued with the reason when nothing fits)
+  sb jobs [--all] [--project p] [--host h] [--mine]     running jobs (--all adds finished ones)
+  sb jobs show <id> [--log N]       placement, resources, state, and the last N log lines (default 40)
+  sb stop <id> [--reason "..."]     stop a job (queued or running)
+  sb adopt <unit|pid> --name NAME [--host H] [--threads N --mem GIB --gpu GIB]
+                                    watch an existing unit as a job without relaunching it (never halted)
+  sb ask "question" [--options a,b] file a decision for the owner on your project
+  sb notify "text" [--info]         page the owner on the taskbar ticker (--info: FYI, no action needed)
+  sb reply <turn> "text"            answer a pane pointer you received
+  sb status <message-id>            show one message
 """
 import argparse
 import json
@@ -158,6 +180,209 @@ def setup():
     return 0
 
 
+def _gib(mib):
+    return "-" if mib is None else f"{mib / 1024:.1f}G"
+
+
+def fleet_lines(hosts):
+    rows = [("HOST", "REACH", "LOAD", "THREADS(free)", "RAM free", "GPUs (free VRAM)", "DESKTOP", "JOBS/UNTRACKED")]
+    for h in hosts:
+        c = h.get("capacity") or {}
+        reach = (f"ok {h['age_s']}s" if h.get("reachable") else "DOWN") if h.get("probed_at") or h.get("error") else "?"
+        load = c.get("load")
+        groups = {}  # identical cards collapse into one entry: "6x Tesla V100 32.0G 0%"
+        for g in c.get("gpus") or []:
+            k = (g["name"], bool(g["display"]))
+            groups.setdefault(k, []).append(g)
+        parts = []
+        for (name, disp), gs in groups.items():
+            free = min((g["vram_free_mib"] for g in gs if g["vram_free_mib"] is not None), default=None)
+            util = max((g["util"] for g in gs if g.get("util") is not None), default=None)
+            parts.append((f"{len(gs)}x " if len(gs) > 1 else "") + name.replace("NVIDIA ", "")[:22] + ("*" if disp else "")
+                         + f" {_gib(free)}" + (f" {util}%" if util is not None else ""))
+        gpus = "; ".join(parts) or "-"
+        d = h.get("desktop_metrics") or {}
+        desk = f"Xorg {d['xorg_cpu_pct']}% {d['xorg_wakeups_s']}/s" if d else ("desktop" if h.get("desktop") else "-")
+        rows.append((h["name"], reach, f"{load[0]:.1f}" if load else "-",
+                     f"{c.get('threads', '-')} ({c.get('free_threads', '-')})" if c else "-",
+                     f"{c.get('free_ram_gib', '-')}/{c.get('ram_total_gib', '-')}G" if c else "-",
+                     gpus, desk, f"{len(h.get('jobs') or [])}/{len(h.get('untracked') or [])}" if c else "-"))
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    out = ["  ".join(str(v).ljust(widths[i]) for i, v in enumerate(r)).rstrip() for r in rows]
+    for h in hosts:
+        if not h.get("reachable") and h.get("error"):
+            out.append(f"  {h['name']}: {h['error']}")
+    return out
+
+
+def fleet_cmd(args):
+    act, arg = args.action, args.arg
+    if act in ("list", "check"):
+        res = call("POST", "/api/fleet/probe", {})["fleet"] if act == "check" else call("GET", "/api/fleet")
+        if args.json:
+            print(json.dumps(res, indent=1))
+            return 0
+        print("\n".join(fleet_lines(res["hosts"])))
+        if res.get("halt"):
+            h = res["halt"]
+            print(f"HALT raised by {h['by']} at {h['at']}: {h['reason'] or 'no reason'}  (hosts: {', '.join(h['hosts']) or '-'}"
+                  + (f"; still pending: {', '.join(h['pending'])}" if h.get("pending") else "") + ")")
+        pl = res.get("placers") or {}
+        wb = pl.get("workboard")
+        if wb and not wb.get("error"):
+            open_jobs = wb.get("jobs") or []
+            print(f"gpu-workboard: {len(wb.get('cards') or [])} cards, {len(open_jobs)} open lease(s)/queued"
+                  + ("; cpu-run advisor on" if pl.get("cpu_run") else ""))
+            for j in open_jobs[:8]:
+                print(f"   {j['id']}  {j['status']:<10} {j.get('project') or '-'}/{j.get('label') or '-'}  {j.get('host') or '-'}"
+                      + (f"  {j['reason']}" if j.get("reason") else ""))
+        elif pl.get("cpu_run"):
+            print("cpu-run advisor on")
+        if not res["config"]["exists"]:
+            print(f"(no hosts file at {res['config']['path']}: this machine only; sb fleet add-host adds more)")
+        return 0
+    if act == "show":
+        res = call("GET", "/api/fleet")
+        for h in res["hosts"]:
+            if h["name"] == arg:
+                print(json.dumps(h, indent=1))
+                return 0
+        sys.exit(f"sb: no host named {arg}")
+    if act == "add-host":
+        if not arg:
+            sys.exit("sb: sb fleet add-host NAME --ssh ALIAS [--desktop] [--order N]")
+        res = call("POST", "/api/fleet/hosts", {"name": arg, "ssh": args.ssh, "desktop": args.desktop, "order": args.order})
+        print("\n".join(fleet_lines([res["host"]])))
+        print(f"written to {res['config']}")
+        return 0
+    if act == "wsl-keepalive":
+        print(call("GET", "/api/fleet/wsl-keepalive?" + urllib.parse.urlencode({"distro": arg or "Ubuntu"}))["text"])
+        return 0
+    return 0
+
+
+def halt_cmd(args):
+    if args.list_guards or args.install_guards or args.remove_guards:
+        if args.list_guards:
+            res = call("GET", "/api/fleet/guards" + (f"?host={','.join(args.host)}" if args.host else ""))
+        else:
+            res = call("POST", "/api/fleet/guards", {"action": "install" if args.install_guards else "remove",
+                                                     "hosts": args.host})
+        for r in res["results"]:
+            what = {"list": "guarded", "install": "guarded", "remove": "unguarded"}[res["action"]]
+            print(f"{r['host']}: {len(r['units'])} {what}" + (f"  ({r['error']})" if r.get("error") else ""))
+            for u in r["units"]:
+                print(f"   {u}")
+        return 0
+    res = call("POST", "/api/fleet/halt", {"from": me(), "reason": args.reason, "hosts": args.host,
+                                           "workloads": args.workloads})
+    for r in res["results"]:
+        line = f"{r['host']}: " + ("HALT raised" if r["flag"] else "NOT halted")
+        if r["stopped"]:
+            line += f"; stopped {len(r['stopped'])} job(s): " + ", ".join(r["stopped"])
+        if r["disabled"]:
+            line += f"; disabled {len(r['disabled'])}: " + ", ".join(r["disabled"])
+        if r["failed"]:
+            line += f"; FAILED to disable: " + ", ".join(r["failed"])
+        if r.get("error"):
+            line += f"  ({r['error']})"
+        print(line)
+    h = res["halt"]
+    if h.get("pending"):
+        print(f"pending (unreachable, flagged when they answer): {', '.join(h['pending'])}")
+    print("nothing launches through sb run until `sb unhalt`")
+    return 0
+
+
+def _job_line(j):
+    res = f"{j['threads']}t {j['mem_mib'] / 1024:.1f}G" + (f" gpu{j['gpu_mib'] / 1024:.1f}G" if j.get("gpu_mib") else "")
+    run = "" if j.get("runtime_s") is None else f" {j['runtime_s'] // 3600}h{(j['runtime_s'] % 3600) // 60:02d}m"
+    who = "/".join(x for x in (j.get("project"), j.get("agent")) if x)
+    tail = f"  {j['reason']}" if j.get("reason") else ""
+    via = f"  via {j['placer']}" if j.get("placer") and j["placer"] != "hub" else ""
+    via += f" {j['board_id']}" if j.get("board_id") else ""
+    via += f"  cpus {','.join(map(str, j['cpus']))}" if j.get("cpus") else ""
+    return (f"{j['id']:<14} {j['state']:<9} {j['name']:<22} {j.get('host') or '-':<10} {res:<16}{run:<8} "
+            f"{who}{'  adopted' if j.get('adopted') else ''}{via}{tail}")
+
+
+def run_cmd(args):
+    argv = [a for a in args.command if a != "--"] if args.command and args.command[0] == "--" else args.command
+    if not argv:
+        sys.exit("sb: sb run --name NAME [...] -- command args...")
+    b = {"name": args.name, "argv": argv, "cwd": args.cwd or os.getcwd(), "threads": args.threads,
+         "mem_mib": int(args.mem * 1024), "hours": args.hours, "host": args.host, "agent": me()}
+    if args.gpu:
+        b["gpu_mib"] = int(args.gpu * 1024)
+    if args.project:
+        b["project"] = args.project
+    b["lane"], b["protected"] = args.lane, args.protected
+    j = call("POST", "/api/jobs", b)
+    print(_job_line(j))
+    if j["state"] == "queued":
+        print("queued: nothing fits right now; the hub retries every probe. `sb fleet` shows what is free, "
+              "`sb stop <id>` withdraws it.")
+    return 0
+
+
+def jobs_cmd(args):
+    if args.action == "show":
+        if not args.arg:
+            sys.exit("sb: sb jobs show <id>")
+        j = call("GET", f"/api/jobs/{args.arg}?log={args.log}")
+        print(_job_line(j))
+        print(f"  unit {j['unit']} on {j.get('host')}  cwd {j.get('cwd')}  pid {j.get('pid')}  exit {j.get('exit_code')}")
+        print(f"  argv: {' '.join(j['argv'])}")
+        print(f"  created {j['created_at']}  started {j.get('started_at')}  finished {j.get('finished_at')}")
+        if j.get("log"):
+            print("  --- log")
+            print("\n".join("  " + l for l in j["log"].splitlines()[-args.log:]))
+        return 0
+    q = {}
+    if args.all:
+        q["all"] = "1"
+    for k in ("project", "host"):
+        if getattr(args, k):
+            q[k] = getattr(args, k)
+    if args.mine:
+        q["agent"] = me()
+    res = call("GET", "/api/jobs" + ("?" + urllib.parse.urlencode(q) if q else ""))
+    for j in res["jobs"]:
+        print(_job_line(j))
+    if not res["jobs"]:
+        print("no jobs" + ("" if args.all else " running (--all for finished ones)"))
+    return 0
+
+
+def stop_cmd(args):
+    j = call("POST", f"/api/jobs/{args.id}/stop", {"from": me(), "reason": args.reason})
+    print(_job_line(j))
+    return 0
+
+
+def adopt_cmd(args):
+    b = {"name": args.name, "host": args.host, "agent": me(), "project": args.project, "threads": args.threads,
+         "mem_mib": int(args.mem * 1024) if args.mem else 0}
+    if args.gpu:
+        b["gpu_mib"] = int(args.gpu * 1024)
+    if args.target.isdigit():
+        b["pid"] = int(args.target)
+    else:
+        b["unit"] = args.target
+    j = call("POST", "/api/jobs/adopt", b)
+    print(_job_line(j))
+    return 0
+
+
+def unhalt_cmd(args):
+    res = call("POST", "/api/fleet/resume", {"from": me(), "hosts": args.host})
+    for r in res["results"]:
+        print(f"{r['host']}: " + ("HALT lowered" if r["ok"] else f"not lowered ({r.get('error')})"))
+    if res["halt"]:
+        print(f"HALT still raised on: {', '.join(res['halt']['hosts'])}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="sb", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -215,6 +440,62 @@ def main():
     nt = sub.add_parser("notify")
     nt.add_argument("text")
     nt.add_argument("--info", action="store_true")
+    a = sub.add_parser("ask")
+    a.add_argument("question")
+    a.add_argument("--options", default="")
+    a.add_argument("--project")
+    r = sub.add_parser("reply")
+    r.add_argument("turn")
+    r.add_argument("text")
+    st = sub.add_parser("status")
+    st.add_argument("id")
+    fl = sub.add_parser("fleet")
+    fl.add_argument("action", nargs="?", default="list", choices=["list", "check", "show", "add-host", "wsl-keepalive"])
+    fl.add_argument("arg", nargs="?", help="host name (show, add-host) or WSL distro (wsl-keepalive)")
+    fl.add_argument("--ssh", help="ssh alias from your ~/.ssh/config")
+    fl.add_argument("--desktop", action="store_true", help="the owner's display is on this host")
+    fl.add_argument("--order", type=int, default=100, help="placement preference, 1 first")
+    fl.add_argument("--json", action="store_true")
+    ha = sub.add_parser("halt")
+    ha.add_argument("--reason", default="")
+    ha.add_argument("--host", action="append", help="only these hosts (repeatable)")
+    ha.add_argument("--workloads", action="store_true", help="also disable --now every unit matching workload_units")
+    ha.add_argument("--install-guards", action="store_true")
+    ha.add_argument("--remove-guards", action="store_true")
+    ha.add_argument("--list-guards", action="store_true")
+    uh = sub.add_parser("unhalt")
+    uh.add_argument("--host", action="append")
+    rn = sub.add_parser("run")
+    rn.add_argument("--name", required=True)
+    rn.add_argument("--host")
+    rn.add_argument("--threads", type=int, default=1)
+    rn.add_argument("--mem", type=float, default=2.0, help="GiB")
+    rn.add_argument("--gpu", type=float, help="VRAM in GiB")
+    rn.add_argument("--hours", type=float, default=12.0)
+    rn.add_argument("--cwd")
+    rn.add_argument("--project")
+    rn.add_argument("--lane", choices=["batch", "interactive"], default="batch")
+    rn.add_argument("--protected", action="store_true", help="opt out of GPU checkpoint preemption (owner's call)")
+    rn.add_argument("command", nargs=argparse.REMAINDER)
+    jb = sub.add_parser("jobs")
+    jb.add_argument("action", nargs="?", default="list", choices=["list", "show"])
+    jb.add_argument("arg", nargs="?")
+    jb.add_argument("--all", action="store_true")
+    jb.add_argument("--mine", action="store_true")
+    jb.add_argument("--project")
+    jb.add_argument("--host")
+    jb.add_argument("--log", type=int, default=40)
+    sp = sub.add_parser("stop")
+    sp.add_argument("id")
+    sp.add_argument("--reason", default="")
+    ad = sub.add_parser("adopt")
+    ad.add_argument("target", help="a unit name or a pid")
+    ad.add_argument("--name", required=True)
+    ad.add_argument("--host")
+    ad.add_argument("--project")
+    ad.add_argument("--threads", type=int, default=0)
+    ad.add_argument("--mem", type=float, default=0.0)
+    ad.add_argument("--gpu", type=float)
     a = sub.add_parser("ask")
     a.add_argument("question")
     a.add_argument("--options", default="")
@@ -340,6 +621,20 @@ def main():
                                            "idem": str(uuid.uuid4())})
         a = res["agent"]
         print(f"{a['id']} on {a['project']}{' (forked)' if res['forked'] else ''}; open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "fleet":
+        return fleet_cmd(args)
+    elif args.cmd == "halt":
+        return halt_cmd(args)
+    elif args.cmd == "unhalt":
+        return unhalt_cmd(args)
+    elif args.cmd == "run":
+        return run_cmd(args)
+    elif args.cmd == "jobs":
+        return jobs_cmd(args)
+    elif args.cmd == "stop":
+        return stop_cmd(args)
+    elif args.cmd == "adopt":
+        return adopt_cmd(args)
     elif args.cmd == "notify":
         n = call("POST", "/api/notifications", {"agent": me(), "text": args.text, "level": "info" if args.info else "need"})
         print(f"{n['id']} in the owner's Switchboard inbox")

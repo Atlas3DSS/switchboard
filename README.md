@@ -128,6 +128,15 @@ its note in `HERMES_EPHEMERAL_SYSTEM_PROMPT` (sent with each call, never stored)
 `$HERMES_HOME/state.db` by its folder, and reads the conversation from there (read-only). `sb send`, replies,
 relaunch, `sb context` and search work as they do for Claude and Codex.
 
+## Fleet: machines, jobs and the off switch
+
+Agents launch work; the hub keeps it orderly. `sb fleet` shows every machine the hub can reach (an ssh alias per host
+in `~/.config/switchboard/hosts.json`; this machine alone with no file), with free threads, RAM and GPUs, probed every
+30 s with nothing installed remotely. `sb run --name NAME --threads N --mem GIB [--gpu GIB] -- command` is the one way
+to launch work: placed on a host that has room, run as a bounded systemd unit in its own slice, tracked under the
+agent that launched it (`sb jobs`, `sb stop`). `sb halt` stops tracked jobs and raises a flag that systemd itself
+honours, so timers and restart loops cannot bring work back until `sb unhalt`. Details: [docs/FLEET.md](docs/FLEET.md).
+
 ## Files
 
 | Path | What |

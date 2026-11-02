@@ -22,6 +22,13 @@ def launch_note(agent):
         src = (json.loads(agent.get("fork_from") or "null") or {}).get("agent")
     except (ValueError, AttributeError):
         src = None
+    note += (" Work that runs for minutes or hours, or uses more than a core or a GPU, is launched with "
+             "`sb run --name NAME --threads N --mem GIB [--gpu GIB] [--hours H] -- command args...`: the hub places it "
+             "on the fleet (`sb fleet` shows every host and what is free), runs it as a bounded systemd unit and tracks "
+             "it under your name (`sb jobs`, `sb jobs show <id>`, `sb stop <id>`). Never use `systemd-run`, `systemctl "
+             "start` or a background shell for workloads: anything heavy launched another way shows on the Fleet panel "
+             "as untracked work attributed to you; `sb adopt <unit> --name NAME` brings an existing unit under tracking. "
+             "While `sb fleet` shows HALT raised, launch nothing.")
     if src:
         note += (f" You were forked from agent '{src}' as a side agent the owner summoned: the "
                  "conversation above is a copy of its context, and that agent keeps working on its own. Do the "

@@ -1,0 +1,57 @@
+{
+  "hosts": [
+    {
+      "name": "desk",
+      "ssh": null,
+      "desktop": true,
+      "order": 3,
+      "reserve": {
+        "cores": 1,
+        "ram_gib": 8
+      }
+    },
+    {
+      "name": "workstation",
+      "ssh": "workstation",
+      "desktop": false,
+      "order": 2,
+      "reserve": {
+        "cores": 1,
+        "ram_gib": 8
+      }
+    },
+    {
+      "name": "gpubox",
+      "ssh": "gpubox",
+      "desktop": false,
+      "order": 1,
+      "reserve": {
+        "cores": 2,
+        "ram_gib": 16
+      }
+    }
+  ],
+  "jobs": {
+    "slice_cpu_weight": 20,
+    "untracked_policy": "flag",
+    "display_gpu": "avoid",
+    "gpu_workboard": "auto",
+    "cpu_run": "auto"
+  },
+  "protected_units": [
+    "switchboard*",
+    "*-tunnel.service",
+    "pipewire*",
+    "dbus*"
+  ],
+  "workload_units": [
+    "research-*",
+    "*-scorer.service",
+    "*-worker.service"
+  ],
+  "budgets": {
+    "default": {
+      "jobs": 4
+    }
+  }
+}

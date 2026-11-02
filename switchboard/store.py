@@ -40,6 +40,18 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, agent TEXT, text TEXT, created_at TEXT);
 CREATE INDEX IF NOT EXISTS notes_project ON notes(project, id);
+CREATE TABLE IF NOT EXISTS hosts (
+  name TEXT PRIMARY KEY, cfg TEXT, doc TEXT, probed_at TEXT, ok INTEGER DEFAULT 0, error TEXT, ms INTEGER);
+CREATE TABLE IF NOT EXISTS host_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, ts TEXT, load1 REAL, available_mib INTEGER, gpus TEXT, desktop TEXT);
+CREATE INDEX IF NOT EXISTS host_samples_host ON host_samples(host, id);
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY, name TEXT, project TEXT, agent TEXT, host TEXT, unit TEXT, cwd TEXT, argv TEXT,
+  threads INTEGER, mem_mib INTEGER, gpu_mib INTEGER, gpu_uuid TEXT, hours REAL, state TEXT, reason TEXT,
+  adopted INTEGER DEFAULT 0, collect INTEGER DEFAULT 0, pid INTEGER, invocation TEXT, cpu_s REAL, mem_cur_mib INTEGER,
+  exit_code INTEGER, created_at TEXT, started_at TEXT, finished_at TEXT, last_seen TEXT, host_pref TEXT, stopped_by TEXT,
+  board_id TEXT, cpus TEXT, protected INTEGER DEFAULT 0, lane TEXT, placer TEXT);
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, host);
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, project TEXT, agent TEXT, question TEXT, options TEXT DEFAULT '[]',
   state TEXT DEFAULT 'open', answer TEXT, created_at TEXT, answered_at TEXT);
