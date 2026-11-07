@@ -25,6 +25,7 @@ os.environ.setdefault("SB_WORKSPACE", os.path.join(TMP, "ws"))
 os.environ.setdefault("SB_CLAUDE_BIN", os.path.join(HERE, "fake_cli.py"))
 os.environ.setdefault("SB_CODEX_BIN", os.path.join(HERE, "fake_cli.py"))
 
+assert "/.config/" not in os.environ["SB_HOSTS"], "tests must never touch the real hosts file"  # 2026-11-01: one run overwrote it
 from switchboard import hosts, jobs, placers  # noqa: E402
 from switchboard.hub import Hub  # noqa: E402
 from switchboard.store import Store  # noqa: E402
