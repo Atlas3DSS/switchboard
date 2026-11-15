@@ -162,10 +162,14 @@ const S = { ov: null, agents: new Map(), projects: new Map(), accounts: [], desk
 window.__sbTerms = {};
 
 /* model suggestions for the CLIs; API accounts suggest the models their endpoint listed during setup */
-const MODEL_HINTS = { claude: ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5'], codex: [], gemini: [], hermes: [] };
-const KIND_LABEL = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI', hermes: 'Hermes Agent', api: 'built-in agent', shell: 'shell' };
-const STATE_WORD = { busy: 'working', idle: 'idle', starting: 'starting', stopped: 'stopped', reconnecting: 'reconnecting' };
-const queueWhy = (a) => `${a.paused ? 'paused' : a.queue_reason || 'waiting to type'}${a.queued_since ? ', oldest ' + ago(a.queued_since) : ''}`;
+const MODEL_HINTS = { claude: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], codex: [], gemini: [], hermes: [], antigravity: [] };
+const KIND_LABEL = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI', hermes: 'Hermes Agent', antigravity: 'Antigravity', api: 'built-in agent', shell: 'shell' };
+const AGENT_CLIS = ['claude', 'codex', 'gemini', 'hermes', 'antigravity'];
+/* why an agent's queue is not moving, and for how long (paused, a choice open, a turn running, ...) */
+const queueWhy = (a) => `${a.paused ? 'paused' : a.queue_reason || 'waiting to type'}${a.queued_since ? ', oldest ' + ago(a.queued_since) : ''}`;  // interactive agent CLIs (switchboard/discovery.py AGENT_CLIS)
+const KIND_NAME = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', hermes: 'Hermes', antigravity: 'Antigravity', api: 'built-in' };
+const LIMIT_LABEL = { session: 'Session (5h)', weekly: 'Weekly', fable: 'Fable weekly', '5h': 'Session (5h)', wk: 'Weekly', Fable: 'Fable weekly' };
+const STATE_WORD = { busy: 'working', idle: 'idle', starting: 'starting', stopped: 'stopped' };
 
 const agentName = (a) => (a && (a.title || a.id)) || '';
 const agentHref = (a) => `#/p/${enc(a.project || '')}/${enc(a.id)}`;
@@ -188,7 +192,8 @@ function lsJSON(k) { try { return JSON.parse(lsGet(k) || 'null'); } catch (e) { 
 
 /* ---------- small shared pieces ---------- */
 function stateDot() { return h('span', { class: 'dot' }); }
-function setDot(dot, a) { setCls(dot, 'dot s-' + (a.state || 'stopped')); setAttr(dot, 'title', STATE_WORD[a.state] || a.state || ''); }
+const agentState = (a) => a.paused ? 'paused' : (STATE_WORD[a.state] || a.state || '');
+function setDot(dot, a) { setCls(dot, 'dot s-' + (a.paused ? 'paused' : a.state || 'stopped')); setAttr(dot, 'title', agentState(a)); }
 function modelTag() { return h('span', { class: 'mtag' }); }
 function setModelTag(el, a) {
   if (a.provider === 'shell') { setCls(el, 'mtag'); setText(el, 'shell'); setAttr(el, 'title', 'Plain shell (' + (a.cwd || '~') + ')'); return; }
@@ -353,118 +358,6 @@ function chatEntry() {
     },
   };
 }
-function makeChat() {
-  const status = h('span', { class: 'chat-status' });
-  const closeBtn = h('button', { class: 'pbtn chat-close', type: 'button', text: '✕', title: 'Close (Esc)', hidden: true });
-  const clearBtn = h('button', { class: 'pbtn', type: 'button', text: 'New chat', title: 'Clear the Switchboard conversation and start over (or type /clear)' });
-  const findBtn = h('button', { class: 'pbtn', type: 'button', text: 'Sessions', 'aria-pressed': 'false', title: 'Search past agent sessions (Claude Code, Codex, built-in) and resume one' });
-  const finder = makeSessionFinder();
-  const log = h('div', { class: 'chat-log', role: 'log', 'aria-live': 'polite' });
-  const list = keyedList(log, (e) => e.key, chatEntry);
-  const empty = h('div', { class: 'chat-empty', text: 'Tell Switchboard what you want to work on — it opens the right agent.' });
-  const noDesk = h('div', { class: 'chat-empty' }, 'The chat runs on one of your accounts. ', h('a', { href: '#/setup', text: 'Set one up' }), ' to start.');
-  const thinking = h('div', { class: 'chat-thinking', hidden: true }, h('span', { class: 'dot s-busy' }), ' thinking…');
-  const ta = h('textarea', { rows: 2, placeholder: 'e.g. "open the payroll agent" — Enter sends, Shift+Enter new line', 'aria-label': 'Message Switchboard' });
-  const send = h('button', { class: 'btn primary', type: 'submit', text: 'Send' });
-  const form = h('form', { class: 'chat-form' }, ta, send);
-  const el = h('section', { class: 'chat' },
-    h('div', { class: 'chat-h' }, h('img', { src: 'logo.svg', width: 18, height: 18, alt: '' }), h('strong', { text: 'Switchboard' }), status, h('span', { class: 'spacer' }), findBtn, clearBtn, closeBtn),
-    finder.el, h('div', { class: 'chat-scroll' }, log, empty, noDesk, thinking), form);
-  const scroller = el.querySelector('.chat-scroll');
-  let timer = null, entries = [], msgs = [], optimistic = [], loaded = false, onClose = null;
-
-  function render() {
-    const seenUser = entries.filter((e) => e.role === 'user').slice(-12).map((e) => e.text);
-    const inTranscript = (body) => seenUser.some((t) => t.includes(body.trim().slice(0, 200)));
-    const pend = [];
-    for (const m of msgs) {
-      if (inTranscript(m.body)) continue;
-      if (m.state === 'queued' || m.state === 'delivering') pend.push({ key: 'm' + m.id, role: 'user', from: m.from, text: m.body, ts: m.created_at, pending: true, note: m.state === 'queued' ? 'queued' : 'sent' });
-      else if (m.state === 'failed' && parseTime(m.created_at) > Date.now() + clockSkew - 30 * 60e3) pend.push({ key: 'm' + m.id, role: 'user', from: m.from, text: m.body, ts: m.created_at, failed: true, note: 'failed: ' + (m.error || 'not delivered') });
-    }
-    for (const o of optimistic) if (!pend.some((p) => p.key === 'm' + o.id) && !inTranscript(o.body)) pend.push({ key: 'm' + o.id, role: 'user', text: o.body, ts: o.ts, pending: true, note: 'sending' });
-    const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
-    const all = entries.filter((e) => e.role === 'user' || e.role === 'assistant').map((e) => ({ ...e, key: 'e' + e.id + (e.part ? '.' + e.part : '') })).concat(pend);
-    list.sync(all);
-    const d = S.desk;
-    empty.hidden = all.length > 0 || !loaded || !d;
-    noDesk.hidden = !!d || !S.ov;
-    const busy = (d && d.state === 'busy') || pend.some((p) => p.pending);
-    thinking.hidden = !busy;
-    setText(status, !d ? (S.ov ? 'needs an account (Setup)' : '') : busy ? 'working' : (d.model || '').replace(/^claude-/, ''));
-    if (atBottom || !loaded) scroller.scrollTop = scroller.scrollHeight;
-    return busy;
-  }
-  async function poll() {
-    clearTimeout(timer);
-    let busy = false;
-    if (el.isConnected && S.desk) {
-      try {
-        const [c, m] = await Promise.all([api('GET', '/agents/desk/chat?limit=30'), api('GET', '/messages?agent=desk&limit=10')]);
-        entries = (c && c.entries) || [];
-        msgs = ((m && m.messages) || []).filter((x) => x.to === 'desk');
-        optimistic = optimistic.filter((o) => !msgs.some((x) => x.id === o.id) && Date.now() - o.at < 15000);
-        loaded = true;
-      } catch (e) { /* hub away: the topbar says so */ }
-      busy = render();
-    }
-    timer = setTimeout(poll, busy ? 1500 : 5000);
-  }
-  async function clearChat() {
-    const d = S.desk;
-    if (d && d.state === 'busy' && !confirm('Switchboard is answering right now. Stop it and start a new chat?')) return;
-    clearBtn.disabled = true;
-    try {
-      await api('POST', '/agents/desk/clear', {});
-      entries = []; msgs = []; optimistic = []; ta.value = '';
-      list.sync([]);
-      toast('New Switchboard chat');
-      tick();
-      setTimeout(poll, 300);
-    } catch (err) { toast(err.message, 'err'); } finally { clearBtn.disabled = false; }
-  }
-  function showFinder(on) {
-    finder.el.hidden = !on;
-    setAttr(findBtn, 'aria-pressed', on ? 'true' : 'false');
-    el.classList.toggle('finding', on);
-    if (on) finder.open(); else ta.focus();
-  }
-  async function submit() {
-    const body = ta.value.trim();
-    if (!body) return;
-    if (/^\/(clear|new|reset)$/i.test(body)) { clearChat(); return; }
-    const sm = body.match(/^\/(sessions|resume)\b\s*(.*)$/i);
-    if (sm) { ta.value = ''; showFinder(true); finder.search(sm[2]); return; }
-    send.disabled = true;
-    try {
-      const r = await api('POST', '/messages', { to: 'desk', body, idem: uuid() });
-      ta.value = '';
-      const m = (r && r.message) || {};
-      if (m.error) toast(m.error, 'err');
-      optimistic.push({ id: m.id || uuid(), body, ts: new Date().toISOString(), at: Date.now() });
-      render();
-      scroller.scrollTop = scroller.scrollHeight;
-      setTimeout(poll, 400);
-    } catch (err) { toast(err.message, 'err'); } finally { send.disabled = false; }
-  }
-  form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); }
-    else if (e.key === 'Escape' && onClose) { e.preventDefault(); onClose(); }
-  });
-  closeBtn.addEventListener('click', () => onClose && onClose());
-  clearBtn.addEventListener('click', clearChat);
-  findBtn.addEventListener('click', () => showFinder(finder.el.hidden));
-  finder.onDone = () => showFinder(false);
-  return {
-    el,
-    mount(parent, close) { onClose = close || null; closeBtn.hidden = !close; parent.append(el); render(); poll(); },
-    focus() { ta.focus(); },
-    poll,
-  };
-}
-const CHAT = makeChat();
-
 /* ---------- past sessions: search every Claude/Codex session, resume one as an agent ---------- */
 function makeSessionFinder() {
   const q = h('input', { type: 'search', placeholder: 'words you remember, a folder, or a session id', 'aria-label': 'Search past sessions', autocomplete: 'off', spellcheck: 'false' });
@@ -585,6 +478,54 @@ function newAgentForm(getPid, onDone) {
   };
 }
 
+/* Pending messages are separate from the terminal until delivery. */
+function openQueue(aid) {
+  document.getElementById('agent-queue')?.close();
+  const title = h('strong', { text: 'Pending messages' });
+  const reason = h('p');
+  const list = h('div');
+  const close = h('button', { class: 'pbtn', text: 'Close', type: 'button' });
+  const resume = h('button', { class: 'pbtn', text: 'Resume queue', type: 'button', hidden: true });
+  const dialog = h('dialog', { id: 'agent-queue', class: 'queue-dialog', 'aria-label': 'Pending messages' },
+    h('div', { class: 'queue-head' }, title, h('span', { class: 'spacer' }), resume, close), reason, list);
+  let timer, stopped = false, busy = false;
+  close.onclick = () => dialog.close();
+  dialog.addEventListener('close', () => { stopped = true; clearTimeout(timer); dialog.remove(); });
+  async function refresh() {
+    clearTimeout(timer);
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      const data = await api('GET', `/agents/${enc(aid)}/queue`);
+      if (stopped) return;
+      const a = data.agent, ms = data.messages;
+      setText(title, `${agentName(a)} · ${ms.length} pending`);
+      setText(reason, ms.length ? queueWhy(a) + '. These messages have not reached the terminal yet.' : 'No pending messages. Delivered messages appear in the terminal.');
+      resume.hidden = !a.paused;
+      const sig = JSON.stringify(ms);
+      if (list.dataset.sig !== sig) {
+        list.dataset.sig = sig;
+        list.replaceChildren(...ms.map(m => {
+          const cancel = h('button', { class: 'pbtn', text: 'Cancel message', type: 'button' });
+          guarded(cancel, async () => {
+            try { await api('POST', `/messages/${enc(m.id)}/cancel`, {}); }
+            finally { await refresh(); tick(); }
+          });
+          return h('article', { class: 'queue-message' },
+            h('div', { class: 'queue-head' }, h('strong', { text: `From ${m.from || 'owner'}` }),
+              h('span', { text: ago(m.created_at), title: absTime(m.created_at) }), h('span', { class: 'spacer' }), cancel),
+            h('p', { class: 'muted', text: m.error || 'Waiting for delivery' }),
+            h('div', { class: 'queue-body', text: m.body }),
+            (m.attachments || []).map(x => h('a', { href: x.url, target: '_blank', rel: 'noopener', text: 'Open attachment' })));
+        }));
+      }
+    } catch (e) { if (!stopped) setText(reason, e.message); }
+    finally { busy = false; if (!stopped) timer = setTimeout(refresh, 2000); }
+  }
+  guarded(resume, async () => { await api('PATCH', `/agents/${enc(aid)}`, { paused: false }); await refresh(); tick(); });
+  document.body.append(dialog); dialog.showModal(); refresh();
+}
+
 /* ---------- overview: project cards ---------- */
 function agentRow() {
   const dot = stateDot();
@@ -593,20 +534,26 @@ function agentRow() {
   const acct = h('span', { class: 'acct' });
   const mt = modelTag();
   const st = h('span', { class: 'ar-state' });
-  const q = h('span', { class: 'badge q' });
+  let aid;
+  const q = h('span', { class: 'badge q', role: 'button', tabindex: '0' });
+  q.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); openQueue(aid); });
+  q.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); openQueue(aid); } });
   const blk = h('span', { class: 'badge warn', text: 'blocked' });
   const el = h('a', { class: 'arow' }, dot, title, id, h('span', { class: 'spacer' }), q, blk, acct, mt, st);
   el.addEventListener('click', (e) => e.stopPropagation());
   return {
     el,
     update(a) {
+      aid = a.id;
       setAttr(el, 'href', agentHref(a));
       setDot(dot, a);
       setText(title, agentName(a)); setText(id, a.title && a.title !== a.id ? a.id : ''); setAttr(title, 'title', a.last_text ? a.last_text.slice(-300) : '');
       setText(acct, a.account); setAttr(acct, 'title', 'Account');
       setModelTag(mt, a);
-      setText(st, a.switching ? '→ ' + a.switching.to : (STATE_WORD[a.state] || a.state));
-      setText(q, a.queued ? a.queued + ' queued' : ''); q.hidden = !a.queued; setAttr(q, 'title', a.queued ? queueWhy(a) : '');
+      setText(st, a.switching ? '→ ' + a.switching.to : agentState(a));
+      setText(q, a.queued ? a.queued + (a.paused ? ' paused' : ' queued') : ''); q.hidden = !a.queued;
+      setAttr(q, 'title', a.queued ? 'View pending messages: ' + queueWhy(a) : '');
+      setAttr(q, 'aria-label', `View ${a.queued || 0} pending messages for ${agentName(a)}`);
       blk.hidden = !a.launch_block; setAttr(blk, 'title', a.launch_block || '');
     },
   };
@@ -620,12 +567,45 @@ function projectCard(p0) {
   const agBox = h('div', { class: 'pc-agents' });
   const ags = keyedList(agBox, (a) => a.id, agentRow);
   const none = h('div', { class: 'muted small', text: 'No agents yet.' });
-  const addBtn = h('button', { class: 'btn ghost small', type: 'button', text: '+ Agent' });
-  const form = newAgentForm(() => pid);
-  addBtn.addEventListener('click', (e) => { e.stopPropagation(); form.toggle(); });
+  const addBtn = h('button', { class: 'btn ghost small', type: 'button' });  // folds the agents outside the seats
+  const nodeBox = h('div', { class: 'pc-nodes' });
+  const seatBtn = {};
+  for (const [role, short] of [['lead', 'Lead Opus'], ['architect', 'Architect'], ['tasker', 'Tasker'], ['janitor', 'Janitor']]) {
+    const b = h('button', { class: 'pc-node', type: 'button' });
+    b.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const n = b._seat; if (!n) return;
+      if (n.state === 'live') { location.hash = `#/p/${enc(pid)}/${enc(n.agent)}`; return; }
+      const what = n.agent ? `${n.agent} has been idle ${n.idle_hours ?? '?'} h. Clear its conversation and brief it as ${short}?`
+        : `Start a clean ${short} on ${n.provider} ${n.model}?`;
+      if (!confirm(what)) return;
+      try { const r = await api('POST', `/projects/${enc(pid)}/nodes/${role}/pickup`, {}); toast(`${short}: ${r.action} ${r.agent}`); tick(); location.hash = `#/p/${enc(pid)}/${enc(r.agent)}`; }
+      catch (err) { toast(err.message, 'err'); }
+    });
+    seatBtn[role] = [b, short]; nodeBox.append(b);
+  }
+  const wikiBtn = h('button', { class: 'pc-node wiki', type: 'button', text: 'Wiki' });
+  wikiBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      const r = await api('GET', `/projects/${enc(pid)}/wiki?format=md`);
+      const close = h('button', { class: 'btn small', type: 'button', text: 'Close' });
+      const box = h('div', { class: 'wiki-pop' }, h('div', { class: 'wiki-bar' }, h('b', { text: 'Live wiki: ' + pid }), h('span', { class: 'spacer' }), close), h('pre', { text: r.markdown }));
+      close.addEventListener('click', () => box.remove());
+      document.body.append(box);
+    } catch (err) { toast(err.message, 'err'); }
+  });
+  nodeBox.append(wikiBtn);
+  addBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const ex = addBtn._extras || [];
+    if (!confirm(`Retire ${ex.join(', ')}? Their conversations go to the project's memory and stay resumable; their open work passes to the lead. An agent in the middle of a turn is left alone.`)) return;
+    try { const r = await api('POST', `/projects/${enc(pid)}/nodes/fold`, {}); toast(`folded ${r.folded.length}` + (r.left_busy.length ? `, left busy: ${r.left_busy.join(', ')}` : '')); tick(); }
+    catch (err) { toast(err.message, 'err'); }
+  });
   const el = h('article', { class: 'pcard' },
     h('div', { class: 'pc-head' }, name, flags, h('span', { class: 'spacer' }), last),
-    goal, agBox, none, h('div', { class: 'pc-foot' }, addBtn), form.el);
+    goal, nodeBox, agBox, none, h('div', { class: 'pc-foot' }, addBtn));
   el.addEventListener('click', (e) => {
     if (e.target.closest('a,button,input,select,textarea,form,label')) return;
     if (getSelection && String(getSelection())) return;
@@ -635,14 +615,420 @@ function projectCard(p0) {
     el,
     update(p) {
       setText(name, p.name || p.id);
-      setText(flags, [p.paused && 'paused', p.stale && 'quiet', p.archived && 'archived'].filter(Boolean).join(' · '));
+      setText(flags, [p.paused && 'paused', p.outside_read && 'reads out', p.outside_write && 'writes out', p.stale && 'quiet', p.archived && 'archived'].filter(Boolean).join(' · '));
       setText(last, ago(p.last_activity)); setAttr(last, 'title', absTime(p.last_activity));
       const g = p.next_step ? `Next: ${p.next_step}` : (p.goal || p.status_note || '');
       setText(goal, g); setAttr(goal, 'title', [p.goal, p.next_step && 'Next: ' + p.next_step, p.status_note].filter(Boolean).join('\n'));
       goal.hidden = !g;
+      for (const n of p.nodes || []) {
+        const [b, short] = seatBtn[n.role] || []; if (!b) continue;
+        b._seat = n;
+        setText(b, `${short}: ${n.agent || 'empty'}`);
+        setCls(b, 'pc-node ' + n.state);
+        setAttr(b, 'title', n.agent ? `${n.title}: ${n.agent} on ${n.running_provider}/${n.account} ${n.running_model || ''}, idle ${n.idle_hours ?? '?'} h. ${n.state === 'live' ? 'Open it (its session is kept).' : 'Click to clear and brief it.'}` : `${n.title}: empty. Click to start a clean one on ${n.provider} ${n.model}.`);
+      }
+      addBtn._extras = p.node_extras || [];
+      setText(addBtn, `Fold ${addBtn._extras.length} outside the seats`); addBtn.hidden = !addBtn._extras.length;
       const list = projectAgents(pid);
       ags.sync(list); none.hidden = list.length > 0;
       setCls(el, 'pcard' + (list.some((a) => a.state === 'busy') ? ' busy' : '') + (p.archived ? ' arch' : ''));
+    },
+  };
+}
+
+/* ---------- master work queue (sb work): the owner, the Switchboard chat and every agent edit the same list ---------- */
+const WORK_STATUS = ['todo', 'doing', 'blocked', 'done', 'dropped'];
+function workRow(w0) {
+  const pri = h('select', { class: 'wq-pri', 'aria-label': 'Priority' }, [1, 2, 3].map((n) => h('option', { value: n, text: 'P' + n })));
+  const st = h('select', { class: 'wq-st', 'aria-label': 'Status' }, WORK_STATUS.map((x) => h('option', { value: x, text: x })));
+  const title = h('input', { type: 'text', class: 'wq-title', 'aria-label': 'Title', autocomplete: 'off' });
+  const proj = h('a', { class: 'wq-proj' });
+  const meta = h('span', { class: 'wq-meta' });
+  const del = h('button', { class: 'pbtn wq-del', type: 'button', text: '✕', title: 'Delete this item' });
+  const detail = h('div', { class: 'wq-detail' });
+  const el = h('div', { class: 'wq-row' }, h('div', { class: 'wq-line' }, pri, st, title, proj, meta, del), detail);
+  let cur = w0;
+  async function save(patch) {
+    try { cur = await api('PATCH', '/work/' + cur.id, patch); render(); tick(); } catch (err) { toast(err.message, 'err'); render(); }
+  }
+  pri.addEventListener('change', () => save({ priority: +pri.value }));
+  st.addEventListener('change', () => save({ status: st.value }));
+  title.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); title.blur(); } else if (e.key === 'Escape') { title.value = cur.title; title.blur(); }
+  });
+  title.addEventListener('blur', () => { const t = title.value.trim(); if (t && t !== cur.title) save({ title: t }); else title.value = cur.title; });
+  del.addEventListener('click', async () => {
+    if (!confirm(`Delete #${cur.id} "${cur.title}"? (Marking it done or dropped keeps a record.)`)) return;
+    try { await api('DELETE', '/work/' + cur.id); tick(); } catch (err) { toast(err.message, 'err'); }
+  });
+  function render() {
+    const w = cur;
+    if (document.activeElement !== pri) pri.value = String(w.priority);
+    if (document.activeElement !== st) st.value = w.status;
+    if (document.activeElement !== title && title.value !== w.title) title.value = w.title;
+    setAttr(title, 'title', `#${w.id} · added by ${w.created_by || 'owner'} ${ago(w.created_at)}`);
+    setText(proj, w.project ? projName(w.project) : ''); setAttr(proj, 'href', w.project ? '#/p/' + enc(w.project) : '#'); proj.hidden = !w.project;
+    setText(meta, [w.agent && '@' + w.agent + (S.agents.has(w.agent) ? '' : ' (gone)'), ago(w.updated_at)].filter(Boolean).join(' · '));
+    setText(detail, w.detail || ''); setAttr(detail, 'title', w.detail || ''); detail.hidden = !w.detail;
+    setCls(el, `wq-row s-${w.status} p${w.priority}`);
+  }
+  return { el, update(w) { cur = w; render(); } };
+}
+function projectOptions(sel, first) {
+  const ps = [...S.projects.values()].filter((p) => !p.archived && p.id !== 'unsorted').sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+  const sig = ps.map((p) => p.id + '=' + p.name).join('|');
+  if (sel.dataset.sig === sig) return;
+  const keep = sel.value;
+  sel.replaceChildren(h('option', { value: '', text: first }), ...ps.map((p) => h('option', { value: p.id, text: p.name || p.id })));
+  sel.value = ps.some((p) => p.id === keep) ? keep : '';
+  sel.dataset.sig = sig;
+}
+function workPanel() {
+  const count = h('span', { class: 'n' });
+  const filter = h('select', { class: 'wq-filter', 'aria-label': 'Show work for project' });
+  const showDone = h('input', { type: 'checkbox' });
+  const doneLbl = h('label', { class: 'wq-done' }, showDone, 'finished');
+  const showStale = h('input', { type: 'checkbox' });
+  const staleN = h('span');
+  const staleLbl = h('label', { class: 'wq-done', title: 'Open items nobody has touched for 3 days. Their agents are asked once a day to close, drop or annotate them.' }, showStale, 'stale ', staleN);
+  const STALE_MS = 3 * 86400e3;
+  const isStale = (w) => w.open && Date.now() - Date.parse(w.updated_at) > STALE_MS;
+  const tIn = h('input', { type: 'text', placeholder: 'Add work… (Enter)', 'aria-label': 'New work item', autocomplete: 'off' });
+  const pSel = h('select', { 'aria-label': 'Project for the new item' });
+  const priSel = h('select', { 'aria-label': 'Priority for the new item' }, [1, 2, 3].map((n) => h('option', { value: n, text: 'P' + n })));
+  priSel.value = '2';
+  const add = h('button', { class: 'btn primary small', type: 'submit', text: 'Add' });
+  const form = h('form', { class: 'wq-add' }, tIn, pSel, priSel, add);
+  const box = h('div', { class: 'wq-list' });
+  const rows = keyedList(box, (w) => w.id, workRow);
+  const empty = h('div', { class: 'muted small wq-empty', text: 'Nothing queued. Add work here, or tell Switchboard; agents add what they leave unfinished.' });
+  const el = h('section', { class: 'block wq' }, h('h2', null, 'Work queue ', count, h('span', { class: 'spacer' }), filter, staleLbl, doneLbl), form, box, empty);
+  filter.value = lsGet('sb.wq.project') || '';
+  showDone.checked = lsGet('sb.wq.done') === '1';
+  showStale.checked = lsGet('sb.wq.stale') === '1';
+  function update() {
+    projectOptions(filter, 'All projects');
+    projectOptions(pSel, 'No project');
+    const all = (S.ov && S.ov.work) || [];
+    const pid = filter.value;
+    const mine = all.filter((w) => !pid || w.project === pid);
+    const stale = mine.filter(isStale).length;
+    const list = mine.filter((w) => (w.open ? showStale.checked || !isStale(w) : showDone.checked));
+    rows.sync(list);
+    box.hidden = !list.length; empty.hidden = list.length > 0;
+    const open = mine.filter((w) => w.open).length;
+    setText(count, `${open - stale} live` + (stale ? ` · ${stale} stale` : '') + (mine.some((w) => w.status === 'doing' && !isStale(w)) ? ` · ${mine.filter((w) => w.status === 'doing' && !isStale(w)).length} in progress` : ''));
+    setText(staleN, stale ? `(${stale})` : ''); staleLbl.hidden = !stale && !showStale.checked;
+  }
+  filter.addEventListener('change', () => { lsSet('sb.wq.project', filter.value); if (filter.value) pSel.value = filter.value; update(); });
+  showDone.addEventListener('change', () => { lsSet('sb.wq.done', showDone.checked ? '1' : ''); update(); });
+  showStale.addEventListener('change', () => { lsSet('sb.wq.stale', showStale.checked ? '1' : ''); update(); });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const title = tIn.value.trim();
+    if (!title) { tIn.focus(); return; }
+    add.disabled = true;
+    try {
+      await api('POST', '/work', { title, project: pSel.value || null, priority: +priSel.value });
+      tIn.value = ''; await tick(); tIn.focus();
+    } catch (err) { toast(err.message, 'err'); } finally { add.disabled = false; }
+  });
+  return { el, update };
+}
+
+/* ---------- fleet: hosts, HALT, tracked jobs, untracked work (docs/FLEET.md) ---------- */
+const JOB_STATES_OPEN = ['queued', 'running', 'stopping'];
+function fmtDur(s) {
+  if (s == null || isNaN(s)) return '';
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  if (s < 86400) return (s / 3600).toFixed(s < 36000 ? 1 : 0) + 'h';
+  return (s / 86400).toFixed(1) + 'd';
+}
+function fmtMib(n) { return n == null ? '—' : n >= 1024 ? (n / 1024).toFixed(n >= 10240 ? 0 : 1) + 'G' : Math.round(n) + 'M'; }
+function fmtGib(n) { return n == null ? '—' : (n >= 100 ? Math.round(n) : Number(n).toFixed(1).replace(/\.0$/, '')) + 'G'; }
+function gpuName(s) { return String(s || 'GPU').replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '').replace(/^Tesla\s+/i, ''); }
+
+/* one chip per GPU: a star marks the card that drives the owner's display (jobs avoid it) */
+function gpuChip() {
+  const el = h('span', { class: 'gpu' });
+  return {
+    el,
+    update(g) {
+      setText(el, `${g.display ? '★ ' : ''}${gpuName(g.name)} ${fmtMib(g.free_mib)} free${g.util != null ? ' · ' + g.util + '%' : ''}`);
+      setAttr(el, 'title', `${g.name || 'GPU'}: ${fmtMib(g.free_mib)} of ${fmtMib(g.total_mib)} VRAM free${g.util != null ? `, ${g.util}% busy` : ''}${g.display ? '. Drives the display: jobs use it only when no other card fits.' : ''}`);
+      setCls(el, 'gpu' + (g.display ? ' display' : '') + (g.util >= 90 ? ' hot' : ''));
+    },
+  };
+}
+
+/* one row per host: reachability mark, free threads / RAM, GPUs, the Xorg numbers on the desktop host, job counts */
+function hostRow() {
+  const mark = h('i', { class: 'hmark' });
+  const name = h('strong', { class: 'hname' });
+  const badge = h('span', { class: 'hbadge', text: 'desktop', title: 'The host whose display the owner sits at. Jobs here run at low CPU weight.' });
+  const note = h('span', { class: 'hnote' });
+  const cpu = h('span', { class: 'hstat' });
+  const ram = h('span', { class: 'hstat' });
+  const gpuBox = h('span', { class: 'hgpus' });
+  const gpus = keyedList(gpuBox, (g, i) => (g.name || '') + '#' + (g.index != null ? g.index : i), gpuChip);
+  const xorg = h('span', { class: 'hstat hxorg' });
+  const counts = h('span', { class: 'hstat hcounts' });
+  const el = h('div', { class: 'host' },
+    h('div', { class: 'host-h' }, mark, name, badge, note),
+    h('div', { class: 'host-s' }, cpu, ram, gpuBox, xorg, counts));
+  return {
+    el,
+    update(x) {
+      setText(name, x.name);
+      badge.hidden = !x.desktop;
+      const old = x.age_s != null && x.age_s > 120;
+      let why = '';
+      if (!x.reachable) why = 'unreachable' + (x.age_s != null ? ' · last seen ' + fmtDur(x.age_s) + ' ago' : '');
+      else if (old) why = 'last probe ' + fmtDur(x.age_s) + ' ago';
+      setText(note, why);
+      setAttr(note, 'title', x.error || '');
+      setAttr(mark, 'title', x.reachable ? `reachable · probed ${x.age_s != null ? fmtDur(x.age_s) + ' ago' : 'just now'}` : (x.error || 'unreachable'));
+      setCls(el, 'host' + (x.reachable ? (old ? ' old' : '') : ' off') + (x.desktop ? ' desktop' : ''));
+      const haveCap = x.threads != null;
+      setCls(cpu, 'hstat' + (haveCap ? '' : ' herr'));
+      setText(cpu, haveCap ? `${x.free_threads} of ${x.threads} threads free${x.load1 != null ? ' · load ' + Number(x.load1).toFixed(1) : ''}` : (x.error || 'no probe yet'));
+      setAttr(cpu, 'title', haveCap ? 'Threads minus the host reserve minus the one-minute load' : (x.error || ''));
+      setText(ram, haveCap ? `${fmtGib(x.free_ram_gib)} of ${fmtGib(x.ram_total_gib)} RAM free` : '');
+      setAttr(ram, 'title', 'Available RAM minus the host reserve');
+      ram.hidden = !haveCap;
+      gpus.sync((x.gpus || []).map((g, i) => ({ ...g, index: g.index != null ? g.index : i })));
+      gpuBox.hidden = !(x.gpus || []).length;
+      const hasX = x.desktop && (x.xorg_cpu_pct != null || x.xorg_wakeups_s != null);
+      xorg.hidden = !hasX;
+      if (hasX) {
+        setText(xorg, `Xorg ${x.xorg_cpu_pct != null ? x.xorg_cpu_pct + '% CPU' : ''}${x.xorg_cpu_pct != null && x.xorg_wakeups_s != null ? ' · ' : ''}${x.xorg_wakeups_s != null ? x.xorg_wakeups_s + ' wake/s' : ''}`);
+        setAttr(xorg, 'title', "The X server's CPU share and voluntary wakeups per second: the honest measure of the owner's input lag");
+        setCls(xorg, 'hstat hxorg' + (x.xorg_cpu_pct >= 30 ? ' bad' : x.xorg_cpu_pct >= 12 ? ' warn' : ''));
+      }
+      const parts = [];
+      if (x.jobs) parts.push(`${x.jobs} job${x.jobs === 1 ? '' : 's'}`);
+      if (x.untracked) parts.push(`${x.untracked} untracked`);
+      setText(counts, parts.join(' · '));
+      setCls(counts, 'hstat hcounts' + (x.untracked ? ' warn' : ''));
+      counts.hidden = !parts.length;
+    },
+  };
+}
+
+/* a tracked job (sb run / sb adopt) with a Stop control */
+function jobRow() {
+  const dot = h('span', { class: 'jdot' });
+  const name = h('strong', { class: 'jname' });
+  const who = h('span', { class: 'jwho' });
+  const where = h('span', { class: 'jwhere' });
+  const res = h('span', { class: 'jres' });
+  const reason = h('span', { class: 'jreason' });
+  const stop = h('button', { class: 'pbtn jstop', type: 'button', text: 'Stop' });
+  const el = h('div', { class: 'job' }, dot, name, who, where, res, reason, h('span', { class: 'spacer' }), stop);
+  let cur = null;
+  guarded(stop, async () => {
+    if (!cur) return;
+    if (!confirm(`Stop ${cur.name} (${cur.id})${cur.host ? ' on ' + cur.host : ', still queued'}?${cur.adopted ? ' It was adopted, not launched by Switchboard.' : ''}`)) return;
+    const r = await api('POST', `/jobs/${enc(cur.id)}/stop`, { from: 'owner', reason: 'stopped from the Fleet panel' });
+    toast(`${r.name}: ${r.state}${r.reason ? ' · ' + r.reason : ''}`);
+    tick();
+  });
+  return {
+    el,
+    update(j) {
+      cur = j;
+      setCls(dot, 'jdot s-' + (j.state || 'queued'));
+      setAttr(dot, 'title', j.state || '');
+      setText(name, j.name || j.id);
+      setAttr(name, 'title', `${j.id}${j.unit ? ' · ' + j.unit : ''}${j.argv && j.argv.length ? '\n' + j.argv.join(' ') : ''}`);
+      setText(who, [j.project && projName(j.project), j.agent && '@' + j.agent].filter(Boolean).join(' / '));
+      const place = j.state === 'queued' ? (j.host_pref ? 'wants ' + j.host_pref : 'queued') : j.host || '';
+      setText(where, place + (j.adopted ? ' · adopted' : '') + (j.lane ? ' · ' + j.lane : ''));
+      setAttr(where, 'title', [j.placer && 'placed by ' + j.placer, j.cpus && j.cpus.length && 'CPUs ' + j.cpus.join(','), j.board_id && 'workboard ' + j.board_id].filter(Boolean).join('\n'));
+      const bits = [];
+      if (j.threads) bits.push(j.threads + ' thr');
+      if (j.mem_mib) bits.push(fmtMib(j.mem_cur_mib != null ? j.mem_cur_mib : 0) + (j.mem_mib ? ' / ' + fmtMib(j.mem_mib) : ''));
+      if (j.gpu_mib) bits.push('GPU ' + fmtMib(j.gpu_mib));
+      if (j.runtime_s != null) bits.push(fmtDur(j.runtime_s));
+      setText(res, bits.join(' · '));
+      setText(reason, j.reason || '');
+      setAttr(reason, 'title', j.reason || '');
+      reason.hidden = !j.reason;
+      stop.hidden = !JOB_STATES_OPEN.includes(j.state);
+      setCls(el, 'job s-' + (j.state || 'queued'));
+    },
+  };
+}
+
+/* a heavy process the hub did not launch, with its best attribution and Adopt / Stop controls.
+ * Adopt brings the unit the pid lives in under tracking; Stop adopts it then stops the unit (the hub has no
+ * stop-by-pid; a process outside any systemd unit cannot be adopted and the hub says so). */
+function untrackedRow() {
+  const pid = h('span', { class: 'upid' });
+  const comm = h('strong', { class: 'ucomm' });
+  const stat = h('span', { class: 'ustat' });
+  const attr = h('span', { class: 'uattr' });
+  const alink = agentLink();
+  const host = h('span', { class: 'uhost' });
+  const adoptBtn = h('button', { class: 'pbtn', type: 'button', text: 'Adopt', title: 'Track this work as a job (sb adopt): it is watched, never halted' });
+  const stopBtn = h('button', { class: 'pbtn udanger', type: 'button', text: 'Stop', title: 'Adopt the unit this process lives in, then stop it' });
+  const nameIn = h('input', { type: 'text', class: 'uname', 'aria-label': 'Job name', autocomplete: 'off', maxlength: 40, placeholder: 'job name' });
+  const ok = h('button', { class: 'btn primary small', type: 'submit', text: 'Adopt' });
+  const cancel = h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel' });
+  const form = h('form', { class: 'uform', hidden: true }, nameIn, ok, cancel);
+  const el = h('div', { class: 'untracked' },
+    h('div', { class: 'uline' }, pid, comm, stat, attr, alink.el, host, h('span', { class: 'spacer' }), h('span', { class: 'ubtns' }, adoptBtn, stopBtn)), form);
+  let cur = null;
+  const jobName = (p) => String(p.comm || 'proc').toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[^a-z0-9]+/, '').slice(0, 30) || 'proc';
+  const adopt = (name) => api('POST', '/jobs/adopt', { host: cur.host, pid: cur.pid, name, agent: cur.agent || 'owner', project: cur.project || null });
+  const close = () => { form.hidden = true; adoptBtn.hidden = stopBtn.hidden = false; };
+  adoptBtn.addEventListener('click', (e) => { e.stopPropagation(); if (!cur) return; nameIn.value = jobName(cur) + '-' + cur.pid; form.hidden = false; adoptBtn.hidden = stopBtn.hidden = true; nameIn.focus(); nameIn.select(); });
+  cancel.addEventListener('click', close);
+  nameIn.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); close(); } });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = nameIn.value.trim();
+    if (!name) { nameIn.focus(); return; }
+    ok.disabled = true;
+    try { const j = await adopt(name); toast(`Adopted ${j.name} on ${j.host} (${j.unit})`); close(); tick(); } catch (err) { toast(err.message, 'err'); } finally { ok.disabled = false; }
+  });
+  guarded(stopBtn, async () => {
+    if (!cur) return;
+    if (!confirm(`Stop pid ${cur.pid} (${cur.comm}) on ${cur.host}? Switchboard adopts the unit it lives in, then stops that unit.`)) return;
+    const j = await adopt('stop-' + jobName(cur) + '-' + cur.pid);
+    const r = await api('POST', `/jobs/${enc(j.id)}/stop`, { from: 'owner', reason: 'untracked work stopped from the Fleet panel' });
+    toast(`${j.unit} on ${j.host}: ${r.state}`);
+    tick();
+  });
+  return {
+    el,
+    update(p) {
+      cur = p;
+      setText(pid, String(p.pid));
+      setText(comm, p.comm || '?');
+      setAttr(comm, 'title', (p.args || '') + (p.cwd ? '\ncwd ' + p.cwd : ''));
+      setText(stat, `${p.cpu != null ? Math.round(p.cpu) + '% CPU' : ''}${p.rss_mib != null ? ' · ' + fmtMib(p.rss_mib) : ''}${p.age_s != null ? ' · ' + fmtDur(p.age_s) : ''}`);
+      const isAgent = !!p.agent && S.agents.has(p.agent);
+      alink.el.hidden = !isAgent;
+      if (isAgent) alink.update(p.agent);
+      setText(attr, isAgent ? 'launched by' : (p.attribution || 'unknown'));
+      setAttr(attr, 'title', p.attribution || '');
+      setText(host, p.host);
+      host.hidden = !p.showHost;
+    },
+  };
+}
+
+/* the HALT banner at the top of the page (overview.fleet.halt) with an Unhalt button */
+function haltBanner() {
+  const text = h('span', { class: 'halt-text' });
+  const hostsEl = h('span', { class: 'halt-hosts' });
+  const btn = h('button', { class: 'btn small halt-btn', type: 'button', text: 'Unhalt' });
+  const el = h('div', { class: 'halt-banner', id: 'halt-banner', role: 'alert', hidden: true }, h('strong', { text: 'HALT' }), text, hostsEl, btn);
+  guarded(btn, async () => {
+    if (!confirm('Lower the HALT on every host? sb run launches again and guarded units may start on their next trigger.')) return;
+    const r = await api('POST', '/fleet/resume', { from: 'owner' });
+    const bad = (r.results || []).filter((x) => !x.ok);
+    toast(bad.length ? `HALT lowered, but ${bad.map((x) => x.host).join(', ')} did not answer` : 'HALT lowered on every host', bad.length ? 'err' : undefined);
+    tick();
+  });
+  return {
+    el,
+    update(halt) {
+      el.hidden = !halt;
+      if (!halt) return;
+      setText(text, `raised by ${halt.by || 'owner'}${halt.at ? ' ' + ago(halt.at) : ''}: ${halt.reason || 'no reason given'}${halt.workloads ? ' · workload units were disabled' : ''}`);
+      setAttr(text, 'title', halt.at ? absTime(halt.at) : '');
+      const pend = halt.pending || [];
+      setText(hostsEl, `${(halt.hosts || []).length ? 'on ' + halt.hosts.join(', ') : ''}${pend.length ? ' · not yet on ' + pend.join(', ') + ' (retried every probe)' : ''}`);
+    },
+  };
+}
+
+function fleetPanel() {
+  const count = h('span', { class: 'n' });
+  const haltBtn = h('button', { class: 'pbtn fl-halt', type: 'button', text: 'Halt', title: 'Stop every tracked job and raise HALT on every host (sb halt)' });
+  const reasonIn = h('input', { type: 'text', placeholder: 'why? (goes in the HALT flag)', 'aria-label': 'Halt reason', autocomplete: 'off' });
+  const haltOk = h('button', { class: 'btn small danger', type: 'submit', text: 'Halt fleet' });
+  const haltCancel = h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel' });
+  const haltForm = h('form', { class: 'fl-haltform', hidden: true }, reasonIn, haltOk, haltCancel);
+  const hostBox = h('div', { class: 'hosts' });
+  const hostRows = keyedList(hostBox, (x) => x.name, hostRow);
+  const hint = h('div', { class: 'muted small fl-hint' });
+  const jobsN = h('span', { class: 'n' });
+  const jobBox = h('div', { class: 'jobs' });
+  const jobRows = keyedList(jobBox, (j) => j.id, jobRow);
+  const jobsEmpty = h('div', { class: 'muted small', text: 'No tracked jobs. Agents launch work with sb run; it shows up here with its owner.' });
+  const unN = h('span', { class: 'n' });
+  const unBox = h('div', { class: 'untracked-list' });
+  const unRows = keyedList(unBox, (p) => p.host + ':' + p.pid, untrackedRow);
+  const unEmpty = h('div', { class: 'muted small', text: 'Nothing heavy is running outside a tracked job.' });
+  const wb = h('div', { class: 'muted small fl-wb' });
+  const closeHalt = () => { haltForm.hidden = true; haltBtn.hidden = false; reasonIn.value = ''; };
+  haltBtn.addEventListener('click', () => { haltForm.hidden = false; haltBtn.hidden = true; reasonIn.focus(); });
+  haltCancel.addEventListener('click', closeHalt);
+  reasonIn.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.preventDefault(); closeHalt(); } });
+  haltForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const reason = reasonIn.value.trim();
+    if (!reason) { reasonIn.focus(); return; }
+    if (!confirm(`Raise HALT on every host and stop every tracked job?\n\nReason: ${reason}`)) return;
+    haltOk.disabled = true;
+    try {
+      const r = await api('POST', '/fleet/halt', { from: 'owner', reason });
+      const res = r.results || [];
+      const stopped = res.reduce((n, x) => n + (x.stopped || []).length, 0);
+      const bad = res.filter((x) => !x.ok).map((x) => x.host);
+      toast(`HALT on ${res.length - bad.length} host${res.length - bad.length === 1 ? '' : 's'} · ${stopped} job${stopped === 1 ? '' : 's'} stopped${bad.length ? ' · pending: ' + bad.join(', ') : ''}`, bad.length ? 'err' : undefined);
+      closeHalt(); tick();
+    } catch (err) { toast(err.message, 'err'); } finally { haltOk.disabled = false; }
+  });
+  const el = h('section', { class: 'block fleet' },
+    h('h2', null, 'Fleet ', count, h('span', { class: 'spacer' }), haltBtn, haltForm),
+    hostBox, hint,
+    h('h3', null, 'Jobs ', jobsN), jobBox, jobsEmpty,
+    h('h3', null, 'Untracked ', unN), unBox, unEmpty, wb);
+  let detail = null, inflight = false, lastFetch = 0;
+  async function fetchDetail() {  // the full view (/api/fleet) carries the tracked and untracked lists
+    if (inflight || Date.now() - lastFetch < 2500) return;
+    inflight = true;
+    try { detail = await api('GET', '/fleet'); lastFetch = Date.now(); renderDetail(); } catch (e) { /* the summary still shows */ } finally { inflight = false; }
+  }
+  function renderDetail() {
+    if (!detail) return;
+    const hs = detail.hosts || [];
+    const many = hs.length > 1;
+    const jobs = hs.flatMap((x) => (x.tracked || []).map((j) => ({ ...j, host: j.host || x.name })))
+      .concat(detail.queued || [])  // queued jobs no host has taken yet belong to no host's list
+      .sort((a, b) => JOB_STATES_OPEN.indexOf(a.state) - JOB_STATES_OPEN.indexOf(b.state) || (parseTime(b.started_at || b.created_at) || 0) - (parseTime(a.started_at || a.created_at) || 0));
+    jobRows.sync(jobs);
+    jobBox.hidden = !jobs.length; jobsEmpty.hidden = jobs.length > 0;
+    setText(jobsN, jobs.length ? `${jobs.filter((j) => j.state === 'running').length} running${jobs.some((j) => j.state === 'queued') ? ` · ${jobs.filter((j) => j.state === 'queued').length} queued` : ''}` : '');
+    const un = hs.flatMap((x) => (x.untracked || []).map((p) => ({ ...p, host: x.name, showHost: many }))).sort((a, b) => (b.cpu || 0) - (a.cpu || 0));
+    unRows.sync(un);
+    unBox.hidden = !un.length; unEmpty.hidden = un.length > 0;
+    setText(unN, un.length ? `${un.length} process${un.length === 1 ? '' : 'es'} above 25% CPU` : '');
+    const board = (detail.placers || {}).workboard;
+    const cards = (board && board.cards) || [], leases = (board && board.jobs) || [];
+    wb.hidden = !board;
+    if (board) setText(wb, board.error ? 'gpu-workboard: ' + board.error : `gpu-workboard: ${cards.length} card${cards.length === 1 ? '' : 's'}, ${leases.length} open lease${leases.length === 1 ? '' : 's'}${leases.length ? ': ' + leases.map((l) => `${l.label || l.id}${l.host ? '@' + l.host : ''} (${l.status}${l.idle ? `, idle ${l.idle.idle_min}m, standing ${Math.round(l.idle.standing * 100)}%` : ""})`).join(', ') : ''}`);
+  }
+  return {
+    el,
+    update() {
+      const f = (S.ov && S.ov.fleet) || {};
+      const hs = f.hosts || [];
+      hostRows.sync(hs);
+      const off = hs.filter((x) => !x.reachable).length;
+      setText(count, `${hs.length} host${hs.length === 1 ? '' : 's'}${off ? ` · ${off} unreachable` : ''}`);
+      setText(hint, f.error ? 'Fleet read failed: ' + f.error
+        : f.config_exists === false ? 'Only this machine. Add hosts in ~/.config/switchboard/hosts.json (see examples/hosts.example.json).' : '');
+      hint.hidden = !hint.textContent;
+      haltBtn.disabled = !!f.halt;
+      setAttr(haltBtn, 'title', f.halt ? 'HALT is already raised; the banner at the top lowers it' : 'Stop every tracked job and raise HALT on every host (sb halt)');
+      fetchDetail();
     },
   };
 }
@@ -677,15 +1063,21 @@ function overviewView() {
     } catch (err) { toast(err.message, 'err'); } finally { pOk.disabled = false; }
   });
   const noProj = h('p', { class: 'muted small', text: 'No projects yet. "+ Project" makes one (with its own folder in your workspace); then "+ Agent" on its card starts an agent there.' });
-  const chatCol = h('aside', { class: 'ov-chat' });
-  const el = h('div', { class: 'ov' }, chatCol,
+  const work = workPanel();
+  const fleet = fleetPanel();
+  const el = h('div', { class: 'ov' },
     h('div', { class: 'ov-main' },
-      h('section', { class: 'block' }, h('h2', null, 'Accounts ', h('a', { class: 'btn ghost small', href: '#/setup', text: 'Setup' })), poolBox),
-      h('section', { class: 'block' }, h('h2', null, 'Projects ', addP, addForm), noProj, grid, arch)));
-  CHAT.mount(chatCol, null);
+      work.el,
+      h('div', { class: 'ov-row' },  // pools + projects on the left fill the height of the fleet column
+        h('div', { class: 'ov-col' },
+          h('section', { class: 'block' }, h('h2', null, 'Accounts ', h('a', { class: 'btn ghost small', href: '#/setup', text: 'Setup' })), poolBox),
+          h('section', { class: 'block' }, h('h2', null, 'Projects ', addP, addForm), noProj, grid, arch)),
+        fleet.el)));
   return {
     el, title: '',
     update() {
+      work.update();
+      fleet.update();
       pools.sync(S.accounts);
       const ps = [...S.projects.values()];
       const act = (p) => -(parseTime(p.last_activity) || 0);
@@ -712,17 +1104,13 @@ function agentPicker(pid) {
     el: sel,
     fill(curId) {
       if (document.activeElement === sel) return;
-      const mine = projectAgents(pid);
-      const others = [...S.agents.values()].filter((a) => a.project !== pid)
-        .sort((x, y) => projName(x.project).localeCompare(projName(y.project)) || agentName(x).localeCompare(agentName(y)));
-      const sig = curId + '|' + mine.map((a) => a.id + agentName(a)).join(',') + '|' + others.map((a) => a.id + a.project).join(',');
+      const mine = projectAgents(pid);  // only this project's agents: another project's agents never open here
+      const sig = curId + '|' + mine.map((a) => a.id + agentName(a)).join(',');
       if (sel.dataset.sig !== sig) {
         sel.dataset.sig = sig;
-        const opt = (a, label) => h('option', { value: a.id, text: label });
         const kids = [];
-        if (!curId || !S.agents.has(curId)) kids.push(h('option', { value: curId || '', text: curId ? curId + ' (unknown)' : 'Pick an agent…' }));
-        if (mine.length) kids.push(h('optgroup', { label: 'This project' }, mine.map((a) => opt(a, agentName(a)))));
-        if (others.length) kids.push(h('optgroup', { label: 'Other projects' }, others.map((a) => opt(a, `${agentName(a)} · ${projName(a.project)}`))));
+        if (!curId || !mine.some((a) => a.id === curId)) kids.push(h('option', { value: curId || '', text: curId ? curId + ' (unknown)' : 'Pick an agent…' }));
+        kids.push(...mine.map((a) => h('option', { value: a.id, text: agentName(a) })));
         sel.replaceChildren(...kids);
       }
       if (sel.value !== (curId || '')) sel.value = curId || '';
@@ -737,15 +1125,51 @@ function makePane(idx, pid, view) {
   const picker = agentPicker(pid);
   const st = h('span', { class: 'pn-state' });
   const conn = h('span', { class: 'pn-conn' });
+  const queueBtn = h('button', { class: 'pbtn', type: 'button', hidden: true });
+  queueBtn.onclick = () => openQueue(id);
+  const ctxBtn = h('button', { class: 'pbtn', type: 'button', text: 'Context', title: 'What fills this agent\'s context, request by request', hidden: true });
+  ctxBtn.onclick = () => { if (id) openContext(id); };
+  const memBtn = h('button', { class: 'pbtn', type: 'button', text: 'Memory', title: 'Memory files this agent wrote, and outlines of its conversations', hidden: true });
+  memBtn.onclick = () => { const a = id && S.agents.get(id); if (a) openMemFiles(a.project, id); };
+  const rewBtn = h('button', { class: 'pbtn', type: 'button', text: 'Rewind', title: 'Put this agent back to the moment before one of its messages (cuts the session; a copy is kept)', hidden: true });
+  rewBtn.onclick = () => { if (id) openRewind(id); };
   const note = h('span', { class: 'pn-note' });
   const meta = h('span', { class: 'pn-meta' });
   const num = h('span', { class: 'pn-num', text: String(idx + 1) });
-  const hdr = h('div', { class: 'pn-h' }, num, dot, picker.el, st, conn, note, h('span', { class: 'spacer' }), meta);
+  const hdr = h('div', { class: 'pn-h' }, num, dot, picker.el, st, conn, queueBtn, note, h('span', { class: 'spacer' }), meta, ctxBtn, memBtn, rewBtn);
+  const rcHead = h('span', { class: 'rc-head' });
+  const rcBody = h('div', { class: 'rc-body', hidden: true });
+  const rcMore = h('button', { class: 'pbtn', type: 'button', text: 'Details' });
+  const rcOk = h('button', { class: 'pbtn', type: 'button', text: 'Got it', title: 'Hide this until the next conversation ends' });
+  const recap = h('div', { class: 'recap', hidden: true }, h('div', { class: 'rc-line' }, rcHead, h('span', { class: 'spacer' }), rcMore, rcOk), rcBody);
+  let rcShown = 0;
+  rcMore.onclick = () => { rcBody.hidden = !rcBody.hidden; scheduleFit(); };
+  rcOk.onclick = async () => {
+    const n = rcShown; recap.hidden = true; scheduleFit();
+    try { await api('POST', `/agents/${enc(id)}/recap/seen`, { n }); tick(); } catch (e) { toast(e.message, 'err'); }
+  };
+  function paintRecap(r) {
+    if (!r) { if (!recap.hidden) { recap.hidden = true; scheduleFit(); } rcShown = 0; return; }
+    if (rcShown === r.n && rcHead.dataset.state === r.state) return;
+    rcShown = r.n; rcHead.dataset.state = r.state;
+    const busy = r.state === 'pending' || r.state === 'working';
+    setText(rcHead, `Before this conversation (${r.why || 'ended'}, ${ago(r.at)}): ` + (busy ? 'summary being written…' : (r.summary || r.last_ask || r.first_ask || 'nothing recorded')));
+    rcBody.replaceChildren();
+    for (const s of r.sections || []) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: s.h }), h('ul', {}, s.points.map((t) => h('li', { text: t })))));
+    if (!(r.sections || []).length) {
+      if (r.first_ask) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: 'FIRST ASKED ' }), r.first_ask));
+      if (r.last_ask) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: 'LAST ASKED ' }), r.last_ask));
+    }
+    if (r.last_said) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: 'LAST REPLY ' }), r.last_said));
+    rcBody.append(h('div', { class: 'rc-sec muted small', text: `sb memory ${r.n} has the outline with its sources` + (r.note ? ` · ${r.note}` : '') }));
+    rcMore.hidden = !rcBody.childNodes.length;
+    recap.hidden = false; scheduleFit();
+  }
   const box = h('div', { class: 'term' });
   const ovMsg = h('div', { class: 'ov-msg' });
   const ovBtn = h('button', { class: 'btn primary', type: 'button' });
   const overlay = h('div', { class: 'ovl', hidden: true }, h('div', { class: 'ov-box' }, ovMsg, ovBtn));
-  const el = h('section', { class: 'pane', hidden: true }, hdr, h('div', { class: 'termwrap' }, box, overlay));
+  const el = h('section', { class: 'pane', hidden: true }, hdr, recap, h('div', { class: 'termwrap' }, box, overlay));
   el.addEventListener('mousedown', () => view.setFocus(idx));
   el.addEventListener('focusin', () => view.setFocus(idx));
   picker.el.addEventListener('change', () => { if (picker.el.value) view.pick(idx, picker.el.value); });
@@ -790,6 +1214,15 @@ function makePane(idx, pid, view) {
     }).catch((err) => toast('Image paste failed: ' + err.message, 'err'));
   }
 
+  function copySelection() {
+    const sel = term.getSelection();
+    if (!sel) return;
+    // the browser's own copy (xterm fills it from its selection) plus the async API as a fallback
+    try { document.execCommand('copy'); } catch (err) { /* not allowed here */ }
+    if (navigator.clipboard) navigator.clipboard.writeText(sel).catch(() => {});
+    toast('Copied');
+  }
+
   function ensureTerm() {
     if (term) return;
     term = new Terminal({
@@ -800,16 +1233,20 @@ function makePane(idx, pid, view) {
     term.loadAddon(fit);
     term.open(box);
     term.onData((d) => sendJ({ t: 'i', d }));
+    /* Clipboard like a desktop terminal: Ctrl+C copies while text is selected (otherwise it still interrupts the
+       CLI), Ctrl+Shift+C always copies; Ctrl+V / Ctrl+Shift+V / Shift+Insert paste through the browser's paste
+       event (text goes to the CLI, images are uploaded). Returning false hands the key to the browser. */
     term.attachCustomKeyEventHandler((e) => {
-      if (e.type === 'keydown' && e.ctrlKey && e.shiftKey && e.code === 'KeyC') {
-        const sel = term.getSelection();
-        if (sel && navigator.clipboard) navigator.clipboard.writeText(sel).catch(() => {});
+      if (e.type !== 'keydown' || e.altKey || e.metaKey) return true;
+      if (e.ctrlKey && e.code === 'KeyC' && (e.shiftKey || term.hasSelection())) {
+        copySelection();
         return false;
       }
-      if (e.ctrlKey && e.shiftKey && e.code === 'KeyV') return false;   // let the browser paste event fire
+      if ((e.ctrlKey && e.code === 'KeyV') || (e.shiftKey && !e.ctrlKey && e.code === 'Insert')) return false;
       return true;
     });
     box.addEventListener('paste', onPaste, true);
+    box.addEventListener('contextmenu', (e) => { e.preventDefault(); termMenu(e.clientX, e.clientY, term); });
     ro = new ResizeObserver(scheduleFit);
     ro.observe(box);
     if (id) window.__sbTerms[id] = term;
@@ -868,6 +1305,7 @@ function makePane(idx, pid, view) {
     if (m.t === 'status') {
       if (m.state && cur) { cur = { ...cur, state: m.state, running: m.running }; paintState(); }
       if (m.running && (ovKind === 'stopped' || ovKind === 'exit')) hideOverlay();
+      if (!m.running && m.held && !ovKind) showOverlay('stopped', 'You stopped this CLI. It stays stopped until you start it (or a message arrives for it).', 'Start', startAndConnect);
       if (m.note) setText(note, m.note);
     } else if (m.t === 'exit') {
       showOverlay('exit', `The CLI exited${m.code != null ? ' (code ' + m.code + ')' : ''}.`, 'Start', startAndConnect);
@@ -880,12 +1318,17 @@ function makePane(idx, pid, view) {
   function paintState() {
     const a = cur || { state: 'stopped' };
     setDot(dot, a);
-    setText(st, !id ? '' : a.switching ? `switching to ${a.switching.to}…` : (STATE_WORD[a.state] || a.state || ''));
+    setText(st, !id ? '' : a.switching ? `switching to ${a.switching.to}…` : agentState(a));
     const bits = [];
     if (a.launch_block) bits.push('blocked: ' + a.launch_block);
-    if (a.queued) bits.push(`${a.queued} queued · ${queueWhy(a)}`);
+    queueBtn.hidden = !a.queued;
+    ctxBtn.hidden = !id || !['claude', 'codex'].includes(a.provider);
+    memBtn.hidden = rewBtn.hidden = !id || a.provider !== 'claude';
+    setText(queueBtn, `${a.queued || 0} pending · View messages`);
+    if (a.queued) bits.push(queueWhy(a));
     if (a.switching && a.switching.note) bits.push(a.switching.note);
     setText(note, bits.join(' · ')); setAttr(note, 'title', bits.join('\n'));
+    paintRecap(id ? a.recap : null);
     setText(meta, !id ? '' : [a.account, a.model ? a.model.replace(/^claude-/, '') : '', a.project !== pid && a.project ? projName(a.project) : ''].filter(Boolean).join(' · '));
   }
 
@@ -911,7 +1354,7 @@ function makePane(idx, pid, view) {
         const wasRunning = cur && cur.running;
         if (a) cur = a;
         /* relaunched elsewhere (account switch, sb send, Start) while we sat on the exit overlay */
-        if (a && visible && a.running && !wasRunning && ovKind === 'exit') reconnect();
+        if (a && visible && a.running && !wasRunning && (ovKind === 'exit' || ovKind === 'stopped')) reconnect();
       }
       picker.fill(id); paintState();
     },
@@ -935,16 +1378,52 @@ function makePane(idx, pid, view) {
   };
 }
 
+/* right-click menu on a terminal: Copy / Paste / Select all (the desktop window has no menu of its own) */
+let TMENU = null;
+function termMenu(x, y, term) {
+  if (!TMENU) {
+    TMENU = h('div', { class: 'tmenu', role: 'menu', hidden: true });
+    document.body.append(TMENU);
+    document.addEventListener('mousedown', (e) => { if (!TMENU.contains(e.target)) TMENU.hidden = true; }, true);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') TMENU.hidden = true; }, true);
+  }
+  const close = () => { TMENU.hidden = true; term.focus(); };
+  const item = (label, key, enabled, fn) => h('button', { type: 'button', role: 'menuitem', disabled: !enabled,
+    onclick: () => { close(); fn(); } }, h('span', { text: label }), h('kbd', { text: key }));
+  TMENU.replaceChildren(
+    item('Copy', 'Ctrl+C', term.hasSelection(), () => {
+      const sel = term.getSelection();
+      (navigator.clipboard ? navigator.clipboard.writeText(sel) : Promise.reject(new Error('no clipboard')))
+        .then(() => toast('Copied'), () => toast('Copy blocked here; select and press Ctrl+C', 'err'));
+    }),
+    item('Paste', 'Ctrl+V', true, () => {
+      (navigator.clipboard && navigator.clipboard.readText ? navigator.clipboard.readText() : Promise.reject(new Error('no clipboard')))
+        .then((t) => { if (t) term.paste(t); }, () => toast('This window does not let a menu read the clipboard; press Ctrl+V', 'err'));
+    }),
+    item('Select all', '', true, () => term.selectAll()));
+  TMENU.hidden = false;
+  const r = TMENU.getBoundingClientRect();
+  TMENU.style.left = Math.min(x, innerWidth - r.width - 4) + 'px';
+  TMENU.style.top = Math.min(y, innerHeight - r.height - 4) + 'px';
+}
+
 /* controls for the focused pane's agent: account, model, project, stop, remove */
 function controlBar() {
   let a = null;
   const who = h('span', { class: 'cb-who' });
   const acct = h('select', { class: 'pn-sel', 'aria-label': 'Account', title: 'Account pool — switching exits the CLI and resumes the same session there' });
   const model = h('input', { class: 'pn-model', type: 'text', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Model', title: 'Model — applies on next launch', placeholder: 'default model' });
-  const move = h('select', { class: 'pn-sel', 'aria-label': 'Project', title: 'Move to another project' });
+  const move = h('select', { class: 'pn-sel', 'aria-label': 'Project', title: 'Give this unsorted agent its project (agents never move between projects)' });
+  const resumeBtn = h('button', { class: 'pbtn', type: 'button', text: 'Resume queue', title: 'Unpause message delivery; retained messages will be delivered' });
   const stopBtn = h('button', { class: 'pbtn', type: 'button', text: 'Stop', title: 'Exit the CLI (/exit)' });
-  const el = h('div', { class: 'cbar' }, who, h('label', { class: 'pn-l' }, 'account', acct), h('label', { class: 'pn-l' }, 'model', model),
-    h('label', { class: 'pn-l' }, 'project', move), stopBtn);
+  const toggle = h('button', { class: 'pbtn cb-toggle', type: 'button', title: 'Show or hide the controls for the focused agent (account, model, stop)' });
+  const body = h('span', { class: 'cb-body' }, h('label', { class: 'pn-l' }, 'account', acct), h('label', { class: 'pn-l' }, 'model', model),
+    h('label', { class: 'pn-l' }, 'assign to', move), resumeBtn, stopBtn);
+  const el = h('div', { class: 'cbar' }, toggle, who, body);
+  let open = lsGet('sb.ctl') === '1';  // collapsed by default: it shares the row with the tabs
+  function paintToggle() { body.hidden = !open; setText(toggle, open ? 'controls ▾' : 'controls ▸'); el.classList.toggle('open', open); }
+  toggle.addEventListener('click', () => { open = !open; lsSet('sb.ctl', open ? '1' : ''); paintToggle(); });
+  paintToggle();
 
   acct.addEventListener('change', async () => {
     if (!a) return;
@@ -967,8 +1446,14 @@ function controlBar() {
     if (!a) return;
     const to = move.value, from = a.project;
     if (to === from) return;
-    try { await api('PATCH', `/agents/${enc(a.id)}`, { project: to }); toast(`Moved ${agentName(a)} to ${projName(to)}`); tick(); }
+    if (!confirm(`Put ${agentName(a)} on ${projName(to)}? Agents stay on their project after that.`)) { move.value = from; return; }
+    try { await api('PATCH', `/agents/${enc(a.id)}`, { project: to }); toast(`${agentName(a)} is now on ${projName(to)}`); tick(); }
     catch (e) { move.value = from; toast(e.message, 'err'); }
+  });
+  guarded(resumeBtn, async () => {
+    if (!a || !a.paused) return;
+    await api('PATCH', `/agents/${enc(a.id)}`, { paused: false });
+    toast(`Queue resumed for ${agentName(a)}`); tick();
   });
   guarded(stopBtn, async () => {
     if (!a) return;
@@ -992,7 +1477,9 @@ function controlBar() {
         }
         if (acct.value !== a.account) acct.value = a.account;
       }
-      if (document.activeElement !== move) {
+      const homeless = !a.project || a.project === 'unsorted' || !S.projects.has(a.project);
+      move.parentElement.hidden = !homeless;
+      if (homeless && document.activeElement !== move) {
         const ps = [...S.projects.values()].filter((p) => !p.archived || p.id === a.project);
         const sig = ps.map((p) => p.id + p.name).join('|');
         if (move.dataset.sig !== sig) {
@@ -1004,6 +1491,7 @@ function controlBar() {
       if (document.activeElement !== model && model.value !== (a.model || '')) model.value = a.model || '';
       model.setAttribute('list', 'models-' + a.provider);
       acct.parentElement.hidden = model.parentElement.hidden = a.provider === 'shell';
+      resumeBtn.hidden = !a.paused;
       stopBtn.disabled = !a.running;
     },
   };
@@ -1039,8 +1527,35 @@ function tabEl() {
   const acct = h('span', { class: 'acct' });
   const mt = modelTag();
   const rm = h('button', { class: 'tab-x', type: 'button', text: '✕', title: 'Remove from Switchboard (stops its CLI; session files stay on disk)' });
-  const el = h('a', { class: 'tab', role: 'tab' }, dot, name, acct, mt, rm);
+  const el = h('a', { class: 'tab', role: 'tab', draggable: 'true', title: 'Drag to reorder' }, dot, name, acct, mt, rm);
   let cur = null;
+  /* drag to reorder: the drop position is saved on the hub per project, so every device shows the same order */
+  el.addEventListener('dragstart', (e) => {
+    if (!cur) return;
+    e.dataTransfer.setData('text/sb-agent', cur.id); e.dataTransfer.effectAllowed = 'move';
+    el.classList.add('dragging');
+  });
+  el.addEventListener('dragend', () => { el.classList.remove('dragging'); document.querySelectorAll('.tab.drop-before, .tab.drop-after').forEach((t) => t.classList.remove('drop-before', 'drop-after')); });
+  el.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer.types.includes('text/sb-agent')) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+    const r = el.getBoundingClientRect(), before = e.clientX < r.left + r.width / 2;
+    el.classList.toggle('drop-before', before); el.classList.toggle('drop-after', !before);
+  });
+  el.addEventListener('dragleave', () => el.classList.remove('drop-before', 'drop-after'));
+  el.addEventListener('drop', async (e) => {
+    const id = e.dataTransfer.getData('text/sb-agent');
+    if (!id || !cur) return;
+    e.preventDefault();
+    const before = el.classList.contains('drop-before');
+    el.classList.remove('drop-before', 'drop-after');
+    if (id === cur.id) return;
+    const bar = el.parentElement;
+    const order = [...bar.querySelectorAll('.tab')].map((t) => t.dataset.agent).filter((x) => x && x !== id);
+    const at = order.indexOf(cur.id) + (before ? 0 : 1);
+    order.splice(at, 0, id);
+    try { await api('PATCH', `/projects/${enc(cur.project)}`, { tab_order: order }); tick(); } catch (err) { toast(err.message, 'err'); }
+  });
   rm.addEventListener('click', async (e) => {
     e.preventDefault(); e.stopPropagation();
     if (!cur || !confirm(`Remove ${agentName(cur)} from Switchboard? Its CLI is stopped first; the session files stay on disk.`)) return;
@@ -1049,7 +1564,7 @@ function tabEl() {
   });
   return {
     el,
-    update(a) { cur = a; setAttr(el, 'href', agentHref(a)); setDot(dot, a); setText(name, agentName(a)); setText(acct, a.account); setModelTag(mt, a); },
+    update(a) { cur = a; el.dataset.agent = a.id; setAttr(el, 'href', agentHref(a)); setDot(dot, a); setText(name, agentName(a)); setText(acct, a.account); setModelTag(mt, a); },
   };
 }
 
@@ -1061,7 +1576,6 @@ function projectView(pid, initialAgent) {
   let focus = Number.isInteger(saved.f) && saved.f < count ? saved.f : 0;
   let showSrc = lsGet('sb.src') !== '0';
   let showLim = lsGet('sb.lim') !== '0';
-  let drawer = false;
   function save() { lsSet('sb.panes.' + pid, JSON.stringify({ n: count, picks, f: focus })); }
 
   const name = h('h1', { class: 'pv-name' });
@@ -1074,6 +1588,23 @@ function projectView(pid, initialAgent) {
   const shellBtn = h('button', { class: 'pbtn', type: 'button', text: '+ Shell', title: 'Open a plain bash shell in this project' });
   const summonBtn = h('button', { class: 'pbtn', type: 'button', text: 'Summon', title: 'Side agent beside the focused agent: a much bigger /btw that leaves it undisturbed' });
   const shareBtn = h('button', { class: 'pbtn', type: 'button', text: 'Shared', title: "What this project's agents are doing, and their shared notes" });
+  const teamBtn = h('button', { class: 'pbtn', type: 'button', text: 'Team', title: 'Messages, notes and decisions between this project\'s agents and you, on a timeline', onclick: () => openTeam(pid) });
+  const memFilesBtn = h('button', { class: 'pbtn', type: 'button', text: 'Memory', title: 'Every memory file this project\'s agents wrote, by agent, and its conversation outlines', onclick: () => openMemFiles(pid, null) });
+  const insBtn = h('a', { class: 'pbtn', href: '#/insights/' + enc(pid), text: 'Insights', title: 'Token use, cost, tools and activity for this project' });
+  /* files outside the project's folder: two owner toggles (POST /api/projects/<id>/outside, sb outside) */
+  const outRead = h('button', { class: 'pbtn out-t', type: 'button', text: 'Read out', 'aria-pressed': 'false' });
+  const outWrite = h('button', { class: 'pbtn out-t', type: 'button', text: 'Write out', 'aria-pressed': 'false' });
+  for (const [btn, key] of [[outRead, 'read'], [outWrite, 'write']]) {
+    guarded(btn, async () => {
+      const p = S.projects.get(pid);
+      const on = !(p && p['outside_' + key]);
+      const res = await api('POST', `/projects/${enc(pid)}/outside`, { [key]: on });
+      if (p) { p.outside_read = res.read; p.outside_write = res.write; }
+      const busy = (res.next_start || []).length ? ` · busy, on next start: ${res.next_start.join(', ')}` : '';
+      toast(`${key === 'read' ? 'Read' : 'Write'} outside the folder ${on ? 'on' : 'off'}${(res.relaunched || []).length ? ' · relaunched ' + res.relaunched.join(', ') : ''}${busy}`);
+      v.update(); tick();
+    });
+  }
   let showShare = lsGet('sb.share') === '1';
   /* summon form */
   const smWho = h('strong');
@@ -1091,14 +1622,16 @@ function projectView(pid, initialAgent) {
   /* shared context side section */
   const shBox = h('div', { class: 'sh-list' });
   const shNotes = h('div', { class: 'sh-notes' });
+  const shMem = h('div', { class: 'sh-notes' });
   const shInput = h('input', { type: 'text', placeholder: 'note for every agent on this project', 'aria-label': 'Shared note', autocomplete: 'off' });
   const shForm = h('form', { class: 'sh-add' }, shInput, h('button', { class: 'btn small', type: 'submit', text: 'Add' }));
   const shareSec = h('section', { class: 'side-sec' },
     h('div', { class: 'side-h' }, h('h2', { text: 'Shared context' })),
     h('div', { class: 'muted small sh-hint', text: 'Agents pull this with sb context when they need it; nothing is pushed into them.' }),
-    shBox, h('h2', { class: 'sh-nh', text: 'Notes' }), shNotes, shForm);
+    shBox, h('h2', { class: 'sh-nh', text: 'Notes' }), shNotes, shForm,
+    h('h2', { class: 'sh-nh', text: 'Project memory' }), shMem);
   shellBtn.addEventListener('click', () => openShell(pid));
-  const deskBtn = h('button', { class: 'pbtn desk-btn', type: 'button', text: 'Switchboard', title: 'Open the Switchboard chat' });
+
   const form = newAgentForm(() => pid, (a) => { location.hash = agentHref(a); });
   const tabsBox = h('nav', { class: 'tabs', role: 'tablist' });
   const tabs = keyedList(tabsBox, (a) => a.id, tabEl);
@@ -1117,19 +1650,18 @@ function projectView(pid, initialAgent) {
   const limSec = h('section', { class: 'side-sec' }, h('div', { class: 'side-h' }, h('h2', { text: 'Agents and context' })), limBox, limEmpty);
   const srcSec = h('section', { class: 'side-sec' }, h('div', { class: 'side-h' }, h('h2', { text: 'Sources' }), h('span', { class: 'spacer' }), srcRefresh), srcBox, srcEmpty);
   const side = h('aside', { class: 'side' }, shareSec, limSec, srcSec);
-  const drawerEl = h('aside', { class: 'drawer', hidden: true });
   const el = h('div', { class: 'pv' },
     h('div', { class: 'pv-head' }, h('a', { class: 'back', href: '#/', text: '← Projects', title: 'Back to all projects' }), name, goal,
-      h('span', { class: 'spacer' }), seg, addBtn, summonBtn, shellBtn, shareBtn, limBtn, srcBtn, deskBtn),
+      h('span', { class: 'spacer' }), seg, addBtn, summonBtn, shellBtn, outRead, outWrite, teamBtn, insBtn, memFilesBtn, shareBtn, limBtn, srcBtn),
     form.el, summonForm,
     h('div', { class: 'pv-bar' }, tabsBox, h('span', { class: 'spacer' }), ctl.el),
-    h('div', { class: 'pv-body' }, h('div', { class: 'stage-wrap' }, stage), side, drawerEl));
+    h('div', { class: 'pv-body' }, h('div', { class: 'stage-wrap' }, stage), side));
   form.el.classList.add('pv-form');
   addBtn.addEventListener('click', () => form.toggle());
   srcBtn.addEventListener('click', () => { showSrc = !showSrc; lsSet('sb.src', showSrc ? '1' : '0'); layout(); });
   limBtn.addEventListener('click', () => { showLim = !showLim; lsSet('sb.lim', showLim ? '1' : '0'); layout(); });
   shareBtn.addEventListener('click', () => { showShare = !showShare; lsSet('sb.share', showShare ? '1' : '0'); layout(); if (showShare) loadShared(); });
-  const focusedAgent = () => { const a = picks[focus] && S.agents.get(picks[focus]); return a && (a.provider === 'claude' || a.provider === 'codex') ? a : null; };
+  const focusedAgent = () => { const a = picks[focus] && S.agents.get(picks[focus]); return a && AGENT_CLIS.includes(a.provider) ? a : null; };
   summonBtn.addEventListener('click', () => {
     if (!summonForm.hidden) { summonForm.hidden = true; return; }
     const a = focusedAgent();
@@ -1167,7 +1699,7 @@ function projectView(pid, initialAgent) {
     clearTimeout(shTimer);
     if (!showShare) return;
     try {
-      const d = await api('GET', `/projects/${enc(pid)}/context`);
+      const d = await api('GET', `/projects/${enc(pid)}/context?notes=30`);
       shBox.replaceChildren(...d.agents.map((x) => h('div', { class: 'sh-agent' },
         h('div', { class: 'sh-name' }, h('span', { class: 'dot s-' + (x.state === 'busy' ? 'busy' : x.state === 'stopped' ? 'stopped' : 'idle') }), ' ', x.title || x.id,
           x.forked_from ? h('span', { class: 'muted small', text: ` · fork of ${x.forked_from}` }) : null),
@@ -1176,6 +1708,14 @@ function projectView(pid, initialAgent) {
       if (!d.agents.length) shBox.replaceChildren(h('div', { class: 'muted small', text: 'No agents yet.' }));
       shNotes.replaceChildren(...(d.notes.length ? d.notes.map((n) => h('div', { class: 'sh-note small' },
         h('span', { class: 'muted', text: `${n.agent} · ${ago(n.created_at)} ` }), n.text)) : [h('div', { class: 'muted small', text: 'No notes yet.' })]));
+      const mem = await api('GET', `/projects/${enc(pid)}/memory?n=5`);
+      shMem.replaceChildren(
+        mem.memory ? h('div', { class: 'sh-note small sh-mem', text: mem.memory })
+          : h('div', { class: 'muted small', text: 'Nothing yet. It is written when a conversation on this project is cleared or an agent is removed.' }),
+        mem.updated_at ? h('div', { class: 'muted small', text: `updated ${ago(mem.updated_at)} · ${mem.total} ended conversation${mem.total === 1 ? '' : 's'} on record (sb memory)` }) : null,
+        ...mem.sessions.map((x) => h('div', { class: 'sh-note small', title: x.path || '' },
+          h('span', { class: 'muted', text: `${x.agent} · ${ago(x.created_at)} ` }),
+          x.summary || (x.state === 'pending' || x.state === 'working' ? 'being summarized…' : (x.last_ask || x.first_ask || x.note || '')))));
     } catch (err) { /* hub away */ }
     shTimer = setTimeout(loadShared, 10000);
   }
@@ -1187,12 +1727,6 @@ function projectView(pid, initialAgent) {
     catch (err) { toast(err.message, 'err'); }
   });
   seg.addEventListener('click', (e) => { const b = e.target.closest('[data-n]'); if (b) setCount(Number(b.dataset.n)); });
-  function closeDrawer() { drawer = false; drawerEl.hidden = true; deskBtn.setAttribute('aria-pressed', 'false'); panes[focus].focus(); }
-  deskBtn.addEventListener('click', () => {
-    if (drawer) { closeDrawer(); return; }
-    drawer = true; drawerEl.hidden = false; deskBtn.setAttribute('aria-pressed', 'true');
-    CHAT.mount(drawerEl, closeDrawer); CHAT.focus();
-  });
   let srcTimer = null, srcGone = false;
   async function loadSources() {
     clearTimeout(srcTimer);
@@ -1210,7 +1744,7 @@ function projectView(pid, initialAgent) {
     if (!S.ov) return;
     const mine = projectAgents(pid).map((a) => a.id);
     for (let i = 0; i < count; i++) {
-      if (picks[i] && (S.agents.has(picks[i]) || !S.agents.size)) continue;
+      if (picks[i] && (!S.agents.size || (S.agents.has(picks[i]) && S.agents.get(picks[i]).project === pid))) continue;
       const used = new Set(picks.slice(0, count).filter(Boolean));
       picks[i] = mine.find((x) => !used.has(x)) || null;
     }
@@ -1274,6 +1808,11 @@ function projectView(pid, initialAgent) {
         const g = [p.goal, p.next_step && 'Next: ' + p.next_step].filter(Boolean).join(' · ');
         setText(goal, g); setAttr(goal, 'title', [p.goal, p.next_step && 'Next: ' + p.next_step, p.status_note].filter(Boolean).join('\n'));
       }
+      for (const [btn, key, verb] of [[outRead, 'outside_read', 'read'], [outWrite, 'outside_write', 'write']]) {
+        const on = !!(p && p[key]);
+        setAttr(btn, 'aria-pressed', on ? 'true' : 'false');
+        setAttr(btn, 'title', `${on ? 'On' : 'Off'}: this project's agents may ${on ? '' : 'not '}${verb} files outside its folder. Click to turn it ${on ? 'off' : 'on'}.`);
+      }
       tabs.sync(projectAgents(pid));
       const withLimits = projectAgents(pid).filter((a) => a.provider !== 'shell');
       limCards.sync(withLimits); limEmpty.hidden = withLimits.length > 0;
@@ -1284,6 +1823,8 @@ function projectView(pid, initialAgent) {
       paint();
     },
     select(aid) {
+      const own = aid && S.agents.get(aid);
+      if (own && own.project !== pid) { location.hash = agentHref(own); return; }  // opens on its own project
       if (aid) {
         const j = picks.slice(0, count).indexOf(aid);
         if (j >= 0) focus = j; else picks[focus] = aid;
@@ -1303,7 +1844,7 @@ function projectView(pid, initialAgent) {
 }
 
 /* ---------- restart the hub (owner only: agents never restart it on their own) ---------- */
-let restarting = false;
+let restarting = false, pageStartedAt = null, pageOutdated = false;
 async function restartHub() {
   if (restarting) return;
   if (!confirm('Restart the Switchboard hub now? Agent terminals keep running; this page reloads when it is back.')) return;
@@ -1325,7 +1866,196 @@ async function restartHub() {
   toast('Switchboard did not come back within a minute; it may need a look (journalctl --user -u switchboard)', 'err');
 }
 $('#tb-restart').addEventListener('click', restartHub);
-$('#stale-restart').addEventListener('click', restartHub);
+$('#stale-restart').addEventListener('click', () => pageOutdated ? location.reload() : restartHub());
+
+/* ---------- phone: pair exactly one phone through the gate (only from this computer; the gate refuses /api/phone) ---------- */
+function phoneDialog() {
+  const status = h('p', { class: 'ph-status' });
+  const addr = h('input', { type: 'url', placeholder: 'https://sb.example.com', 'aria-label': 'Phone address', autocomplete: 'off' });
+  const addrRow = h('label', { class: 'ph-addr' }, h('span', { text: 'Address the phone opens' }), addr);
+  const pairBtn = h('button', { class: 'btn primary', type: 'button', text: 'Pair a phone' });
+  const unpairBtn = h('button', { class: 'btn', type: 'button', text: 'Unpair' });
+  const qr = h('div', { class: 'ph-qr', hidden: true });
+  const qrNote = h('p', { class: 'ph-note', hidden: true });
+  const closeBtn = h('button', { class: 'pbtn', type: 'button', text: '✕', title: 'Close' });
+  const dlg = h('dialog', { class: 'ph-dlg', 'aria-label': 'Phone' },
+    h('div', { class: 'ph-h' }, h('strong', { text: 'Phone' }), h('span', { class: 'spacer' }), closeBtn),
+    status, addrRow, qr, qrNote, h('div', { class: 'ph-actions' }, pairBtn, unpairBtn));
+  let countdown = null;
+  const stopQr = () => { clearInterval(countdown); qr.hidden = true; qrNote.hidden = true; qr.replaceChildren(); };
+  async function refresh() {
+    const st = await api('GET', '/phone');
+    setText(status, st.paired ? `Paired ${ago(st.paired_at)} · ${st.sessions ? 'signed in' : 'not signed in now'}. Pairing again replaces it.` : 'No phone is paired.');
+    setAttr(status, 'title', st.browser || '');
+    addr.value = addr.value || st.origin || '';
+    addrRow.hidden = !!st.origin && !addrRow.dataset.edit;
+    setText(pairBtn, st.paired ? 'Pair a new phone' : 'Pair a phone');
+    unpairBtn.hidden = !st.paired;
+    return st;
+  }
+  status.addEventListener('dblclick', () => { addrRow.dataset.edit = '1'; addrRow.hidden = false; });
+  pairBtn.addEventListener('click', async () => {
+    try {
+      const st = await api('POST', '/phone/pair', addrRow.hidden ? {} : { origin: addr.value.trim() });
+      const q = window.qrcode(0, 'M'); q.addData(st.url); q.make();
+      qr.innerHTML = q.createSvgTag({ cellSize: 6, margin: 4, scalable: true });
+      qr.hidden = false; qrNote.hidden = false; addrRow.hidden = true; delete addrRow.dataset.edit;
+      const end = Date.now() + st.expires_in * 1000;
+      const tick = () => {
+        const s = Math.max(0, Math.round((end - Date.now()) / 1000));
+        setText(qrNote, s ? `Scan with the phone's camera within ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}. The code works once. On iPhone, then tap Share → Add to Home Screen and open it from there (Safari clears sites you don't visit for a week).` : 'This code expired. Make a new one.');
+        if (!s) { clearInterval(countdown); qr.replaceChildren(); }
+      };
+      clearInterval(countdown); tick(); countdown = setInterval(tick, 1000);
+      const was = st.paired_at;
+      const wait = setInterval(async () => {  // close the code once the phone has paired
+        if (!dlg.open) return clearInterval(wait);
+        const now2 = await refresh().catch(() => null);
+        if (now2 && now2.paired && now2.paired_at !== was) { clearInterval(wait); stopQr(); toast('Phone paired'); }
+      }, 2000);
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  unpairBtn.addEventListener('click', async () => {
+    if (!confirm('Unpair the phone? It is signed out at once and needs a new code to get back in.')) return;
+    try { await api('POST', '/phone/unpair', {}); stopQr(); await refresh(); toast('Phone unpaired'); } catch (e) { toast(e.message, 'err'); }
+  });
+  closeBtn.addEventListener('click', () => dlg.close());
+  dlg.addEventListener('close', () => { stopQr(); dlg.remove(); });
+  document.body.append(dlg);
+  refresh().then(() => dlg.showModal()).catch((e) => { dlg.remove(); toast(e.message, 'err'); });
+}
+api('GET', '/phone').then(() => { $('#tb-phone').hidden = false; }).catch(() => {});  // hidden on the phone itself
+$('#tb-phone').addEventListener('click', phoneDialog);
+
+/* ---------- the owner's Inbox: decisions to answer and needs to acknowledge, per project (switchboard/inbox.py) ---------- */
+/* one item: who filed it, age, the text, one button per option, an inline answer box (decisions), Dismiss / Acknowledge */
+function inboxRow() {
+  const kind = h('span', { class: 'ib-kind' });
+  const who = h('span', { class: 'ib-who' });
+  const age = h('span', { class: 'ib-age' });
+  const text = h('div', { class: 'ib-text' });
+  const opts = h('div', { class: 'ib-opts' });
+  const optBtns = keyedList(opts, (o) => o, (o) => {
+    const b = h('button', { class: 'btn small ib-opt', type: 'button', text: o });
+    guarded(b, () => cross(o));
+    return { el: b, update() {} };
+  });
+  const txt = h('input', { type: 'text', class: 'ib-txt', 'aria-label': 'Your answer', autocomplete: 'off' });
+  const send = h('button', { class: 'btn primary small', type: 'submit', text: 'Answer' });
+  const dismiss = h('button', { class: 'pbtn ib-dismiss', type: 'button' });
+  const ignore = h('button', { class: 'pbtn ib-ignore', type: 'button', text: 'Ignore', title: 'Just remove it from the inbox: the agent is told nothing and keeps doing what it was doing' });
+  const form = h('form', { class: 'ib-form' }, txt, send, dismiss, ignore);
+  const el = h('div', { class: 'ib-item' }, h('div', { class: 'ib-h' }, kind, who, age), text, opts, form);
+  let cur = null, onDone = null;
+  async function cross(answer, quiet) {
+    const r = await api('POST', `/inbox/${enc(cur.id)}/done`, { answer: answer || undefined, from: 'owner', quiet: !!quiet });
+    toast(r.state === 'answered' ? `Answered ${cur.agent || ''}: ${answer}` : r.state === 'acked' ? 'Acknowledged' : r.state === 'dismissed' ? 'Dismissed' : r.state === 'ignored' ? 'Ignored (the agent was not told)' : `Already ${r.state}`);
+    if (onDone) onDone();
+  }
+  guarded(ignore, () => cross(null, true));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const a = txt.value.trim();
+    if (!a) { txt.focus(); return; }
+    send.disabled = true;
+    try { await cross(a); txt.value = ''; } catch (err) { toast(err.message, 'err'); } finally { send.disabled = false; }
+  });
+  guarded(dismiss, async () => {
+    if (cur.kind === 'decision' && !confirm(`Close this question from ${cur.agent || 'an agent'} without answering? The agent is told it is no longer wanted.\n\n${cur.text}`)) return;
+    await cross(null);
+  });
+  return {
+    el,
+    update(it, done) {
+      cur = it; onDone = done;
+      const dec = it.kind === 'decision', live = !!it.choices;  // live: a dialog open in the agent's terminal
+      setText(kind, dec ? 'question' : live ? 'in its terminal' : 'needs you'); setCls(kind, 'ib-kind ' + (dec ? 'dec' : 'need'));
+      setText(who, it.agent || 'someone'); setAttr(who, 'title', it.id);
+      setText(age, it.age_s != null ? fmtDur(it.age_s) + ' ago' : ago(it.created_at)); setAttr(age, 'title', absTime(it.created_at));
+      setText(text, it.text || '');
+      optBtns.sync(it.options || []);
+      opts.hidden = !(it.options || []).length;
+      txt.hidden = send.hidden = live || !(dec || it.agent);  // a terminal choice takes one of its options; a notice can be replied to
+      setText(send, dec ? 'Answer' : 'Reply');
+      setAttr(txt, 'placeholder', dec ? ((it.options || []).length ? 'or type an answer… (Enter)' : 'Type your answer… (Enter)') : 'Reply to the agent… (Enter)');
+      setText(dismiss, dec ? 'Dismiss' : live ? 'Hide' : 'Acknowledge');
+      setAttr(dismiss, 'title', dec ? 'Close the question without answering; the agent is told it is no longer wanted'
+        : live ? 'Cross it off here; the agent keeps waiting in its terminal until someone answers' : 'Cross it off; the agent is told you saw it');
+      setCls(el, 'ib-item ' + (dec ? 'dec' : 'need'));
+    },
+  };
+}
+function inboxGroup() {
+  const name = h('a', { class: 'ib-proj' });
+  const n = h('span', { class: 'n' });
+  const el = h('div', { class: 'ib-group' }, name, n);
+  return { el, update(g) { setText(name, g.name); setAttr(name, 'href', g.pid && g.pid !== 'unsorted' ? '#/p/' + enc(g.pid) : '#/'); setText(n, g.count); } };
+}
+function makeInbox() {
+  const btn = $('#tb-inbox');
+  const badge = $('#tb-inbox-n');
+  const title = h('span', { class: 'ib-title' });
+  const scopeEl = h('span', { class: 'ib-scope' });
+  const close = h('button', { class: 'pbtn ib-close', type: 'button', text: '✕', title: 'Close (Esc)' });
+  const list = h('div', { class: 'ib-list' });
+  const rows = keyedList(list, (x) => x.key, (x) => (x.kind === 'group' ? inboxGroup() : inboxRow()));
+  const empty = h('div', { class: 'muted small ib-empty' });
+  const card = h('div', { class: 'inbox-card', id: 'inbox-card', role: 'dialog', 'aria-label': 'Inbox', hidden: true },
+    h('div', { class: 'ib-head' }, title, scopeEl, h('span', { class: 'spacer' }), close), list, empty);
+  document.body.append(card);
+  let open = location.hash === '#/inbox' || lsGet('sb.inbox.open') === '1', pid = parseRoute().pid, data = null, inflight = false, last = 0, lastOv = null;
+  const refetch = () => fetchItems(true);
+  async function fetchItems(force) {
+    if (!open || inflight || (!force && Date.now() - last < 2500)) return;
+    inflight = true;
+    try { data = await api('GET', '/inbox' + (pid ? '?project=' + enc(pid) : '')); last = Date.now(); render(); }
+    catch (e) { setText(empty, 'Inbox read failed: ' + e.message); empty.hidden = false; }
+    finally { inflight = false; }
+  }
+  function render() {
+    setText(scopeEl, pid ? projName(pid) : 'all projects');
+    if (!data || data.project !== (pid || null)) { rows.sync([]); empty.hidden = true; setText(title, 'Inbox'); return; }
+    const its = data.items || [];
+    setText(title, `Inbox · ${its.length}`);
+    const items = [];
+    if (pid) for (const it of its) items.push({ ...it, kind: it.kind, key: it.id });
+    else {
+      const by = new Map();
+      for (const it of its) { if (!by.has(it.project)) by.set(it.project, []); by.get(it.project).push(it); }
+      for (const [p, ds] of by) {  // the API is newest first, so the first group holds the newest item
+        items.push({ kind: 'group', key: 'g:' + p, pid: p, name: p === 'unsorted' ? 'No project' : projName(p), count: ds.length });
+        for (const it of ds) items.push({ ...it, key: it.id });
+      }
+    }
+    rows.sync(items);
+    for (const [k, rec] of rows.map) if (!k.startsWith('g:')) rec.update(its.find((x) => x.id === k), refetch);
+    empty.hidden = its.length > 0;
+    setText(empty, pid ? `Nothing waits for you on ${projName(pid)}.` : 'Nothing waits for you.');
+  }
+  function show(on) {
+    open = on; card.hidden = !on; setAttr(btn, 'aria-pressed', on ? 'true' : 'false'); lsSet('sb.inbox.open', on ? '1' : '');
+    if (!on && location.hash === '#/inbox') history.replaceState(null, '', '#/');
+    if (on) fetchItems(true);
+  }
+  btn.addEventListener('click', () => show(!open));
+  close.addEventListener('click', () => show(false));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && open && !e.defaultPrevented && (document.activeElement == null || !document.activeElement.closest('.ib-txt'))) show(false); });
+  card.hidden = !open; setAttr(btn, 'aria-pressed', open ? 'true' : 'false');
+  return {
+    el: card,
+    show,
+    scope(newPid) { if (newPid === pid) return; pid = newPid; data = null; render(); if (lastOv) this.update(lastOv); fetchItems(true); },
+    update(ov) {  // every poll: the badge from overview.inbox, and a refetch while the card is open
+      lastOv = ov;
+      const ib = (ov && ov.inbox) || { count: 0, by_project: {} };
+      const n = pid ? (ib.by_project || {})[pid] || 0 : ib.count || 0;
+      setText(badge, n ? String(n) : ''); badge.hidden = !n;
+      setAttr(btn, 'title', n ? `${n} request${n === 1 ? '' : 's'} wait${n === 1 ? 's' : ''} for you${pid ? ' on ' + projName(pid) : ''}${ib.count > n ? ` (${ib.count} across all projects)` : ''}` : 'Requests agents filed for you: questions to answer and needs to acknowledge');
+      setCls(btn, 'pbtn tb-inbox' + (n ? ' has' : ''));
+      fetchItems(false);
+    },
+  };
+}
 
 /* ---------- phone: pair exactly one phone through the gate (only from this computer; the gate refuses /api/phone) ---------- */
 function phoneDialog() {
@@ -1388,14 +2118,29 @@ $('#tb-phone').addEventListener('click', phoneDialog);
 
 /* ---------- routing + polling ---------- */
 function parseRoute() {
+  const ins = location.hash.match(/^#\/insights(?:\/([^/]+))?/);
+  if (ins) return { pid: null, insights: ins[1] ? decodeURIComponent(ins[1]) : '' };
   const m = location.hash.match(/^#\/p\/([^/]+)(?:\/([^/]+))?/);
   return m ? { pid: decodeURIComponent(m[1]), aid: m[2] ? decodeURIComponent(m[2]) : null } : { pid: null };
 }
 function route() {
   const r = parseRoute();
+  if (location.hash === '#/inbox') { INBOX.scope(null); INBOX.show(true); }
   const app = $('#app');
+  const own = r.aid && S.agents.get(r.aid);
+  if (own && own.project !== r.pid) { location.hash = agentHref(own); return; }  // an agent opens on its own project only
   if (r.pid && S.view && S.view.pid === r.pid) { S.view.select(r.aid); return; }
   if (S.view) S.view.destroy();
+  if (r.insights !== undefined) {
+    S.view = insightsView(r.insights);
+    app.className = 'app';
+    app.replaceChildren(S.view.el);
+    INBOX.scope(r.insights || null);
+    if (S.ov) S.view.update();
+    S.view.start();
+    document.title = 'Insights · Switchboard';
+    return;
+  }
   if (location.hash === '#/setup') {
     S.view = setupView();
     app.className = 'app';
@@ -1408,6 +2153,7 @@ function route() {
     app.className = 'app';
   }
   app.replaceChildren(S.view.el);
+  INBOX.scope(r.pid || null);
   if (S.ov) { S.view.update(); if (r.pid) S.view.select(null); }
   document.title = (S.view.title ? S.view.title + ' · ' : '') + 'Switchboard';
 }
@@ -1419,6 +2165,9 @@ function setOnline(on) {
   setText(c.lastElementChild, on ? 'live' : 'hub unreachable');
 }
 let tickTimer = null, ticking = false, firstLoad = true;
+const INBOX = makeInbox();
+const HALT = haltBanner();
+$('#stale-banner').after(HALT.el);  // the HALT banner sits under the stale-code banner, above the page
 async function tick() {
   clearTimeout(tickTimer);
   if (ticking) { tickTimer = setTimeout(tick, 300); return; }
@@ -1430,7 +2179,10 @@ async function tick() {
     // Something (POST /api/focus) asks to open an agent: follow fresh requests only (never jump on a reload).
     if (ov.focus && ov.focus.ts !== S.focusTs) {
       S.focusTs = ov.focus.ts;
-      if (Date.now() + clockSkew - parseTime(ov.focus.ts) < 15000) location.hash = '#/p/' + enc(ov.focus.project) + '/' + enc(ov.focus.agent);
+      if (Date.now() + clockSkew - parseTime(ov.focus.ts) < 15000) {
+        if (ov.focus.inbox) { location.hash = '#/inbox'; INBOX.scope(null); INBOX.show(true); }
+        else location.hash = '#/p/' + enc(ov.focus.project) + '/' + enc(ov.focus.agent);
+      }
     }
     const router = ov.router || 'desk';
     const isDesk = (a) => a.role === 'desk' || a.id === router;
@@ -1442,19 +2194,27 @@ async function tick() {
     if (ov.setup_needed && firstLoad && location.hash !== '#/setup') location.hash = '#/setup';
     setOnline(true);
     const banner = $('#stale-banner');
-    const stale = !ov.code ? 'Switchboard is running older code than this page. Restart to update.'
+    if (!pageStartedAt && ov.code) pageStartedAt = ov.code.started_at;
+    pageOutdated = !!(ov.code && pageStartedAt !== ov.code.started_at);
+    setText($('#stale-restart'), pageOutdated ? 'Refresh page' : 'Restart now');
+    const stale = pageOutdated ? 'Switchboard updated. Refresh this page to load the latest controls.' : !ov.code ? 'Switchboard is running older code than this page. Restart to update.'
       : ov.code.stale ? `New Switchboard code is ready (${ov.code.disk}; running ${ov.code.running}). Restart when it suits you; terminals keep running.` : '';
     banner.hidden = !stale || restarting;
     setText($('#stale-text'), stale);
     S.code = ov.code;
+    HALT.update(ov.fleet && ov.fleet.halt);
+    INBOX.update(ov);
     const agents = [...S.agents.values()];
     setText($('#tb-sum'), `${agents.filter((a) => a.running).length} running · ${agents.filter((a) => a.state === 'busy').length} working`);
+    if (firstLoad) {  // a link to another project's agent opens it on its own project
+      const r = parseRoute(), own = r.aid && S.agents.get(r.aid);
+      if (own && own.project !== r.pid) location.hash = agentHref(own);
+    }
     if (S.view) {
       S.view.update();
       if (firstLoad && S.view.pid) S.view.select(null);
       document.title = (S.view.title ? S.view.title + ' · ' : '') + 'Switchboard';
     }
-    if (firstLoad) CHAT.poll();
     firstLoad = false;
   } catch (e) {
     setOnline(false);

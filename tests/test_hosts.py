@@ -84,14 +84,14 @@ class ConfigTests(unittest.TestCase):
 
     def test_file_adds_hosts_and_keeps_a_local_one(self):
         write_hosts([{"name": "box", "ssh": "box", "order": 1}, {"name": "desk", "ssh": None, "desktop": True, "order": 3}],
-                    workload_units=["atlas-*"], protected_units=["switchboard*"])
+                    workload_units=["batch-*"], protected_units=["switchboard*"])
         cfg = hosts.load_config()
         self.assertEqual([h["name"] for h in cfg["hosts"]], ["box", "desk"])  # by order
         self.assertEqual(cfg["hosts"][1]["reserve"], {"cores": 1, "ram_gib": 8})
         self.assertTrue(cfg["hosts"][1]["desktop"])
 
     def test_bad_pattern_is_refused(self):
-        write_hosts([], workload_units=["atlas-*; rm -rf /"])
+        write_hosts([], workload_units=["batch-*; rm -rf /"])
         with self.assertRaises(ValueError):
             hosts.load_config()
 
@@ -201,9 +201,13 @@ class HaltTests(unittest.TestCase):
     @unittest.skipUnless(have_user_systemd(), "needs a systemd user manager")
     def test_halt_stops_tracked_jobs_and_disables_matching_workloads_only(self):
         tag = uuid.uuid4().hex[:8]
-        units = {"job": f"sb-job-test{tag}", "work": f"sbtest-work-{tag}", "keep": f"sbtest-keep-{tag}"}
+        units = {"job": f"sb-job-test{tag}", "work": f"sbtest-work-{tag}", "keep": f"sbtest-keep-{tag}",
+                 "other": f"sb-job-other{tag}"}  # an sb-job unit this hub does not track: production, another hub
         for u in units.values():
             subprocess.run(["systemd-run", "--user", "--quiet", "--unit", u, "sleep", "300"], check=True)
+        # only a job THIS hub tracks is stopped by its halt: another hub's sb-job units on the same machine are not
+        self.h.s.x("INSERT INTO jobs(id,name,host,unit,threads,mem_mib,state,created_at) VALUES('job-t','t','here',?,1,64,"
+                   "'running','2026-01-01T00:00:00Z')", (units["job"] + ".service",))
         try:
             res = hosts.halt(self.h, "tester", "test", ["here"], True)
             r = res["results"][0]
@@ -213,6 +217,10 @@ class HaltTests(unittest.TestCase):
             active = subprocess.run(["systemctl", "--user", "is-active", units["keep"]], capture_output=True,
                                     text=True).stdout.strip()
             self.assertEqual(active, "active", "protected unit untouched")
+            self.assertNotIn(units["other"] + ".service", r["stopped"])
+            other = subprocess.run(["systemctl", "--user", "is-active", units["other"]], capture_output=True,
+                                   text=True).stdout.strip()
+            self.assertEqual(other, "active", "an untracked sb-job unit survives the halt")
         finally:
             for u in units.values():
                 subprocess.run(["systemctl", "--user", "stop", u], capture_output=True)
@@ -225,23 +233,23 @@ class GuardTests(unittest.TestCase):
         self.d = os.environ["SB_SYSTEMD_USER_DIR"]
         shutil.rmtree(self.d, ignore_errors=True)
         os.makedirs(self.d)
-        for name in ("atlas-sweep.service", "atlas-sweep.timer", "atlas-bobbler.service", "devbox-compositor.service"):
+        for name in ("batch-sweep.service", "batch-sweep.timer", "nightly-backup.service", "homebox-compositor.service"):
             with open(os.path.join(self.d, name), "w") as f:
                 f.write("[Unit]\nDescription=test\n")
         write_hosts([{"name": "here", "ssh": None}, {"name": "far", "ssh": "far-alias"}],
-                    workload_units=["atlas-*"], protected_units=["atlas-bobbler*", "devbox-*"])
+                    workload_units=["batch-*"], protected_units=["nightly-backup*", "homebox-*"])
 
     def test_install_list_remove(self):
         res = hosts.guards(self.h, "install")
         for r in res["results"]:
-            self.assertEqual(r["units"], ["atlas-sweep.service", "atlas-sweep.timer"], r)
-        conf = os.path.join(self.d, "atlas-sweep.service.d", "switchboard-halt.conf")
+            self.assertEqual(r["units"], ["batch-sweep.service", "batch-sweep.timer"], r)
+        conf = os.path.join(self.d, "batch-sweep.service.d", "switchboard-halt.conf")
         self.assertEqual(open(conf).read(), hosts.GUARD)
-        self.assertFalse(os.path.exists(os.path.join(self.d, "atlas-bobbler.service.d")))
+        self.assertFalse(os.path.exists(os.path.join(self.d, "nightly-backup.service.d")))
         self.assertEqual(hosts.guards(self.h, "list", ["here"])["results"][0]["units"],
-                         ["atlas-sweep.service", "atlas-sweep.timer"])
+                         ["batch-sweep.service", "batch-sweep.timer"])
         res = hosts.guards(self.h, "remove", ["here"])
-        self.assertEqual(res["results"][0]["units"], ["atlas-sweep.service", "atlas-sweep.timer"])
+        self.assertEqual(res["results"][0]["units"], ["batch-sweep.service", "batch-sweep.timer"])
         self.assertFalse(os.path.exists(conf))
 
     def test_install_needs_patterns(self):

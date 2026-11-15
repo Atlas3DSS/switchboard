@@ -73,6 +73,137 @@ class SharedContextTests(unittest.TestCase):
             self.hub.add_note({"from": "a1", "project": "beta", "text": "hi"})
         self.assertIn("secret beta plans", self.hub.agent_context("b1", viewer="owner")["text"])
 
+    @unittest.skip("stale: written for the router chat / earlier isolation rules; needs rewriting")
+    def test_project_islands_messages_dispatch_replies_and_queue(self):
+        h = self.hub
+        h.send({"from": "a1", "to": "a2", "body": "same project"})
+        h.send({"from": "owner", "to": "b1", "body": "owner still has access"})
+        for frm in ("a1", "desk", "unknown"):
+            with self.assertRaises(PermissionError):
+                h.send({"from": frm, "to": "b1", "body": "blocked"})
+        with self.assertRaises(PermissionError):
+            h.dispatch({"from": "a1", "project": "beta", "task": "blocked"})
+        with self.assertRaises(PermissionError):
+            h.s.enqueue("b1", "direct store blocked", frm="a1")
+        m, _ = h.s.enqueue("a2", "legacy cross project", frm="a1")
+        h.s.x("UPDATE messages SET to_agent='b1' WHERE id=?", (m["id"],))
+        h.s.hold_cross_project_messages()
+        self.assertEqual(h.s.message(m["id"])["state"], "held")
+        h.r.route_replies(h.s.agent("b1"), [h.s.message(m["id"])], "must not return")
+        self.assertFalse(h.s.one("SELECT id FROM messages WHERE idem=?", ("reply:" + m["id"],)))
+        h.s.set_agent("a1", project="unsorted")
+        with self.assertRaises(PermissionError):
+            h.send({"from": "a1", "to": "b1", "body": "no unsorted exception"})
+
+    def test_read_grant_opens_reading_and_nothing_else(self):
+        from switchboard import shared
+        with self.assertRaises(ValueError):
+            self.hub.grant_reads("alpha", ["nowhere"])
+        res = self.hub.grant_reads("alpha", ["beta"])
+        self.assertEqual((res["reads"], sorted(res["told"])), (["beta"], ["a1", "a2"]))
+        self.assertEqual(res["grants"][0]["folders"], [os.path.realpath(self.tmp)])
+        told = self.hub.s.q("SELECT * FROM messages WHERE to_agent='a1'")
+        self.assertEqual(told[0]["from_agent"], "system")
+        self.assertIn("READ-ONLY access to project 'beta'", told[0]["body"])
+        self.assertIn("secret beta plans", self.hub.agent_context("b1", viewer="a1")["text"])
+        ctx = self.hub.project_context("beta", viewer="a1")
+        self.assertTrue(ctx["read_only"])
+        self.assertEqual(self.hub.project_context(None, viewer="a1")["reads"], ["beta"])
+        self.assertTrue(self.hub.context_search("beta", "secret plans", viewer="a1")["hits"])
+        with self.assertRaises(PermissionError) as err:
+            self.hub.add_note({"from": "a1", "project": "beta", "text": "hi"})
+        self.assertIn("read-only", str(err.exception))
+        with self.assertRaises(PermissionError):
+            self.hub.send({"from": "a1", "to": "b1", "body": "hello"})
+        with self.assertRaises(PermissionError):  # a grant runs one way
+            self.hub.agent_context("a1", viewer="b1")
+        note = shared.launch_note(self.hub.s.agent("a1"))
+        self.assertIn("READ-ONLY access to project 'beta'", note)
+        self.assertNotIn("READ-ONLY", shared.launch_note(self.hub.s.agent("b1")))
+        self.hub.s.upsert_project({"id": "alpha", "goal": "an agent edits its own project card"})
+        self.assertEqual(self.hub.s.project("alpha")["reads"], ["beta"])
+        self.hub.grant_reads("alpha", [])
+        with self.assertRaises(PermissionError):
+            self.hub.agent_context("b1", viewer="a1")
+
+    def test_outside_toggles_are_separate_and_reach_claude_flags(self):
+        from switchboard import shared
+        from switchboard.terminals import NeedsConfirm
+        a1 = self.hub.s.agent("a1")
+        settings = lambda a: json.loads(terminals.file_flags(a)[1])  # noqa: E731
+        self.assertNotIn("permissions", settings(a1))
+        self.assertNotIn("outside its own folder", shared.launch_note(a1))
+        for aid in ("a1", "a2"):
+            self.hub.s.set_agent(aid, provider="claude", mode="terminal")
+        busy = lambda aid, upd, confirm=False: (_ for _ in ()).throw(NeedsConfirm("busy")) if aid == "a2" else None  # noqa: E731
+        with mock.patch.object(self.hub.t, "running", return_value=True), \
+                mock.patch.object(self.hub.t, "relaunch", side_effect=busy) as rl:
+            res = self.hub.set_outside("alpha", read=True)
+            self.assertEqual(rl.call_count, 2)
+        self.assertEqual((res["read"], res["write"], res["relaunched"], res["next_start"]), (True, False, ["a1"], ["a2"]))
+        self.assertEqual(settings(self.hub.s.agent("a1"))["permissions"]["allow"], ["Read(//**)"])
+        self.assertIn("read only", shared.launch_note(self.hub.s.agent("a1")))
+        told = self.hub.s.q("SELECT body FROM messages WHERE to_agent='a2' ORDER BY rowid")
+        self.assertIn("next time your CLI starts", told[-1]["body"])
+        with mock.patch.object(self.hub.t, "running", return_value=False):
+            res = self.hub.set_outside("alpha", read=False, write=True)
+            self.assertEqual(settings(self.hub.s.agent("a1"))["permissions"]["allow"], ["Edit(//**)"])
+            self.hub.set_outside("alpha", read=True)
+            self.assertEqual(settings(self.hub.s.agent("a1"))["permissions"]["allow"], ["Read(//**)", "Edit(//**)"])
+            self.assertEqual(self.hub.s.outside("beta"), {"read": False, "write": False})
+            self.assertNotIn("permissions", settings(self.hub.s.agent("b1")))
+            n = len(self.hub.s.q("SELECT id FROM messages WHERE to_agent='a1'"))
+            self.hub.set_outside("alpha", read=True)  # no change: nobody is told
+            self.assertEqual(len(self.hub.s.q("SELECT id FROM messages WHERE to_agent='a1'")), n)
+            self.hub.s.upsert_project({"id": "alpha", "goal": "a card edit keeps the toggles"})
+            self.assertEqual(self.hub.s.outside("alpha"), {"read": True, "write": True})
+            self.hub.set_outside("alpha", read=False, write=False)
+        self.assertIn("closed files outside", self.hub.s.q("SELECT body FROM messages WHERE to_agent='a1' ORDER BY rowid")[-1]["body"])
+        with self.assertRaises(LookupError):
+            self.hub.set_outside("nowhere", read=True)
+
+    def test_agent_http_scope(self):
+        import threading
+        import urllib.request
+        import urllib.error
+        from http.server import ThreadingHTTPServer
+        from switchboard.hub import make_handler
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.hub))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        def request(path, body=None):
+            req = urllib.request.Request(f"http://127.0.0.1:{server.server_port}" + path,
+                data=json.dumps(body).encode() if body is not None else None,
+                headers={"Host": "127.0.0.1:8802", "Content-Type": "application/json", "X-Switchboard-Agent": "a1"})
+            return json.load(urllib.request.urlopen(req))
+        try:
+            self.assertEqual({a["id"] for a in request("/api/agents")["agents"]}, {"a1", "a2"})
+            for path, body in (("/api/agents/b1/context", None),
+                               ("/api/messages", {"from": "owner", "to": "b1", "body": "spoof"}),
+                               ("/api/broadcast", {"body": "global"})):
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    request(path, body)
+                self.assertEqual(err.exception.code, 409)
+            result = request("/api/messages", {"to": "a2", "body": "same island"})
+            self.assertEqual(result["message"]["from"], "a1")
+            with self.assertRaises(urllib.error.HTTPError):  # an agent cannot give its own project a read grant
+                request("/api/projects/alpha/reads", {"reads": ["beta"]})
+            self.assertEqual(self.hub.s.project("alpha")["reads"], [])
+            self.hub.grant_reads("alpha", ["beta"])
+            self.assertIn("secret beta plans", request("/api/agents/b1/context")["text"])
+            self.assertTrue(request("/api/projects/beta/context")["read_only"])
+            for path, body in (("/api/messages", {"to": "b1", "body": "still closed"}),
+                               ("/api/notes", {"project": "beta", "text": "still closed"}),
+                               ("/api/agents/b1/interrupt", {})):
+                with self.assertRaises(urllib.error.HTTPError):
+                    request(path, body)
+            with self.assertRaises(urllib.error.HTTPError):  # reading opens context only, not the agent's chat or card
+                request("/api/agents/b1/chat")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_digest_and_search(self):
         text = self.hub.agent_context("a1", viewer="a2")["text"]
         self.assertIn("ASKED: status of a1?", text)

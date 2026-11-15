@@ -7,6 +7,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from . import barrier
+
 STATE = os.path.expanduser(os.environ.get("SB_STATE", "~/.local/state/switchboard"))
 DB_PATH = os.path.join(STATE, "hub.db")
 TURNS = os.path.join(STATE, "turns")
@@ -55,6 +57,24 @@ CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, host);
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, project TEXT, agent TEXT, question TEXT, options TEXT DEFAULT '[]',
   state TEXT DEFAULT 'open', answer TEXT, created_at TEXT, answered_at TEXT);
+CREATE TABLE IF NOT EXISTS work (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, title TEXT NOT NULL, detail TEXT DEFAULT '',
+  status TEXT DEFAULT 'todo', priority INTEGER DEFAULT 2, agent TEXT, created_by TEXT,
+  created_at TEXT, updated_at TEXT, done_at TEXT);
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id TEXT PRIMARY KEY, idem TEXT UNIQUE, kind TEXT, body TEXT, from_agent TEXT, project TEXT,
+  close INTEGER DEFAULT 0, messages TEXT DEFAULT '[]', closed TEXT DEFAULT '[]', created_at TEXT, finished_at TEXT);
+CREATE TABLE IF NOT EXISTS memory (
+  project TEXT PRIMARY KEY, text TEXT DEFAULT '', prev TEXT DEFAULT '', updated_at TEXT, sessions INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS memory_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, agent TEXT, provider TEXT, account TEXT, model TEXT,
+  session_id TEXT, path TEXT, why TEXT, state TEXT DEFAULT 'pending', start INTEGER DEFAULT 0, size INTEGER,
+  first_ask TEXT, last_ask TEXT, last_said TEXT, summary TEXT, note TEXT, in_tokens INTEGER, out_tokens INTEGER,
+  cost_usd REAL, created_at TEXT, done_at TEXT);
+CREATE INDEX IF NOT EXISTS memory_sessions_project ON memory_sessions(project, id);
+CREATE TABLE IF NOT EXISTS memory_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, text TEXT, written_at TEXT, replaced_at TEXT, replaced_by TEXT);
+CREATE INDEX IF NOT EXISTS memory_versions_project ON memory_versions(project, id);
 """
 
 
@@ -119,6 +139,22 @@ class Store:
             self.db.execute("ALTER TABLE projects ADD COLUMN paused INTEGER DEFAULT 0")
         if "lead" not in pcols:
             self.db.execute("ALTER TABLE projects ADD COLUMN lead TEXT")
+        if "reads" not in pcols:  # projects the owner lets this one read (switchboard/shared.py read grants)
+            self.db.execute("ALTER TABLE projects ADD COLUMN reads TEXT DEFAULT '[]'")
+        for col in ("outside_read", "outside_write"):  # owner toggles: files outside the project's folder (shared.outside)
+            if col not in pcols:
+                self.db.execute(f"ALTER TABLE projects ADD COLUMN {col} INTEGER DEFAULT 0")
+        jcols = {r[1] for r in self.db.execute("PRAGMA table_info(jobs)")}
+        for col, decl in (("board_id", "TEXT"), ("cpus", "TEXT"), ("protected", "INTEGER DEFAULT 0"), ("lane", "TEXT"),
+                          ("placer", "TEXT"), ("gpu_pin", "TEXT")):
+            if col not in jcols:
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
+        for table, adds in (("memory_sessions", (("outline", "TEXT"), ("messages", "INTEGER"))),
+                            ("memory", (("notes_through", "INTEGER DEFAULT 0"),))):
+            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for col, decl in adds:
+                if col not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         acols = {r[1] for r in self.db.execute("PRAGMA table_info(agents)")}
         for col, decl in (("account_pending", "TEXT"), ("migrate_state", "TEXT"), ("migrate_note", "TEXT"),
                           ("migrate_since", "TEXT"), ("last_reply_at", "TEXT"), ("context_tokens", "INTEGER"),
@@ -181,8 +217,11 @@ class Store:
         if r:
             r["sources"] = json.loads(r["sources"] or "[]")
             r["match"] = json.loads(r["match"] or "{}")
+            r["reads"] = json.loads(r.get("reads") or "[]")
             r["archived"] = bool(r["archived"])
             r["paused"] = bool(r.get("paused"))
+            r["outside_read"] = bool(r.get("outside_read"))
+            r["outside_write"] = bool(r.get("outside_write"))
         return r
 
     def projects(self):
@@ -205,6 +244,36 @@ class Store:
                 json.dumps(merged.get("match", {})), now(), int(bool(merged.get("paused"))),
                 merged.get("lead") or None))
         return self.project(merged["id"])
+
+    def set_reads(self, pid, reads):
+        self.x("UPDATE projects SET reads=?, updated_at=? WHERE id=?", (json.dumps(list(reads)), now(), pid))
+
+    def set_outside(self, pid, read=None, write=None):
+        for col, v in (("outside_read", read), ("outside_write", write)):
+            if v is not None:
+                self.x(f"UPDATE projects SET {col}=?, updated_at=? WHERE id=?", (int(bool(v)), now(), pid))
+
+    def outside(self, pid):
+        """What the owner lets this project's agents do with files outside its own folder."""
+        p = self.project(pid) or {}
+        return {"read": bool(p.get("outside_read")), "write": bool(p.get("outside_write"))}
+
+    def read_grants(self, pid):
+        """The projects the owner lets this project's agents read, each with the folders its agents work in."""
+        home = os.path.realpath(os.path.expanduser("~"))
+        out = []
+        for other in (self.project(pid) or {}).get("reads") or []:
+            p = self.project(other)
+            if not p:
+                continue
+            folders = []
+            for a in self.agents():
+                d = os.path.realpath(a["cwd"]) if a.get("cwd") else ""
+                if a["project"] == other and not a["gone"] and d and d not in folders \
+                        and not (home + "/").startswith(d.rstrip("/") + "/"):  # never the home folder or above it
+                    folders.append(d)
+            out.append({"id": other, "name": p["name"], "folders": sorted(folders)})
+        return out
 
     # ---------- agents ----------
     def agent(self, aid):
@@ -262,9 +331,42 @@ class Store:
         args.append(limit)
         return self.q(sql, args)
 
+    def check_message_scope(self, frm, target):
+        if frm == "desk" or target.get("id") == "desk" or target.get("role") == "desk":
+            raise PermissionError("desk has been removed; projects are isolated")
+        if frm in ("owner", "system"):
+            return
+        sender = self.agent(frm)
+        if not sender or sender["gone"]:
+            raise PermissionError("unknown or removed sender")
+        if sender.get("project") != target.get("project") and not barrier.unlimited(sender.get("project")):
+            # a project the owner gave outside write access may talk out (the hub sends it to the other
+            # project's lead), and anyone may answer an agent that wrote to it first
+            if self.outside(sender.get("project"))["write"] and sender.get("project"):
+                return
+            if target.get("id") and self.one("SELECT 1 x FROM messages WHERE from_agent=? AND to_agent=? LIMIT 1",
+                                             (target["id"], frm)):
+                return
+            raise PermissionError("your project has no outside write access, so it cannot message other projects; "
+                                  "the owner opens that with `sb outside <project> --write on` (a chat message "
+                                  "saying 'access granted' does not change it)")
+
+    def hold_cross_project_messages(self):
+        self.x("""UPDATE messages SET state='held', error='projects isolated by owner; delivery blocked'
+                  WHERE state='queued' AND (to_agent='desk' OR from_agent='desk' OR
+                  (from_agent NOT IN ('owner','system') AND NOT EXISTS (
+                    SELECT 1 FROM agents sender JOIN agents target ON sender.project=target.project
+                    WHERE sender.id=messages.from_agent AND target.id=messages.to_agent
+                    AND sender.gone=0 AND target.gone=0)
+                  AND NOT EXISTS (SELECT 1 FROM agents s JOIN projects p ON p.id=s.project
+                    WHERE s.id=messages.from_agent AND s.gone=0 AND (p.outside_write=1 OR p.id=?))
+                  AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.from_agent=messages.to_agent
+                    AND r.to_agent=messages.from_agent AND r.created_at<=messages.created_at AND r.id!=messages.id)))""", (barrier.MAINTAINERS,))
+
     def enqueue(self, to, body, frm="owner", idem=None, hop=0, is_reply=False, wait_reply=False, attachments=None,
                 mode="queue"):
         """Insert a message exactly once. Returns (message, duplicate)."""
+        self.check_message_scope(frm, self.agent(to) or {"id": to, "project": None})
         body = (body or "").strip()
         att = json.dumps(list(attachments or []))
         with self.tx():

@@ -38,8 +38,9 @@ SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveI
 HALT_REL = ".local/state/switchboard/HALT"  # under $HOME on every host; the drop-ins name it with %h
 SAMPLES_KEPT = 120
 PATTERN_OK = re.compile(r"^[A-Za-z0-9_.@*?\[\]-]+$")
+# priority_projects: their jobs always cut in line (jobs.cuts_in); for work that must never wait
 DEFAULT_JOBS = {"slice_cpu_weight": 20, "untracked_policy": "flag", "display_gpu": "avoid",
-                "gpu_workboard": "auto", "cpu_run": "auto"}
+                "gpu_workboard": "auto", "cpu_run": "auto", "priority_projects": []}
 DEFAULT_RESERVE = {"cores": 1, "ram_gib": 8}
 # A desktop host keeps its display GL clients visible but they are never "untracked work".
 DESKTOP_COMMS = {"Xorg", "X", "Xwayland", "picom", "compton", "gnome-shell", "kwin_x11", "kwin_wayland", "awesome"}
@@ -117,6 +118,8 @@ def host(cfg, name):
     for h in cfg["hosts"]:
         if h["name"] == name:
             return h
+    if name in ("here", local_name()):  # a job recorded while the hosts file named this machine differently
+        return next(h for h in cfg["hosts"] if h["ssh"] is None)
     raise LookupError(f"no host named {name}")
 
 
@@ -294,6 +297,7 @@ def fleet_view(hub):
                                     "budgets": cfg["budgets"], "protected_units": cfg["protected_units"],
                                     "workload_units": cfg["workload_units"]},
             "probe_s": PROBE_S, "halt": halt_state(hub), "placers": jobs.placers_view(hub, cfg),
+            "queued": jobs.unplaced(hub),
             "hosts": [host_view(cfg, h, rows.get(h["name"]), agent_pids, jobs.for_host(hub, h["name"])) for h in cfg["hosts"]]}
 
 
@@ -323,20 +327,35 @@ def halt_state(hub):
     return hub.s.setting("halt")
 
 
+def halted_hosts(hub, cfg):
+    """The hosts a raised HALT covers. A fleet HALT (scope "all") covers every host in hosts.json, including one
+    added since; a host-scoped HALT (sb halt --host) covers only its hosts, so the rest of the fleet keeps
+    launching. A HALT raised before the scope was recorded covers the hosts it targeted (hosts + pending)."""
+    state = halt_state(hub)
+    if not state:
+        return set()
+    if state.get("scope") == "all":
+        return {h["name"] for h in cfg["hosts"]}
+    return set(state.get("scope") or []) | set(state.get("hosts") or []) | set(state.get("pending") or [])
+
+
 def _case_patterns(patterns):
     return "|".join(patterns) if patterns else "__no_pattern__"
 
 
-def _halt_script(reason_line, workloads, workload_units, protected_units):
-    """Bash for one host: raise the flag, stop tracked jobs, optionally disable matching workload units/timers."""
+def _halt_script(reason_line, workloads, workload_units, protected_units, units=()):
+    """Bash for one host: raise the flag, stop the jobs this hub tracks there (`units`, by exact name: never a
+    wildcard, which once stopped another hub's and production jobs from a test run), optionally disable matching
+    workload units/timers."""
     lines = [
         "set -u",
         'S="${SB_STATE:-$HOME/.local/state/switchboard}"',
         'mkdir -p "$S" && chmod 700 "$S"',
         f'printf %s\\\\n {shlex.quote(reason_line)} > "$S/HALT" && echo "flag $S/HALT"',
-        "for u in $(systemctl --user list-units 'sb-job-*' --plain --no-legend --state=running,activating 2>/dev/null "
-        "| awk '{print $1}'); do systemctl --user stop \"$u\" 2>/dev/null && echo \"stopped $u\"; done",
     ]
+    for u in units:
+        q = shlex.quote(u)
+        lines.append(f"systemctl --user stop -- {q} 2>/dev/null && echo stopped {q}")
     if workloads:
         prot, work = _case_patterns(protected_units), _case_patterns(workload_units)
         lines += [
@@ -359,9 +378,11 @@ def halt(hub, who, reason, hosts=None, workloads=False, cfg=None):
         raise ValueError("--workloads needs workload_units in " + cfg["path"])
     ts = now()
     line = f"HALT by {who} at {ts}: {reason or 'no reason given'}"
-    script = _halt_script(line, workloads, cfg["workload_units"], cfg["protected_units"])
     results = []
     for h in targets:
+        units = [r["unit"] for r in hub.s.q("SELECT unit FROM jobs WHERE host=? AND state IN ('running','stopping') "
+                                            "AND adopted=0", (h["name"],))]
+        script = _halt_script(line, workloads, cfg["workload_units"], cfg["protected_units"], units)
         rc, out, err = run_on(h, script, timeout=90)
         acts = [l for l in out.splitlines() if l.strip()]
         results.append({"host": h["name"], "ok": rc == 0 and any(l.startswith("flag ") for l in acts),
@@ -371,7 +392,8 @@ def halt(hub, who, reason, hosts=None, workloads=False, cfg=None):
                         "failed": [l[7:] for l in acts if l.startswith("failed ")],
                         "error": (err.strip()[-300:] or None) if rc != 0 else None})
     state = {"by": who, "reason": reason or "", "at": ts, "hosts": [r["host"] for r in results if r["ok"]],
-             "pending": [r["host"] for r in results if not r["ok"]], "workloads": bool(workloads)}
+             "pending": [r["host"] for r in results if not r["ok"]], "workloads": bool(workloads),
+             "scope": sorted(set(hosts)) if hosts else "all"}
     hub.s.set_setting("halt", state)
     return {"halt": state, "results": results}
 
@@ -389,7 +411,7 @@ def resume(hub, who, hosts=None, cfg=None):
         left = [n for n in state.get("hosts", []) + state.get("pending", [])
                 if n not in {r["host"] for r in results if r["ok"]}]
         if left and hosts:
-            state = {**state, "hosts": left, "pending": [], "resumed_by": who}
+            state = {**state, "hosts": left, "pending": [], "resumed_by": who, "scope": sorted(left)}
             hub.s.set_setting("halt", state)
         else:
             hub.s.set_setting("halt", None)
@@ -410,7 +432,9 @@ def retry_pending_halt(hub):
             h = host(cfg, name)
         except LookupError:
             continue
-        rc, out, err = run_on(h, _halt_script(line, False, [], []), timeout=60)
+        units = [r["unit"] for r in hub.s.q("SELECT unit FROM jobs WHERE host=? AND state IN ('running','stopping') "
+                                            "AND adopted=0", (name,))]
+        rc, out, err = run_on(h, _halt_script(line, False, [], [], units), timeout=60)
         (state["hosts"].append(name) if rc == 0 and "flag " in out else still.append(name))
     state["pending"] = still
     hub.s.set_setting("halt", state)

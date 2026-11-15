@@ -397,6 +397,17 @@ class GateTests(unittest.TestCase):
             s.settimeout(3)
             self.assertIn(b" 408 ", s.recv(4096).split(b"\r\n")[0])  # the body never finished in time
             s.close()
+            s = socket.create_connection(("127.0.0.1", self.gw.server_port), timeout=5)  # the last bytes come late
+            s.sendall(f"POST /gate/challenge HTTP/1.1\r\nHost: h\r\nOrigin: {ORIGIN}\r\n"
+                      f"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{{".encode())
+            time.sleep(gate.AUTH_BODY_S + 0.5)
+            try:
+                s.sendall(b"}")
+            except OSError:
+                pass
+            s.settimeout(3)
+            self.assertIn(b" 408 ", s.recv(4096).split(b"\r\n")[0])
+            s.close()
         finally:
             gate.READ_TIMEOUT_S, gate.AUTH_BODY_S = old
 

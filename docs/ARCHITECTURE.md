@@ -20,7 +20,7 @@ browser ──HTTP/WebSocket──▶ hub (hub.py) ──unix socket──▶ pt
 | `ptyholder.py` | tiny process that owns one pty and its scrollback; the hub reconnects to it after a restart |
 | `vtscreen.py` | a small VT100 screen model: is the agent busy, is its input box empty, what is the window title |
 | `agent.py` | the built-in agent for OpenAI-compatible endpoints (Claude-format transcripts, Claude-style stream-json) |
-| `runner.py` | headless turns for the Switchboard chat (and any `mode='managed'` agent): `claude -p`, `codex exec`, `agent -p` |
+| `runner.py` | headless turns for any `mode='managed'` agent: `claude -p`, `codex exec`, `agent -p` |
 | `transcript.py`, `discovery.py` | read Claude / Codex / built-in transcripts: last reply, usage, model, "did my text land" |
 | `sessions.py` | full-text index of past sessions (`sessions.db`), for search and resume |
 | `shared.py` | `sb context` / `sb note`: project-scoped shared context, pulled on demand |
@@ -28,6 +28,20 @@ browser ──HTTP/WebSocket──▶ hub (hub.py) ──unix socket──▶ pt
 | `store.py` | SQLite (WAL) tables: projects, agents, messages, events, notes, decisions, notifications, settings |
 | `hermes.py` | Hermes Agent sessions: reads `$HERMES_HOME/state.db` (read-only) as if it were a transcript |
 | `gate.py`, `phone.py` | the phone gate: one paired phone in, everything else refused (see [PHONE.md](PHONE.md)) |
+| `barrier.py` | the project barrier: which routes an agent may call, and who is calling (read from the caller's process, not from what it claims) |
+| `fleet.py` | broadcast and wrap-up to every running agent, the executive brief, the master work queue |
+| `inbox.py` | the owner's inbox: open decisions and needs per project |
+| `hosts.py`, `probe.py`, `jobs.py`, `placers.py` | the fleet: host inventory, HALT, `sb run` jobs and placement (see [FLEET.md](FLEET.md)) |
+| `boardwatch.py`, `leasedecay.py` | optional, with a GPU workboard: page when a host's cards go stale, and release leases that sit idle |
+| `memory.py` | project memory: an outline per ended conversation and a short running record, each line citing its source |
+| `retention.py` | what the hub keeps and for how long; one sweep at start and every few hours |
+| `autoclear.py` | clears a Claude agent's context at a natural pause once it passes its model's limit, instead of compacting |
+| `handoff.py`, `accounts.py` | moves a Claude agent to another account before (or when) its account runs out; limits come from an optional usage cache |
+| `helpers.py` | temporary helpers: one narrow task on a smaller model, with a deadline |
+| `nodes.py` | the same seats on every project (lead, architect, tasker, janitor) and the project wiki |
+| `insights.py`, `trace.py`, `team.py` | the Insights page, one agent's context view, a project's team view |
+| `rewind.py` | owner tools on one agent's history: memory files and rewinding to before a message |
+| `antigravity.py` | Google Antigravity CLI sessions, read as transcripts |
 
 ## Accounts and providers
 
@@ -64,7 +78,7 @@ under the other account.
 ```
 GET  /api/overview                     projects, agents, accounts (no keys), open decisions, code version
 GET  /api/setup                        accounts (keys masked), presets, detected CLIs and env keys
-POST /api/setup {accounts, workspace, router_account}
+POST /api/setup {accounts, workspace}
 POST /api/setup/test {account}         list models + one tiny chat completion
 GET  /api/projects/<id>                project, agents, sources, recent messages, decisions
 POST /api/projects {name, ...}         PATCH /api/projects/<id> {name, goal, next_step, lead, archived, paused, ...}
@@ -82,7 +96,17 @@ GET  /api/notifications                POST /api/notifications {agent, text, lev
 GET  /api/sessions?q=words             POST /api/sessions/resume {session_id}
 GET  /api/context?…  /api/projects/<id>/context  /api/agents/<id>/context   POST /api/notes {text}
 POST /api/summon {beside, task, fork?}  POST /api/dispatch {project, task, idem?}   POST /api/restart
+GET  /api/work   POST /api/work {title, project?, priority?, agent?}   PATCH|DELETE /api/work/<n>
+GET  /api/inbox?project=               POST /api/inbox/<id>/done {answer?}
+POST /api/broadcast {body, project?}   GET /api/brief?hours=24
+GET  /api/fleet   /api/jobs            POST /api/jobs {name, argv, threads, mem_gib, ...}   POST /api/jobs/<id>/stop
+GET  /api/memory?project=              GET /api/memory/<n>     POST /api/helpers {task, minutes?, model?}
+GET  /api/insights?range=7d&project=   POST /api/projects/<id>/outside {read?, write?}   …/reads {reads}
 ```
+
+Agents may call only the routes listed in `barrier.AGENT_ROUTES`, and only for their own project; everything else is
+the owner's (the dashboard, a Switchboard shell pane, your own terminal, or the paired phone).
+
 
 Errors are `{error: "..."}` with 4xx/5xx. Writes must be JSON (`Content-Type: application/json`); requests from
 another site's page (Origin) or a host name other than `127.0.0.1` / `localhost` (DNS rebinding) get 403.

@@ -13,6 +13,7 @@ Configuration (hosts.json "jobs"): "gpu_workboard": "auto" | "/path" | null, "cp
 Each host may carry "cpu_run_name" when cpu-run knows it by another name; the board knows hosts by hostname.
 """
 import json
+import re
 import os
 import shlex
 import shutil
@@ -71,6 +72,22 @@ def _wb(h, cfg, args, timeout=60):
     return rc, data, (text or err.strip())[-600:]
 
 
+VALUE_FLAGS = {"--project", "--label", "--vram-gib", "--duration-min", "--lane", "--gpu", "--note"}
+
+
+def _drop_flags(args, bad):
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in bad:
+            skip = a in VALUE_FLAGS
+            continue
+        out.append(a)
+    return out
+
+
 def wb_submit(h, cfg, job, gpu_uuid):
     args = ["submit", "--project", job.get("project") or "switchboard", "--label", job["name"][:60],
             "--vram-gib", f"{job['gpu_mib'] / 1024:.2f}", "--duration-min", str(max(1, int(job["hours"] * 60))),
@@ -79,6 +96,12 @@ def wb_submit(h, cfg, job, gpu_uuid):
     if job.get("protected"):
         args.append("--protected")
     rc, data, text = _wb(h, cfg, args)
+    if rc != 0 and "unrecognized arguments" in (text or ""):
+        # an older board client on this host (one that lacks --lane/--protected): drop what it
+        # rejects and submit once more, so the job still reaches the board instead of failing every retry
+        bad = set(re.findall(r"(--[a-z][a-z-]*)", text.split("unrecognized arguments", 1)[1]))
+        args = _drop_flags(args, bad)
+        rc, data, text = _wb(h, cfg, args)
     if rc != 0 or not data:
         return None, f"GPU workboard submit failed: {(data or {}).get('error') or text or f'exit {rc}'}"
     bid = data.get("id") or (data.get("job") or {}).get("id")
@@ -92,7 +115,12 @@ def wb_acquire(h, cfg, board_id):
     rc, data, text = _wb(h, cfg, ["acquire", "--json", board_id])
     data = data or {}
     if rc == 0 and data.get("acquired", True):
-        return True, data.get("assigned_uuid") or (data.get("job") or {}).get("assigned_uuid"), None
+        # the board answers gpu_uuid (gpu_workboard.py acquire); assigned_uuid is its column name, kept as a fallback
+        uuid = (data.get("gpu_uuid") or data.get("assigned_uuid") or (data.get("job") or {}).get("gpu_uuid")
+                or (data.get("job") or {}).get("assigned_uuid"))
+        if not uuid:  # never fall back to the hub's snapshot card: that is someone else's lease
+            return False, None, f"GPU workboard: lease granted without a card UUID ({text[:200]})"
+        return True, uuid, None
     reason = data.get("decision_reason") or data.get("reason") or data.get("error") or text or f"exit {rc}"
     return False, None, f"GPU workboard: {reason}"
 
@@ -136,17 +164,21 @@ def wb_status(cfg):
     cards = [{"host": c.get("host"), "label": c.get("label"), "uuid": c.get("uuid"), "free_mib": c.get("free_mib"),
               "fresh": c.get("fresh"), "active_jobs": c.get("active_job_ids") or []}
              for c in (data.get("fleet") or {}).get("cards") or []]
-    jobs = [{"id": j.get("id"), "label": j.get("label"), "project": j.get("project"), "status": j.get("status"),
+    rows = [{"id": j.get("id"), "label": j.get("label"), "project": j.get("project"), "status": j.get("status"),
              "lane": j.get("lane"), "host": j.get("target_host") or j.get("lease_owner_host"),
-             "uuid": j.get("assigned_uuid"), "reason": j.get("decision_reason")}
+             "uuid": j.get("assigned_uuid"), "reason": j.get("decision_reason"),
+             "work_changed": j.get("work_changed_epoch")}
             for j in data.get("jobs") or [] if (j.get("status") or "") not in ("completed", "failed", "released", "cancelled")]
+    # a preempted row is history, not an open lease: it holds nothing, and the board already requeued it once
+    # (unclaimed requeues expire). Kept apart so the Fleet panel does not count it and wb_job_status still finds it.
+    jobs = [j for j in rows if j["status"] != "preempted"]
     return {"available": True, "observed_at": data.get("observed_at"), "coordinator": data.get("coordinator"),
-            "cards": cards, "jobs": jobs}
+            "cards": cards, "jobs": jobs, "preempted": [j for j in rows if j["status"] == "preempted"]}
 
 
 def wb_job_status(cfg, board_id):
     st = wb_status(cfg) or {}
-    for j in st.get("jobs") or []:
+    for j in (st.get("jobs") or []) + (st.get("preempted") or []):
         if j.get("id") == board_id:
             return j
     return None

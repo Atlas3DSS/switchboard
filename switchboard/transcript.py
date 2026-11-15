@@ -114,6 +114,9 @@ def _parse(line, provider):
     if provider == "hermes":
         from . import hermes
         return hermes.entries(line)
+    if provider == "antigravity":
+        from . import antigravity
+        return antigravity.entries(line)
     if '"type"' not in line:
         return []
     try:
@@ -143,6 +146,9 @@ def read_chat(path, provider, limit=40, before=None, after=None):
     if provider == "hermes" and path:
         from . import hermes
         return hermes.read_chat(path, limit, before, after)
+    if provider == "antigravity" and path:
+        from . import antigravity
+        return antigravity.read_chat(path, limit, before, after)
     if not path or not os.path.exists(path):
         return {"entries": [], "before": None, "latest": None}
     size = os.path.getsize(path)
@@ -233,6 +239,42 @@ def _reverse_lines(path, max_bytes=256 << 20):
 CLAUDE_WINDOW = 1_000_000  # recent Claude models in Claude Code; an approximation for other models
 
 
+LIMIT_ERRORS = ("usage_limit_reached", "model_requires_usage_credits")
+
+
+def limit_hit(path):
+    """The CLI's usage-limit notice ("You've hit your weekly limit", "out of usage credits") when it is the last
+    thing in a Claude transcript, i.e. the agent stopped on it: {uuid, ts, text, kind}. None otherwise."""
+    if not path:
+        return None
+    try:
+        for line in _reverse_lines(path, 4 << 20):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") not in ("user", "assistant") or e.get("isMeta"):
+                continue
+            msg = e.get("message") or {}
+            if e["type"] == "user":
+                return None  # someone spoke after it
+            if msg.get("model") != "<synthetic>":
+                return None
+            if e.get("apiError") in LIMIT_ERRORS:
+                text = " ".join(c.get("text", "") for c in msg.get("content") or [] if isinstance(c, dict)).strip()
+                info = ((e.get("apiErrorParams") or {}).get("rate_limit_info") or {})
+                return {"uuid": e.get("uuid") or e.get("timestamp"), "ts": e.get("timestamp"), "text": text,
+                        "kind": info.get("rateLimitType") or e["apiError"]}
+            # other synthetic notes ("No response requested.") sit on top of it; keep looking
+    except OSError:
+        return None
+    return None
+
+
+CLAUDE_WINDOW = 1_000_000  # Claude Code 2.1 runs Fable/Opus 5.x with a 1M window here; approximate for others
+
+
+
 def usage_stats(path, provider, since_epoch):
     """{'context_tokens', 'context_window', 'tokens_24h', 'last_turn'} from a transcript.
 
@@ -242,6 +284,9 @@ def usage_stats(path, provider, since_epoch):
     if provider == "hermes" and path:
         from . import hermes
         return hermes.usage_stats(path, since_epoch)
+    if provider == "antigravity" and path:
+        from . import antigravity
+        return antigravity.usage_stats(path, since_epoch)
     if not path or not os.path.exists(path):
         return out
     seen = set()

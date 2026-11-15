@@ -83,10 +83,30 @@ w(f"\x1b[1;38;2;134;194;50mFAKE CLI\x1b[0m {' '.join(args)}\r\nsession {sid} siz
 composer()
 paste = False
 painted = time.time()
-if os.environ.get("FAKE_TRUST_MENU"):  # a folder-trust choice instead of the prompt until Enter
-    w("Do you trust the files in this folder?\r\n\x1b[1;32m❯\x1b[0m 1. Yes, I trust this folder\r\n  2. No, exit\r\n")
-    while os.read(0, 16) not in (b"\r", b"\n"):
-        pass
+if os.environ.get("FAKE_TRUST_MENU"):  # a folder-trust choice instead of the prompt until Enter; arrows move
+    opts, sel = ["Yes, I trust this folder", "No, exit"], 0
+
+    def menu():
+        w("\x1b[2J\x1b[HDo you trust the files in this folder?\r\n" +
+          "".join(("\x1b[1;32m❯\x1b[0m " if i == sel else "  ") + f"{i + 1}. {o}\r\n" for i, o in enumerate(opts)))
+
+    menu()
+    while True:
+        k = os.read(0, 16)
+        if k in (b"\r", b"\n"):
+            if sel == 1:
+                w("\r\nNo, exit\r\n")
+                sys.exit(1)
+            break
+        if k == b"\x1b[B":
+            sel = min(len(opts) - 1, sel + 1)
+            menu()
+        elif k == b"\x1b[A":
+            sel = max(0, sel - 1)
+            menu()
+        elif k.startswith(b"\x1b"):  # Esc cancels the dialog: the real CLI exits with 1
+            w("\r\nNo, exit\r\n")
+            sys.exit(1)
     w("\x1b[2J\x1b[H")
     composer()
 try:

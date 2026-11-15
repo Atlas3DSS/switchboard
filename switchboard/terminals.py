@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 
-from . import discovery, shared
+from . import autoclear, discovery, shared
 from .ptyholder import KEEP, FrameReader, frame
 from .store import INBOX, STATE, epoch, iso_from_epoch, new_id, now
 from .vtscreen import Screen
@@ -48,19 +48,129 @@ EXIT_WAIT_S = 30
 REATTACH_FIRST_S = 5
 
 
-PROVIDERS = ("claude", "codex", "gemini", "hermes", "api", "shell")
+PROVIDERS = ("claude", "codex", "gemini", "hermes", "antigravity", "api", "shell")
 SB_BIN = os.path.join(ROOT, "bin")
 
 
 def cli_bin(provider):
+    if provider == "antigravity":
+        return os.environ.get("SB_ANTIGRAVITY_BIN") or "agy"
     return os.environ.get(f"SB_{provider.upper()}_BIN") or provider
+
+
+def is_fable(model):
+    return "fable" in (model or "").lower()
 
 
 def has_history(agent):
     sid = agent.get("session_id")
     if not sid:
         return False
-    return bool(discovery.transcript_path(agent["provider"], sid))
+    return bool(discovery.transcript_path(agent["provider"], sid, agent.get("account")))
+
+
+def claude_project_slug(cwd):
+    """Claude Code's folder name for a working directory under <config dir>/projects (every other character
+    becomes '-'); it derives it from the real path, since that is what getcwd() reports to the process."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", os.path.realpath(cwd))
+
+
+def launch_cwd(agent):
+    """Where an agent's CLI starts: the real path of its cwd. A cwd reached through a symlink (~/proj ->
+    ~/work/proj) makes Claude Code treat every edit as leaving the working directory."""
+    return os.path.realpath(agent.get("cwd") or os.path.expanduser("~"))
+
+
+def extra_dirs(agent):
+    """--add-dir list for a Claude agent: its cwd as spelled, when that is a symlink to where the CLI starts."""
+    cwd = agent.get("cwd") or os.path.expanduser("~")
+    return [cwd] if cwd != launch_cwd(agent) else []
+
+
+def memory_dir(agent):
+    """An agent's auto-memory folder, with no symlink anywhere in the path. Every account dir links projects/ into
+    ~/.claude/projects, and Claude Code treats everything under a .claude* folder as a sensitive file, asking every
+    time; --add-dir and allow rules do not change that. Its one exemption is its own memory folder, and that does not
+    match through the symlink, so each memory write stopped the agent at a prompt until the owner came back. Claude Code
+    names the folder after the main checkout of the git repository (worktrees and subfolders share it)."""
+    real = launch_cwd(agent)
+    cfg = discovery.account_env(agent.get("account"), "claude").get("CLAUDE_CONFIG_DIR") or \
+        os.path.expanduser("~/.claude")
+    try:
+        common = subprocess.run(["git", "-C", real, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        common = ""
+    root = os.path.dirname(common) if common.endswith("/.git") else real
+    return os.path.join(os.path.realpath(os.path.join(cfg, "projects")), claude_project_slug(root), "memory")
+
+
+def outside_rules(agent):
+    """Allow rules for files outside the agent's folder, when the owner opened its project (sb outside): Read(//**)
+    covers Read/Grep/Glob anywhere, Edit(//**) every file-writing tool. Claude Code still asks for .claude* folders
+    and for shell commands; Codex and Hermes are not held to their folder in the first place."""
+    o = shared.outside(agent.get("project") or "unsorted")
+    return (["Read(//**)"] if o.get("read") else []) + (["Edit(//**)"] if o.get("write") else [])
+
+
+def file_flags(agent):
+    """What lets a Claude agent write its own files without asking, and reach outside its folder when the owner
+    allowed it. --add-dir is variadic, so these go right before the note and nothing positional can ever land in it."""
+    settings = {"autoMemoryDirectory": memory_dir(agent)}
+    allow = outside_rules(agent)
+    if allow:
+        settings["permissions"] = {"allow": allow}
+    return ["--settings", json.dumps(settings)] + [x for d in extra_dirs(agent) for x in ("--add-dir", d)]
+
+
+def claude_config_dir(account):
+    return discovery.account_env(account, "claude").get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def _trusts(cfg_dir, folder):
+    """Whether the Claude account at cfg_dir has accepted the trust dialog for folder (None: no config at all)."""
+    try:
+        with open(os.path.join(cfg_dir, ".claude.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    proj = (cfg.get("projects") or {}).get(folder) or {}
+    return bool(proj.get("hasTrustDialogAccepted"))
+
+
+def seed_trust(agent):
+    """Carry the owner's folder trust to the account a Claude agent starts on. Claude Code asks "do you trust this
+    folder?" once per account dir; an account handoff (one account at its limit -> another) relaunches the same session on
+    a dir that never saw the folder, and the CLI sits on that dialog until the owner finds it, with its queue held.
+    The owner already answered for the folder on another of their accounts, so the answer is copied: only
+    hasTrustDialogAccepted, only into an account that has a config file (a never-used account still onboards), and
+    only when some other account trusts it. Returns the account the trust was copied from, or None."""
+    if agent.get("provider") != "claude":
+        return None
+    folder = launch_cwd(agent)
+    target = claude_config_dir(agent.get("account"))
+    if _trusts(target, folder) is not False:
+        return None
+    donor = None
+    for a in discovery.accounts():
+        if a["kind"] == "claude" and a["name"] != agent.get("account") and _trusts(a["config_dir"] or os.path.expanduser("~/.claude"), folder):
+            donor = a["name"]
+            break
+    if not donor:
+        return None
+    path = os.path.join(target, ".claude.json")
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        cfg.setdefault("projects", {}).setdefault(folder, {})["hasTrustDialogAccepted"] = True
+        tmp = path + ".sb-tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        return None
+    return donor
 
 
 def launch_argv(agent):
@@ -108,7 +218,17 @@ def launch_argv(agent):
             argv += ["--permission-mode", agent["permission_mode"]]
         if agent.get("effort"):
             argv += ["--effort", agent["effort"]]
-        return argv + ["--append-system-prompt", note]
+        return argv + file_flags(agent) + ["--append-system-prompt", note]
+    if agent["provider"] == "antigravity":  # no system-prompt flag: a new conversation opens with the note (-i)
+        from . import antigravity
+        antigravity.trust(agent["cwd"])  # else the CLI opens on a trust question
+        argv = [exe, "--dangerously-skip-permissions"]
+        argv += ["--conversation", agent["session_id"]] if has_history(agent) else ["-i", note]
+        if agent.get("model"):
+            argv += ["--model", agent["model"]]
+        if agent.get("effort"):
+            argv += ["--effort", agent["effort"]]
+        return argv
     if agent.get("session_id"):
         argv = [exe, "resume", agent["session_id"]]
     else:
@@ -130,6 +250,11 @@ def fork_source(agent):
         return None
 
 
+def hub_url():
+    """The hub this process serves: `sb` inside its agents must reach this hub, never the live one from a test hub."""
+    return f"http://127.0.0.1:{os.environ.get('SB_PORT', '8802')}"
+
+
 def launch_env(agent):
     env = discovery.account_env(agent["account"], agent["provider"]) if agent["provider"] != "shell" else dict(os.environ)
     for k in list(env):  # markers from a parent Claude session would turn off transcript saving
@@ -137,7 +262,7 @@ def launch_env(agent):
                 not k.startswith("SB_API_"):  # SB_API_*: the built-in agent's endpoint, from the account
             env.pop(k, None)
     env.update(SB_AGENT=agent["id"] if agent["provider"] != "shell" else "owner", TERM="xterm-256color",
-               COLORTERM="truecolor", PATH=SB_BIN + os.pathsep + env.get("PATH", ""))
+               COLORTERM="truecolor", SB_HUB=hub_url(), PATH=SB_BIN + os.pathsep + env.get("PATH", ""))
     if agent["provider"] == "api":  # the built-in agent writes its transcript under the hub's state dir
         env["PYTHONPATH"] = ROOT + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         env["SB_STATE"] = STATE
@@ -234,6 +359,9 @@ class Term:
     def _composer(self):
         """(screen lines, index of the composer line or None). Gemini draws its composer in a box: "│ > text │"."""
         lines = [re.sub(r"^\s*[│┃]\s?(.*?)\s*[│┃]?\s*$", r"\1", l) for l in self.text().splitlines()]
+        if self.provider == "antigravity":  # Antigravity: '>' at column 0
+            return lines, max((i for i, l in enumerate(lines) if re.match(r"^>(\s|$)", l)), default=None)
+        # Claude '❯', Codex '›' (0.166 and later: '»'), Gemini '>'
         return lines, max((i for i, l in enumerate(lines) if re.match(r"^\s*[❯›»]\s?", l) or re.match(r"^\s*>\s", l)),
                           default=None)
 
@@ -269,12 +397,89 @@ class Term:
         that choice name it, so old text in the scrollback never looks like a dialog."""
         lines, idx = self._composer()
         tail = [l for l in lines if l.strip()][-6:]
-        footer = any(re.search(r"Enter to (confirm|select)\s*·\s*Esc to (cancel|exit)", l, re.I) for l in tail)
+        footer = any(re.search(r"Enter to (confirm|select)\s*·\s*Esc to (cancel|exit)|Navigate\s*·\s*enter Confirm", l, re.I)
+                     for l in tail)
         menu = idx is not None and re.match(r"^\s*[❯›»]\s*\d+\.\s", lines[idx])
         if not menu and not footer:
             return None
         near = "\n".join(lines[max(0, idx - 15):idx + 6] if idx is not None else tail)
         return next((why for rx, why in Terminals.WAITING if rx.search(near)), "has a choice open")
+
+    BOX = re.compile(r"[─│╭╮╰╯┌┐└┘├┤═║]")
+
+    def choices(self):
+        """The open dialog as {"question", "options", "selected"}, or None. The marker line and its siblings are the
+        options: numbered ones ("❯ 1. Yes", "  2. Yes, and don't ask again") or plain ones two columns in under the
+        marker ("❯ No, exit", "  Yes, I trust this folder"); a deeper-indented line continues the option above it.
+        The non-blank lines just above, up to a box edge, are the question. For the inbox: shown there, answered
+        with choose()."""
+        if not self.dialog():
+            return None
+        lines, idx = self._composer()
+        mark = re.match(r"^(\s*)[❯›»]\s?(.*)$", lines[idx])
+        if not mark:
+            return None
+        col = len(mark.group(1))
+        numbered = bool(re.match(r"\s*\d+\.\s+", mark.group(2)))
+
+        def role(i):  # "opt" starts an option, "more" continues one, None ends the block
+            l = lines[i]
+            if not l.strip() or self.BOX.search(l) or re.search(r"Enter to (confirm|select)", l, re.I):
+                return None
+            if re.match(r"^\s*[❯›»]\s?", l):
+                return "opt" if (not numbered or re.match(r"^\s*[❯›»]\s*\d+\.\s+", l)) else None
+            indent = len(l) - len(l.lstrip())
+            if indent <= col:
+                return None
+            if numbered:
+                return "opt" if re.match(r"^\s*\d+\.\s+", l) else "more"
+            return "opt" if indent == col + 2 else "more"
+
+        top = idx
+        while top > 0 and role(top - 1):
+            top -= 1
+        end = idx
+        while end + 1 < len(lines) and role(end + 1):
+            end += 1
+        options, selected = [], None
+        for i in range(top, end + 1):
+            label = re.sub(r"^\s*[❯›»]\s?", "", lines[i])
+            if role(i) == "opt":
+                if numbered:
+                    label = re.sub(r"^\s*\d+\.\s+", "", label)
+                if i == idx:
+                    selected = len(options)
+                options.append(label.strip())
+            elif options:
+                options[-1] = (options[-1] + " " + label.strip()).strip()
+        if not options or selected is None:
+            return None
+        q = []
+        i = top - 1
+        while i >= 0 and not lines[i].strip():  # the question may sit above an empty line
+            i -= 1
+        while i >= 0 and len(q) < 3 and lines[i].strip() and not self.BOX.search(lines[i]):
+            q.insert(0, lines[i].strip())
+            i -= 1
+        for l in reversed(lines[max(0, top - 15):top]):  # the question itself beats a preview's last lines
+            if re.search(r"Do you want to|Would you like to|trust (this folder|the files)", l, re.I):
+                q = [l.strip()]
+                break
+        return {"question": " ".join(q)[:300], "options": options, "selected": selected}
+
+    def choose(self, k):
+        """Answer the open dialog with option k: arrow keys move the marker there (checked on the mirrored screen
+        after each step), then Enter. False when the dialog went away or the marker would not move."""
+        for _ in range(16):
+            ch = self.choices()
+            if not ch or k >= len(ch["options"]):
+                return False
+            if ch["selected"] == k:
+                self.write("\r")
+                return True
+            self.write("\x1b[B" if k > ch["selected"] else "\x1b[A")
+            time.sleep(0.25)
+        return False
 
     def background(self):
         """True if the footer shows background shells, monitors or subagents, which exiting the CLI would end."""
@@ -294,10 +499,26 @@ class Terminals:
         self.reattached = {}  # aid -> recent quiet reattach times
         self.pruned = 0.0
         self.on_waiting = None  # hub callback(aid, waiting, why): a prompt only the owner can answer
+        self.before_launch = None  # hub callback(agent) -> account to start on (account handoff)
+        self.before_deliver = None  # hub callback(agent) -> True while it moves to another account first
+        self.after_switch = None  # hub callback(aid, old, new, limit_hit) once relaunched on another account
+        self.on_reply = None  # hub callback(agent, message, reply) when a typed message is answered
         self.waiting = {}
         self.launched_at = {}
         self._procs_cache = (0.0, [])
+        # agents the owner stopped: opening their terminal shows the scrollback and a Start button instead of
+        # launching the CLI again (which made Stop look like it did nothing). Cleared by any launch.
+        self.held = set(self.s.setting("held_terminals", []) or [])
+        self.healed = {}  # aid -> when it was relaunched past a trust dialog (once an hour at most)
         os.makedirs(PTY_DIR, mode=0o700, exist_ok=True)
+
+    def hold(self, aid, on=True):
+        with self.lock:
+            if on:
+                self.held.add(aid)
+            else:
+                self.held.discard(aid)
+            self.s.set_setting("held_terminals", sorted(self.held))
 
     def paths(self, aid):
         b = os.path.join(PTY_DIR, aid)
@@ -463,11 +684,17 @@ class Terminals:
             return "no account: pick one in the agent's controls (accounts are set up on the Setup page)"
         return None
 
-    def launch(self, agent):
+    def launch(self, agent, during_switch=False):
         aid = agent["id"]
         with self.lock:
             if self.running(aid):
                 return self.terms[aid]
+            if aid in self.switching and not during_switch:
+                # the switch exits the CLI, then writes the new account, then launches: a launch squeezed into
+                # that gap (a queued message, a browser opening the terminal) starts the old account's CLI, and
+                # the hub then believes the row while the CLI runs out of the old pool
+                raise PermissionError("moving to another account; it starts again by itself")
+            agent = self.s.agent(aid) or agent  # never a caller's stale copy of the row
             self._procs_cache = (0.0, [])
             why = self.launch_block(agent)
             if why:
@@ -478,11 +705,22 @@ class Terminals:
             if agent["provider"] in ("claude", "api") and not agent.get("session_id"):
                 self.s.set_agent(aid, session_id=str(uuid.uuid4()))
                 agent = self.s.agent(aid)
+            if self.before_launch and aid not in self.switching and agent["provider"] != "shell":
+                acct = self.before_launch(agent)
+                if acct and acct != agent["account"]:
+                    self.s.set_agent(aid, account=acct)
+                    agent = self.s.agent(aid)
+            if aid in self.held:
+                self.hold(aid, False)
+            donor = seed_trust(agent)
+            if donor:
+                self.s.event(aid, "system", f"folder trust for {launch_cwd(agent)} copied to account "
+                                            f"{agent['account']} from {donor}: no trust dialog")
             p = self.paths(aid)
             old = self.terms.get(aid)
             cols, rows = old.size if old else (120, 40)
             argv = launch_argv(agent)
-            spec = {"argv": argv, "cwd": agent.get("cwd") or os.path.expanduser("~"), "env": launch_env(agent),
+            spec = {"argv": argv, "cwd": launch_cwd(agent), "env": launch_env(agent),
                     "sock": p["sock"], "log": p["log"], "state": p["state"], "cols": cols, "rows": rows,
                     "agent": aid, "account": agent["account"], "session_id": agent.get("session_id")}
             fd = os.open(p["spec"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -561,6 +799,7 @@ class Terminals:
     def stop(self, aid, confirm=False):
         if self.busy(aid) and not confirm:
             raise NeedsConfirm("the agent is working (or has unsent text or background jobs, which stopping ends); interrupt and stop it?")
+        self.hold(aid)  # stays stopped until Start (or a message for it) launches it again
         threading.Thread(target=self.exit_cli, args=(aid, True), daemon=True).start()
 
     def switch_account(self, aid, account, confirm=False):
@@ -575,6 +814,10 @@ class Terminals:
 
         def run():
             try:
+                hit = None
+                if agent["provider"] == "claude" and agent.get("session_id"):
+                    from . import transcript  # stopped on a usage-limit notice? then it is told to carry on
+                    hit = transcript.limit_hit(discovery.claude_transcript(agent["session_id"]))
                 if not self.exit_cli(aid, interrupt=True):
                     self.switching[aid]["note"] = "the CLI did not exit; switch abandoned"
                     time.sleep(10)
@@ -583,7 +826,9 @@ class Terminals:
                 self.s.event(aid, "system", f"account {agent['account']} -> {account}: relaunching the same session")
                 self.switching[aid]["note"] = "relaunching"
                 time.sleep(0.5)
-                self.launch(self.s.agent(aid))
+                self.launch(self.s.agent(aid), during_switch=True)
+                if self.after_switch:
+                    self.after_switch(aid, agent["account"], account, hit)
             except Exception as e:
                 self.s.event(aid, "error", f"account switch failed: {e}")
             finally:
@@ -614,7 +859,7 @@ class Terminals:
                 self.s.event(aid, "system", f"relaunching the same session ({what})")
                 self.switching[aid]["note"] = "relaunching"
                 time.sleep(0.5)
-                self.launch(self.s.agent(aid))
+                self.launch(self.s.agent(aid), during_switch=True)
             except Exception as e:
                 self.s.event(aid, "error", f"relaunch failed: {e}")
             finally:
@@ -649,6 +894,7 @@ class Terminals:
 
     # ---------- delivery: sb send -> typed input ----------
     def tick(self):
+        self.s.hold_cross_project_messages()
         for t in list(self.terms.values()):
             if t.alive:
                 ready, busy, _ = t.view()
@@ -657,14 +903,24 @@ class Terminals:
                 if cur:
                     st = "busy" if busy else "idle"
                     upd = {"state": st}
+                    real = t.state.get("account")  # the holder knows which account's CLI it runs
+                    if real and cur["provider"] != "shell" and real != cur["account"] and t.aid not in self.switching:
+                        upd["account"] = real  # the row follows the CLI, so the handoff judges the right pool
+                        self.s.event(t.aid, "system", f"the CLI runs on account {real}, not {cur['account']} as "
+                                                      "recorded; record corrected")
                     if t.last_output and t.last_output > epoch(cur.get("last_activity")) + 1:
                         upd["last_activity"] = iso_from_epoch(t.last_output)
                     self.s.set_agent(t.aid, **upd)
                     if cur["provider"] == "codex" and not cur.get("session_id"):
                         self._find_codex_thread(cur, t)
-                    elif cur["provider"] == "hermes" and not cur.get("session_id"):
+                    elif cur["provider"] in ("hermes", "antigravity") and not cur.get("session_id"):
                         self._find_hermes_session(cur, t)
                     self._check_waiting(t)
+                    self._heal_trust(t, cur)
+                    try:
+                        autoclear.check(self, cur, t)
+                    except Exception as e:
+                        self.s.event(t.aid, "error", f"auto-clear: {e}")
             elif self.waiting.pop(t.aid, None) and self.on_waiting:
                 self.on_waiting(t.aid, False)
         self._confirm()
@@ -684,6 +940,9 @@ class Terminals:
                 continue
             if self.s.one("SELECT 1 n FROM messages WHERE to_agent=? AND state='delivering'", (agent["id"],)):
                 continue  # one typed message at a time; the next waits for its confirmation
+            if autoclear.holding(self.s, agent["id"]):
+                self._waiting_on(agent["id"], "auto-clearing its context; typed once the new session starts")
+                continue
             try:
                 self._deliver_one(agent)
             except Exception as e:
@@ -707,6 +966,43 @@ class Terminals:
             if self.on_waiting:
                 self.on_waiting(t.aid, bool(why), why or "")
 
+    def _heal_trust(self, t, agent):
+        """A Claude CLI sitting on the folder-trust dialog for a folder the owner trusts on another of their accounts
+        (where an account handoff lands it): copy the trust over and relaunch the same session, which then starts past
+        the question. The CLI has not done anything yet, so nothing is lost. At most once an hour per agent: a CLI
+        that asks again is left to the owner, like a folder no account trusts."""
+        aid = t.aid
+        if agent["provider"] != "claude" or aid in self.switching or time.time() - t.last_output < 3:
+            return
+        if t.dialog() != "asks whether to trust its folder" or time.time() - self.healed.get(aid, 0) < 3600:
+            return
+        folder = launch_cwd(agent)
+        donor = seed_trust(agent)
+        if not donor and not _trusts(claude_config_dir(agent["account"]), folder):
+            return  # no account of the owner's trusts this folder: their question to answer
+        self.healed[aid] = time.time()
+        self.s.event(aid, "system", f"folder trust for {folder} copied to account {agent['account']}"
+                                    f"{' from ' + donor if donor else ''}; relaunching the same session past the dialog")
+        self.switching[aid] = {"to": "relaunch", "note": "leaving the trust dialog"}
+
+        def run():
+            try:
+                t.write("\x1b")  # Esc on the dialog: the CLI exits
+                end = time.time() + 10
+                while time.time() < end and t.alive:
+                    time.sleep(0.2)
+                if t.alive and not self.exit_cli(aid, interrupt=True):
+                    self.s.event(aid, "error", "the CLI did not leave the trust dialog; it is left to the owner")
+                    return
+                time.sleep(0.5)
+                self.launch(self.s.agent(aid), during_switch=True)
+            except Exception as e:
+                self.s.event(aid, "error", f"relaunch past the trust dialog failed: {e}")
+            finally:
+                self.switching.pop(aid, None)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _waiting_on(self, aid, why):
         self.s.x("UPDATE messages SET error=? WHERE to_agent=? AND state='queued' AND error IS NOT ?",
                  ("waiting: " + why, aid, "waiting: " + why))
@@ -715,6 +1011,9 @@ class Terminals:
         aid = agent["id"]
         t = self.term(aid)
         if not t:
+            if aid in self.switching:
+                self._waiting_on(aid, "moving to another account")
+                return
             why = self.launch_block(agent)
             if why:
                 self.s.x("UPDATE messages SET error=? WHERE to_agent=? AND state='queued'", ("waiting: " + why, aid))
@@ -738,14 +1037,16 @@ class Terminals:
             if why:  # shown by sb status and the UI, so a queue that does not move says why
                 self._waiting_on(aid, why)
             return
-        ms = self.s.q("SELECT * FROM messages WHERE to_agent=? AND state='queued' ORDER BY created_at LIMIT ?",
-                      (aid, BATCH_MAX))
-        if not ms:
-            return
-        bid = new_id("batch") if len(ms) > 1 else None
-        turn = f"pty-{bid}" if bid else "pty-" + ms[0]["id"]
-        text = self._batch(agent, bid, ms) if bid else None  # the file exists before anything is claimed
-        with self.s.tx():  # a snapshot: whatever arrives while this is typed waits for the next batch
+        if self.before_deliver and self.before_deliver(agent):
+            return  # moving to another account first; the message is typed after the relaunch
+        with self.s.tx():  # select and claim atomically against owner cancellation
+            ms = self.s.q("SELECT * FROM messages WHERE to_agent=? AND state='queued' ORDER BY created_at LIMIT ?",
+                          (aid, BATCH_MAX))
+            if not ms:
+                return
+            bid = new_id("batch") if len(ms) > 1 else None
+            turn = f"pty-{bid}" if bid else "pty-" + ms[0]["id"]
+            text = self._batch(agent, bid, ms) if bid else None  # the file exists before anything is claimed
             for m in ms:
                 self.s.db.execute("UPDATE messages SET state='delivering', turn_id=?, attempts=attempts+1, "
                                   "delivered_at=?, error=NULL WHERE id=? AND state='queued'", (turn, now(), m["id"]))
@@ -754,6 +1055,7 @@ class Terminals:
             text = m["body"] + "".join(" " + p for p in self._attachments(m))
             if m["from_agent"] and m["from_agent"] != "owner":
                 text = f"[from {m['from_agent']} via sb] {text}"
+        text = autoclear.reminder(self.s, agent) + text  # once, after an auto-clear: where the old conversation went
         t.write("\x1b[200~" + text + "\x1b[201~")
         time.sleep(0.5)
         t.write("\r")
@@ -788,13 +1090,14 @@ class Terminals:
         for m in ms:
             body = " ".join(m["body"].split())
             lines.append(f"- from {who(m)} ({m['id']}): {body[:300]}{' …' if len(body) > 300 else ''}")
-        lines.append("Work through them in order; one reply covering each goes back to every sender.")
+        lines.append("Work through them in order; one reply covering each goes back to every sender. An independent "
+                     "item can go to a temporary helper: sb helper \"task\" (10 min, at most two).")
         return "\n".join(lines)
 
     def _maybe_interrupt(self, agent, t):
         """The oldest waiting message has waited INTERRUPT_AFTER_S while the agent works: one Esc (never twice within
         that time, never on a choice or a draft), so the batch lands at the next prompt."""
-        if agent["provider"] not in ("claude", "codex") or t.dialog():
+        if agent["provider"] not in ("claude", "codex", "antigravity") or t.dialog():
             return
         oldest = self.s.one("SELECT MIN(created_at) t FROM messages WHERE to_agent=? AND state='queued'", (agent["id"],))
         logged = self.s.one("SELECT MAX(ts) t FROM events WHERE agent=? AND kind='system' AND text LIKE 'interrupted:%'",
@@ -863,8 +1166,13 @@ class Terminals:
             from . import transcript
             text, ts = transcript.last_reply(path, agent["provider"])
             if ts and epoch(ts) >= since - 1 and (not t or t.steady_for() > 2):  # not "no output": footers repaint
+                answered = m["turn_id"].startswith("pty-batch-") and self.s.one(  # one reply per sender per batch
+                    "SELECT 1 n FROM messages WHERE turn_id=? AND from_agent IS ? AND state='done' AND id<>?",
+                    (m["turn_id"], m["from_agent"], m["id"]))
                 self.s.x("UPDATE messages SET state='done', finished_at=?, reply=? WHERE id=?",
                          (now(), (text or "")[:20000], m["id"]))
+                if self.on_reply and not answered:
+                    self.on_reply(agent, m, text or "")
         elif not t:
             self.s.x("UPDATE messages SET state='done', finished_at=? WHERE id=?", (now(), m["id"]))
 
@@ -886,13 +1194,18 @@ class Terminals:
     def _find_codex_thread(self, agent, t):
         started = t.state.get("started_at") or 0
         for mtime, path, meta in discovery.recent_codex_rollouts(1):
-            if meta.get("cwd") == agent.get("cwd") and meta.get("id") and epoch(meta.get("timestamp")) >= started - 5:
+            if meta.get("cwd") in (agent.get("cwd"), launch_cwd(agent)) and meta.get("id") and \
+                    epoch(meta.get("timestamp")) >= started - 5:
                 if not self.s.one("SELECT 1 n FROM agents WHERE session_id=?", (meta["id"],)):
                     self.s.set_agent(agent["id"], session_id=meta["id"])
                     return
 
     def _find_hermes_session(self, agent, t):
-        from . import hermes
+        """Hermes and Antigravity: the newest unclaimed session started in the agent's folder since launch."""
+        if agent["provider"] == "antigravity":
+            from . import antigravity as hermes
+        else:
+            from . import hermes
         taken = {r["session_id"] for r in self.s.q("SELECT session_id FROM agents WHERE session_id IS NOT NULL")}
         home = next((a["config_dir"] for a in discovery.accounts() if a["name"] == agent["account"]), None)
         sid = hermes.new_session(agent["cwd"], t.state.get("started_at") or 0, taken, home or None)

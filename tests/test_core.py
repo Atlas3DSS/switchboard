@@ -218,3 +218,21 @@ class ScreenViewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TabOrderTests(unittest.TestCase):
+    """The owner drags a project's tabs into an order; the hub keeps it so every page shows the same one."""
+
+    def test_order_is_kept_and_unknown_or_missing_agents_fall_in_line(self):
+        h = Hub(Store(os.path.join(tempfile.mkdtemp(), "hub.db")))
+        h.s.upsert_project({"id": "p", "name": "P"})
+        for aid in ("a", "b", "c"):
+            h.s.add_agent({"id": aid, "project": "p", "title": aid, "provider": "claude", "account": "one",
+                           "mode": "terminal", "session_id": None, "cwd": "/tmp", "state": "idle"})
+        ids = lambda: next(p for p in h.overview()["projects"] if p["id"] == "p")["agent_ids"]  # noqa: E731
+        self.assertEqual(ids(), ["a", "b", "c"])
+        h.set_tab_order("p", ["c", "a", "ghost", "c"])
+        self.assertEqual(ids(), ["c", "a", "b"])  # named first in that order, the rest after, no ghosts
+        self.assertEqual(h.tab_order("p"), ["c", "a"])
+        with self.assertRaises(ValueError):
+            h.set_tab_order("p", "c,a")

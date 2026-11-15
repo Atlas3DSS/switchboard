@@ -14,10 +14,13 @@ import json
 import os
 import re
 import shlex
+import threading
 import time
 
 from . import hosts, placers
 from .store import epoch, new_id, now
+
+_launching, _launching_lock = set(), threading.Lock()  # jobs a launch_queued call is working on right now
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$")
 UNIT_RE = re.compile(r"^[A-Za-z0-9_.@:\\-]+\.(service|scope)$")
@@ -26,6 +29,9 @@ FINAL = ("finished", "failed", "stopped", "lost", "refused", "preempted")
 LOST_AFTER_S = 3 * hosts.PROBE_S + 10
 DEFAULT_HOURS = 12.0
 MAX_HOURS = 24 * 30
+# sb itself, for jobs that call `sb send` / `sb notify`: a unit gets the user manager's PATH, which lacks this
+# directory, so without it `sb` is "No such file or directory" inside every job.
+SB_BIN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
 SLICE_DESCRIPTION = "Switchboard jobs: work launched with sb run (docs/FLEET.md)"
 
 SCHEMA = """
@@ -59,6 +65,7 @@ def view(r):
     v["adopted"] = bool(r.get("adopted"))
     v["protected"] = bool(r.get("protected"))
     v["board_id"], v["lane"], v["placer"] = r.get("board_id"), r.get("lane"), r.get("placer")
+    v["gpu_pin"] = r.get("gpu_pin")
     v["cpus"] = json.loads(r.get("cpus") or "null")
     v["argv"] = json.loads(r.get("argv") or "[]")
     v["open"] = r.get("state") in OPEN
@@ -87,42 +94,106 @@ def submit(hub, b):
     cwd = b.get("cwd") or os.path.expanduser("~")
     if not cwd.startswith("/"):
         raise ValueError("--cwd must be absolute")
-    lane = b.get("lane") or "batch"
-    if lane not in ("batch", "interactive"):
+    lane = b.get("lane")
+    if lane not in (None, "batch", "interactive"):
         raise ValueError("--lane is batch or interactive")
     protected = 1 if b.get("protected") else 0
+    gpu_pin = (b.get("gpu_uuid") or "").strip() or None
+    if gpu_pin and not gpu_mib:
+        raise ValueError("--gpu-uuid needs --gpu (the VRAM the job holds on that card)")
+    if gpu_pin and not re.fullmatch(r"GPU-[\w-]+", gpu_pin):
+        raise ValueError("--gpu-uuid: a card UUID as nvidia-smi prints it (GPU-...)")
     agent = b.get("agent") or "owner"
     project = b.get("project")
     if not project:
         a = hub.s.agent(agent)
         project = a["project"] if a else None
     cfg = hosts.load_config()
+    if lane is None:  # a priority project's GPU job takes the board's interactive lane, which can checkpoint batch work
+        lane = "interactive" if project in (cfg["jobs"].get("priority_projects") or []) else "batch"
     host_pref = b.get("host") or None
     if host_pref:
         hosts.host(cfg, host_pref)  # raises LookupError
-    state = hosts.halt_state(hub)
-    if state:
-        raise ValueError(f"HALT raised by {state['by']} at {state['at']}: {state.get('reason') or 'no reason'}; "
-                         "nothing launches until `sb unhalt`")
+    state, halted = hosts.halt_state(hub), hosts.halted_hosts(hub, cfg)
+    if state and (host_pref in halted if host_pref else not [h for h in cfg["hosts"] if h["name"] not in halted]):
+        where = f"on {host_pref}" if host_pref else "on every host"
+        raise ValueError(f"HALT raised by {state['by']} at {state['at']} {where}: {state.get('reason') or 'no reason'}; "
+                         "nothing launches there until `sb unhalt`")
     jid = new_id("job")
     hub.s.x("INSERT INTO jobs(id,name,project,agent,host,unit,cwd,argv,threads,mem_mib,gpu_mib,hours,state,reason,"
-            "created_at,host_pref,lane,protected) VALUES(?,?,?,?,NULL,?,?,?,?,?,?,?,'queued','not placed yet',?,?,?,?)",
+            "created_at,host_pref,lane,protected,gpu_pin) VALUES(?,?,?,?,NULL,?,?,?,?,?,?,?,'queued','not placed yet',"
+            "?,?,?,?,?)",
             (jid, name, project, agent, f"sb-job-{jid}.service", cwd, json.dumps(argv), threads, mem_mib, gpu_mib,
-             hours, now(), host_pref, lane, protected))
+             hours, now(), host_pref, lane, protected, gpu_pin))
     launch_queued(hub, cfg, only=jid)
     return view(_row(hub, jid))
 
 
-def reserved(hub, host):
-    """What running (and launching) jobs on a host already hold."""
-    res = {"threads": 0, "mem_mib": 0, "gpu": {}}
-    for r in hub.s.q("SELECT threads, mem_mib, gpu_mib, gpu_uuid FROM jobs WHERE host=? AND state IN ('running','stopping')"
-                     " AND adopted=0", (host,)):
+MEM_SETTLE_S = 20 * 60          # a job holds its full declared memory for its first 20 minutes
+MEM_HEADROOM, MEM_HEADROOM_MIB = 1.25, 2048
+
+
+def mem_hold_mib(declared, peak, started_at, now=None):
+    """RAM the hub books for a running job. Until it has run MEM_SETTLE_S: its declaration. After that: its observed
+    peak (the unit's MemoryPeak) plus headroom (x1.25, at least 2 GiB), never above the declaration. The unit keeps
+    MemoryMax = its declaration, so the job can still grow to it; MemAvailable is still checked live in place().
+    Why: a job that declares 96 GiB and peaks at 7.5 GiB would otherwise make a host with ~180 GiB available look
+    full, and its GPUs sit idle while other jobs wait."""
+    if peak is None or not started_at:
+        return declared
+    if (time.time() if now is None else now) - epoch(started_at) < MEM_SETTLE_S:
+        return declared
+    return min(declared, max(int(peak * MEM_HEADROOM), peak + MEM_HEADROOM_MIB))
+
+
+def reserved(hub, host, doc=None):
+    """What running (and launching) jobs on a host hold: declared totals, and the part not yet visible in the
+    probe (declared minus the unit's measured memory, declared minus the card's measured VRAM).
+
+    VRAM is realized per card, not per pid: a job's VRAM usually sits in a child of the unit's main pid, and
+    nvidia-smi on Windows/WSL attributes nothing to any pid, so matching the job's pid found 0 MiB realized,
+    the whole lease stayed 'unrealized' on top of the real usage, and every request on that card was refused
+    with VRAM physically free. Realized on a card = the VRAM of procs
+    that match a job pid, or, when none match, the card's measured use, capped at what the jobs hold."""
+    res = {"threads": 0, "mem_mib": 0, "mem_unrealized_mib": 0, "gpu": {}, "gpu_unrealized": {}}
+    vram_by_pid, used_by_card = {}, {}
+    for g in (doc or {}).get("gpus") or []:
+        used_by_card[g["uuid"]] = g.get("vram_used_mib") or 0
+        for p in g.get("procs") or []:
+            if p.get("pid"):
+                vram_by_pid[(g["uuid"], p["pid"])] = vram_by_pid.get((g["uuid"], p["pid"]), 0) + (p.get("vram_mib") or 0)
+    attributed = {}
+    peaks = {u["unit"]: u.get("mem_peak_mib") for u in ((doc or {}).get("units") or []) + ((doc or {}).get("jobs") or [])
+             if u.get("unit")}
+    for r in hub.s.q("SELECT threads, mem_mib, mem_cur_mib, gpu_mib, gpu_uuid, pid, unit, started_at FROM jobs WHERE host=? "
+                     "AND state IN ('running','stopping') AND adopted=0", (host,)):
         res["threads"] += r["threads"] or 0
         res["mem_mib"] += r["mem_mib"] or 0
+        res["mem_unrealized_mib"] += max(0, mem_hold_mib(r["mem_mib"] or 0, peaks.get(r["unit"]), r["started_at"])
+                                         - (r["mem_cur_mib"] or 0))
         if r["gpu_uuid"] and r["gpu_mib"]:
             res["gpu"][r["gpu_uuid"]] = res["gpu"].get(r["gpu_uuid"], 0) + r["gpu_mib"]
+            seen = vram_by_pid.get((r["gpu_uuid"], r["pid"]), 0) if r["pid"] else 0
+            attributed[r["gpu_uuid"]] = attributed.get(r["gpu_uuid"], 0) + seen
+    for uuid, held in res["gpu"].items():
+        realized = attributed.get(uuid) or min(held, used_by_card.get(uuid, 0))
+        res["gpu_unrealized"][uuid] = max(0, held - realized)
     return res
+
+
+def disjoint_cpus(hub, host, nthreads, advised, want):
+    """The CPU set a job is pinned to: cpu-run's advice when none of it is held by another running sb job on the
+    host, else the lowest free CPUs. cpu-run's dry run is an advisory snapshot that sees live load, not the hub's
+    pins, so every 2-thread job it advised landed on CPUs 0,1 (the shared-affinity trap). When the
+    host has too few free CPUs the advice stands: the inventory already found the threads."""
+    taken = set()
+    for r in hub.s.q("SELECT cpus FROM jobs WHERE host=? AND state IN ('running','stopping') AND cpus IS NOT NULL",
+                     (host,)):
+        taken.update(json.loads(r["cpus"]) or [])
+    if advised and not taken.intersection(advised):
+        return advised
+    free = [c for c in range(nthreads or 0) if c not in taken]
+    return free[:want] if len(free) >= want else advised
 
 
 def budget_check(hub, cfg, job):
@@ -145,14 +216,49 @@ def budget_check(hub, cfg, job):
     return None
 
 
-def place(hub, cfg, job, rows):
-    """Choose (host, gpu) for a job from the latest inventory, or (None, None, why)."""
+TINY_HOURS = 1.0  # a 1-thread CPU job this short never waits on load (jobs.cuts_in)
+
+
+def cuts_in(cfg, job):
+    """Why a job goes ahead of the queue and past the thread gate, or None. Two kinds:
+    a priority project's job (hosts.json jobs.priority_projects; none by default), and a tiny job from any
+    project (1 thread, no GPU, at most TINY_HOURS). The thread gate counts live load, so a box oversubscribed by
+    long runs would hold an hourly 1-CPU-second job for minutes each hour. Cutting in is graceful: nothing
+    running is stopped, the kernel shares the CPUs, and memory, VRAM, HALT and budgets still apply."""
+    if job.get("project") in (cfg.get("jobs", {}).get("priority_projects") or []):
+        return "priority project"
+    if (job.get("threads") or 0) <= 1 and not job.get("gpu_mib") and job.get("hours") is not None \
+            and job["hours"] <= TINY_HOURS:
+        return "tiny job"
+    return None
+
+
+def place(hub, cfg, job, rows, board=False):
+    """Choose (host, gpu) for a job from the latest inventory, or (None, None, why). A job that cuts in (cuts_in)
+    still goes where there is room when some host has it, and only when none has does it take a full one."""
+    h, gpu, why = _place(hub, cfg, job, rows, board, cut=False)
+    if h or not cuts_in(cfg, job):
+        return h, gpu, why
+    h2, gpu2, why2 = _place(hub, cfg, job, rows, board, cut=True)
+    return (h2, gpu2, None) if h2 else (None, None, why2)
+
+
+def _place(hub, cfg, job, rows, board, cut):
+    """One pass of place(); cut: skip the thread gate (live load and held threads).
+
+    board: the gpu-workboard is in use. An interactive-lane job then reaches the board even when the inventory
+    says every card is full, because the board's interactive lane can checkpoint a preemptible batch job to make
+    room; the inventory alone would keep such a job queued forever behind the batch job. The
+    pick is provisional (job["board_only"] says why) and the board's lease decides the card."""
     over = budget_check(hub, cfg, job)
     if over:
         return None, None, over
     candidates = [h for h in cfg["hosts"] if not job["host_pref"] or h["name"] == job["host_pref"]]
     reasons, fallback = [], None
     for h in candidates:
+        if h["name"] in cfg.get("halted", ()):
+            reasons.append(f"{h['name']}: HALT raised")
+            continue
         row = rows.get(h["name"])
         if not row or not row["doc"]:
             reasons.append(f"{h['name']}: not probed yet")
@@ -162,10 +268,14 @@ def place(hub, cfg, job, rows):
             continue
         doc = json.loads(row["doc"])
         cap = hosts.capacity(h, doc)
-        held = reserved(hub, h["name"])
-        free_threads = cap["free_threads"] - held["threads"]
-        free_mem = ((cap["free_ram_gib"] or 0) * 1024) - held["mem_mib"]
-        if free_threads < job["threads"]:
+        held = reserved(hub, h["name"], doc)
+        # Live load and MemAvailable already include what running jobs use, so a job's declared hold counts only as
+        # far as it is not yet realized: threads = max(load, declared), memory and VRAM = declared minus measured.
+        per_core = (cap["threads"] // cap["cores"]) if cap["cores"] else 1
+        busy = max(int(round((cap["load"] or [0])[0] or 0)), held["threads"])
+        free_threads = max(0, cap["threads"] - h["reserve"]["cores"] * per_core - busy)
+        free_mem = max(0, ((cap["ram_available_gib"] or 0) * 1024) - h["reserve"]["ram_gib"] * 1024 - held["mem_unrealized_mib"])
+        if free_threads < job["threads"] and not cut:
             reasons.append(f"{h['name']}: {free_threads} threads free, need {job['threads']}")
             continue
         if free_mem < job["mem_mib"]:
@@ -173,17 +283,30 @@ def place(hub, cfg, job, rows):
             continue
         if not job["gpu_mib"]:
             return h, None, None
-        cards = [g for g in cap["gpus"] if g["vram_free_mib"] is not None
-                 and g["vram_free_mib"] - held["gpu"].get(g["uuid"], 0) >= job["gpu_mib"]]
+        pin = job.get("gpu_pin")
+        if pin and pin not in [g["uuid"] for g in cap["gpus"]]:
+            reasons.append(f"{h['name']}: no card {pin}")
+            continue
+        cards = [g for g in cap["gpus"] if g["vram_free_mib"] is not None and (not pin or g["uuid"] == pin)
+                 and g["vram_free_mib"] - held["gpu_unrealized"].get(g["uuid"], 0) >= job["gpu_mib"]]
         if cfg["jobs"]["display_gpu"] == "never":
             cards = [g for g in cards if not g["display"]]
-        cards.sort(key=lambda g: -(g["vram_free_mib"] - held["gpu"].get(g["uuid"], 0)))
+        cards.sort(key=lambda g: -(g["vram_free_mib"] - held["gpu_unrealized"].get(g["uuid"], 0)))
         plain = [g for g in cards if not g["display"]]
         if plain:
             return h, plain[0], None
         if cards and fallback is None:
             fallback = (h, cards[0])
-        reasons.append(f"{h['name']}: no " + ("non-display " if cards else "") + f"GPU with {job['gpu_mib']} MiB free")
+        why = f"{h['name']}: " + (f"card {pin} lacks" if pin else "no " + ("non-display " if cards else "") + "GPU with") \
+            + f" {job['gpu_mib']} MiB free"
+        reasons.append(why)
+        if board and (job.get("lane") == "interactive" or cuts_in(cfg, job) == "priority project") and fallback is None:
+            pool = [g for g in cap["gpus"] if g["vram_free_mib"] is not None and (not pin or g["uuid"] == pin)
+                    and (cfg["jobs"]["display_gpu"] != "never" or not g["display"])]
+            if pool:
+                pool.sort(key=lambda g: (g["display"], -(g["vram_free_mib"] - held["gpu_unrealized"].get(g["uuid"], 0))))
+                job["board_only"] = why
+                fallback = (h, pool[0])
     if fallback:
         return fallback[0], fallback[1], None
     return None, None, "; ".join(reasons) or "no host matches"
@@ -197,7 +320,7 @@ def _launch_script(cfg, h, doc, job, gpu):
         f"MemoryHigh={high}M\n" if high else "")
     desc = f"sb job {job['name']} ({job['project'] or '-'}/{job['agent']})"
     env = ["-E", f"SB_JOB_ID={job['id']}", "-E", f"SB_AGENT={job['agent']}", "-E", f"SB_PROJECT={job['project'] or ''}",
-           "-E", f"SB_HOST={h['name']}"]
+           "-E", f"SB_HOST={h['name']}", "-E", "SB=" + os.path.join(SB_BIN, "sb"), "-E", "__SB_PATH__"]
     if gpu:
         env += ["-E", f"CUDA_VISIBLE_DEVICES={gpu['uuid']}", "-E", f"SB_GPU={gpu['uuid']}"]
     if job.get("board_id"):
@@ -210,91 +333,135 @@ def _launch_script(cfg, h, doc, job, gpu):
            "-p", f"CPUWeight={weight}", "-p", f"MemoryMax={job['mem_mib']}M",
            "-p", f"RuntimeMaxSec={int(job['hours'] * 3600)}", "-p", "KillMode=control-group", "-p", "Nice=10",
            "-p", 'ConditionPathExists=!$S/HALT'] + env + ["--"] + json.loads(job["argv"])
-    cmd = " ".join('"ConditionPathExists=!$S/HALT"' if a == 'ConditionPathExists=!$S/HALT' else shlex.quote(a)
-                   for a in run)
+    live = {'ConditionPathExists=!$S/HALT': '"ConditionPathExists=!$S/HALT"', "__SB_PATH__": '"PATH=$P"'}
+    cmd = " ".join(live.get(a) or shlex.quote(a) for a in run)
     return "\n".join([
         "set -u",
         'S="${SB_STATE:-$HOME/.local/state/switchboard}"; D="${SB_SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"',
         'if [ -e "$S/HALT" ]; then echo "refused HALT"; exit 0; fi',
+        # the unit's PATH: the user manager's (what a job got before), with sb's directory in front
+        "P=" + shlex.quote(SB_BIN) + ':"$(systemctl --user show-environment 2>/dev/null | sed -n "s/^PATH=//p")"',
+        '[ "$P" = ' + shlex.quote(SB_BIN + ":") + ' ] && P="$P/usr/local/bin:/usr/bin:/bin"',
         f"SLICE={shlex.quote(slice_text)}",
         'mkdir -p "$D"',
         'if [ ! -e "$D/switchboard-jobs.slice" ] || [ "$(cat "$D/switchboard-jobs.slice")" != "$SLICE" ]; then',
         '  printf %s "$SLICE" > "$D/switchboard-jobs.slice" && systemctl --user daemon-reload && echo "slice written"',
         "fi",
+        # systemd-run resolves a relative command (./script.sh) against its own cwd, not --working-directory
+        f"cd {shlex.quote(job['cwd'])} || {{ echo launch failed: no directory {shlex.quote(job['cwd'])}; exit 1; }}",
         f"{cmd} 2>&1 && echo launched",
         f"systemctl --user show -p ActiveState,SubState,Result,ConditionResult,MainPID,InvocationID -- {shlex.quote(job['unit'])}",
     ]) + "\n"
 
 
+def _launch_one(hub, cfg, job, rows, avail, hostmap, launched):
+    """Place one queued job and launch it, or leave it queued with the reason."""
+    job["cpus"], job["placer"], job["board_only"] = None, None, None
+    if not job["gpu_mib"] and avail["cpu_run"]:
+        advice, note = placers.cpu_advise(cfg, job, hostmap)
+        if advice:
+            pinned = dict(job, host_pref=advice["host"])
+            h, gpu, why = place(hub, cfg, pinned, rows)
+            if h:
+                cap = hosts.capacity(h, json.loads(rows[h["name"]]["doc"]))
+                cpus = disjoint_cpus(hub, h["name"], cap["threads"], advice["cpus"], job["threads"])
+                job["cpus"], job["placer"] = json.dumps(cpus), "cpu-run"
+            else:  # cpu-run and the inventory disagree: the inventory wins, without the pin
+                h, gpu, why = place(hub, cfg, job, rows)
+        else:
+            h, gpu, why = place(hub, cfg, job, rows)
+            if h and note:
+                job["placer"] = "hub (" + note + ")"
+    else:
+        h, gpu, why = place(hub, cfg, job, rows, board=avail["gpu_workboard"] and job.get("adopted", 0) == 0)
+    if not h:
+        _set(hub, job["id"], reason=why)
+        return
+    if gpu and avail["gpu_workboard"] and job.get("adopted", 0) == 0:
+        if not job.get("board_id"):
+            # The inventory chooses a host; the board chooses the card at admission.
+            # Pinning this snapshot's UUID strands queued work when another card frees up; only a card the
+            # job asked for (--gpu-uuid) goes through, unchanged, and the board's lanes still admit it.
+            bid, why = placers.wb_submit(h, cfg, job, job.get("gpu_pin"))
+            if not bid and "no gpu-workboard on this host" in (why or "") and job["board_only"]:
+                _set(hub, job["id"], reason=job["board_only"])  # the card is full and no board can make room
+                return
+            if not bid and "no gpu-workboard on this host" in (why or ""):
+                job["placer"] = "hub (no gpu-workboard on host)"  # the board is not installed there: hub placement
+            elif not bid:
+                _set(hub, job["id"], reason=why)
+                return
+            else:
+                job["board_id"] = bid
+                _set(hub, job["id"], board_id=bid, placer="gpu-workboard")
+        if job.get("board_id"):
+            ok, assigned, why = placers.wb_acquire(h, cfg, job["board_id"])
+            if not ok:
+                _set(hub, job["id"], reason=why)
+                return
+            if job.get("gpu_pin") and assigned != job["gpu_pin"]:
+                # fail closed: a pinned job never runs on a substitute card, and is not retried
+                why = f"board assigned {assigned}, not the pinned card {job['gpu_pin']}: not started"
+                placers.wb_finish(h, cfg, job["board_id"], "released", why)
+                _set(hub, job["id"], state="failed", reason=why, finished_at=now(), collect=1)
+                return
+            if assigned != gpu["uuid"]:  # the lease decides the card, CUDA_VISIBLE_DEVICES and the hold
+                cap = hosts.capacity(h, json.loads(rows[h["name"]]["doc"]))
+                gpu = next((g for g in cap["gpus"] if g["uuid"] == assigned), {**gpu, "uuid": assigned})
+            job["placer"] = "gpu-workboard"
+    doc = json.loads(rows[h["name"]]["doc"])
+    _set(hub, job["id"], host=h["name"], gpu_uuid=gpu["uuid"] if gpu else None, state="running",
+         started_at=now(), last_seen=now(), reason=None, cpus=job["cpus"],
+         placer=job["placer"] or "hub")  # held from now so a parallel launch does not double-book
+    rc, out, err = hosts.run_on(h, _launch_script(cfg, h, doc, job, gpu), timeout=60)
+    props = dict(l.split("=", 1) for l in out.splitlines() if "=" in l and not l.startswith("Running as unit"))
+    # only a unit that systemd-run created can be refused by its HALT condition: `systemctl show` on a unit that
+    # does not exist also answers ConditionResult=no, which used to turn every failed launch into a false HALT
+    started = "launched" in out.splitlines()
+    if "refused HALT" in out or (started and props.get("ConditionResult") == "no"):
+        _set(hub, job["id"], state="refused", reason="HALT was raised on the host", finished_at=now(), collect=1)
+    elif rc != 0 or not started:
+        msg = [l for l in (err + "\n" + out).splitlines()
+               if l.strip() and "=" not in l and l != "slice written"][-1:] or ["launch failed"]
+        _set(hub, job["id"], state="failed", reason=f"launch failed: {msg[0][:300]}", finished_at=now(), collect=1)
+    else:
+        pid = int(props["MainPID"]) if props.get("MainPID", "0").isdigit() and props["MainPID"] != "0" else None
+        _set(hub, job["id"], pid=pid, invocation=props.get("InvocationID") or None)
+        if job.get("board_id"):
+            placers.wb_start(h, cfg, job["board_id"], job["unit"], pid)
+        launched.append(job["id"])
+    if job.get("board_id") and hub.s.one("SELECT state FROM jobs WHERE id=?", (job["id"],))["state"] in FINAL:
+        placers.wb_finish(h, cfg, job["board_id"], "released", "did not start")
+
+
 def launch_queued(hub, cfg=None, only=None):
-    """Place and launch queued jobs, oldest first. Nothing launches while HALT is raised."""
-    if hosts.halt_state(hub):
-        return []
+    """Place and launch queued jobs, oldest first. Nothing launches on a host while a HALT covers it."""
     cfg = cfg or hosts.load_config()
+    halted = hosts.halted_hosts(hub, cfg)
+    if halted and not [h for h in cfg["hosts"] if h["name"] not in halted]:
+        return []
+    cfg = {**cfg, "halted": halted}
     rows = {r["name"]: r for r in hub.s.q("SELECT * FROM hosts")}
     q = "SELECT * FROM jobs WHERE state='queued'" + (" AND id=?" if only else "") + " ORDER BY created_at"
     launched = []
     avail = placers.available(cfg)
     hostmap = placers.cpu_run_hostmap(cfg)
-    for job in [dict(r) for r in hub.s.q(q, (only,) if only else ())]:
-        job["cpus"], job["placer"] = None, None
-        if not job["gpu_mib"] and avail["cpu_run"]:
-            advice, note = placers.cpu_advise(cfg, job, hostmap)
-            if advice:
-                pinned = dict(job, host_pref=advice["host"])
-                h, gpu, why = place(hub, cfg, pinned, rows)
-                if h:
-                    job["cpus"], job["placer"] = json.dumps(advice["cpus"]), "cpu-run"
-                else:  # cpu-run and the inventory disagree: the inventory wins, without the pin
-                    h, gpu, why = place(hub, cfg, job, rows)
-            else:
-                h, gpu, why = place(hub, cfg, job, rows)
-                if h and note:
-                    job["placer"] = "hub (" + note + ")"
-        else:
-            h, gpu, why = place(hub, cfg, job, rows)
-        if not h:
-            _set(hub, job["id"], reason=why)
-            continue
-        if gpu and avail["gpu_workboard"] and job.get("adopted", 0) == 0:
-            if not job.get("board_id"):
-                bid, why = placers.wb_submit(h, cfg, job, gpu["uuid"])
-                if not bid and "no gpu-workboard on this host" in (why or ""):
-                    job["placer"] = "hub (no gpu-workboard on host)"  # the board is not installed there: hub placement
-                elif not bid:
-                    _set(hub, job["id"], reason=why)
-                    continue
-                else:
-                    job["board_id"] = bid
-                    _set(hub, job["id"], board_id=bid, placer="gpu-workboard")
-            if job.get("board_id"):
-                ok, assigned, why = placers.wb_acquire(h, cfg, job["board_id"])
-                if not ok:
-                    _set(hub, job["id"], reason=why)
-                    continue
-                if assigned and assigned != gpu["uuid"]:
-                    cap = hosts.capacity(h, json.loads(rows[h["name"]]["doc"]))
-                    gpu = next((g for g in cap["gpus"] if g["uuid"] == assigned), {**gpu, "uuid": assigned})
-                job["placer"] = "gpu-workboard"
-        doc = json.loads(rows[h["name"]]["doc"])
-        _set(hub, job["id"], host=h["name"], gpu_uuid=gpu["uuid"] if gpu else None, state="running",
-             started_at=now(), last_seen=now(), reason=None, cpus=job["cpus"],
-             placer=job["placer"] or "hub")  # held from now so a parallel launch does not double-book
-        rc, out, err = hosts.run_on(h, _launch_script(cfg, h, doc, job, gpu), timeout=60)
-        props = dict(l.split("=", 1) for l in out.splitlines() if "=" in l and not l.startswith("Running as unit"))
-        if "refused HALT" in out or props.get("ConditionResult") == "no":
-            _set(hub, job["id"], state="refused", reason="HALT was raised on the host", finished_at=now(), collect=1)
-        elif rc != 0 or "launched" not in out:
-            msg = (err.strip() or out.strip()).splitlines()[-1:] or ["launch failed"]
-            _set(hub, job["id"], state="failed", reason=f"launch failed: {msg[0][:300]}", finished_at=now(), collect=1)
-        else:
-            pid = int(props["MainPID"]) if props.get("MainPID", "0").isdigit() and props["MainPID"] != "0" else None
-            _set(hub, job["id"], pid=pid, invocation=props.get("InvocationID") or None)
-            if job.get("board_id"):
-                placers.wb_start(h, cfg, job["board_id"], job["unit"], pid)
-            launched.append(job["id"])
-        if job.get("board_id") and hub.s.one("SELECT state FROM jobs WHERE id=?", (job["id"],))["state"] in FINAL:
-            placers.wb_finish(h, cfg, job["board_id"], "released", "did not start")
+    queue = [dict(r) for r in hub.s.q(q, (only,) if only else ())]
+    queue.sort(key=lambda r: (cuts_in(cfg, r) is None, r["created_at"]))  # cut-ins first, then oldest first
+    for snapshot in [r["id"] for r in queue]:
+        with _launching_lock:  # the tick and sb run both land here; one job has one launcher at a time
+            if snapshot in _launching:
+                continue
+            _launching.add(snapshot)
+        try:
+            # read the row again here: this loop runs ssh per job, so a row read at the top is stale by now, and a
+            # stale board_id None submitted the job twice, leaving a lease nobody acquires at the head of the board
+            row = hub.s.one("SELECT * FROM jobs WHERE id=?", (snapshot,))
+            if row and row["state"] == "queued":
+                _launch_one(hub, cfg, dict(row), rows, avail, hostmap, launched)
+        finally:
+            with _launching_lock:
+                _launching.discard(snapshot)
     return launched
 
 
@@ -528,6 +695,11 @@ def show(hub, jid, log_lines=40):
 def for_host(hub, name):
     return [view(dict(r)) for r in hub.s.q("SELECT * FROM jobs WHERE host=? AND state IN ('queued','running','stopping')"
                                             " ORDER BY created_at", (name,))]
+
+
+def unplaced(hub):
+    """Queued jobs no host has taken yet: for_host never returns them, and the Fleet panel still has to show and stop them."""
+    return [view(dict(r)) for r in hub.s.q("SELECT * FROM jobs WHERE host IS NULL AND state='queued' ORDER BY created_at")]
 
 
 def terminal_pids(hub):

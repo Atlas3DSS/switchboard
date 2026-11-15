@@ -14,6 +14,8 @@ CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
 CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 API_SESSIONS = os.path.join(STATE, "api-sessions")  # the built-in agent's transcripts (agent.py)
 EXTRA_PROJECTS = []  # tests: more transcript roots (fake CLIs)
+DEFAULT_CLAUDE_DIR = os.path.realpath(os.path.expanduser("~/.claude"))
+AGENT_CLIS = ("claude", "codex", "gemini", "hermes", "antigravity")  # interactive agent CLIs Switchboard runs as terminals
 
 
 def slug(s):
@@ -135,31 +137,12 @@ _path_cache = {}
 def transcript_format(provider):
     """Which transcript parser reads this provider: the built-in agent writes Claude-format lines; Hermes sessions
     are rows in its state.db (switchboard/hermes.py)."""
-    return {"claude": "claude", "api": "claude", "codex": "codex", "hermes": "hermes"}.get(provider)
+    return {"claude": "claude", "api": "claude", "codex": "codex", "hermes": "hermes", "antigravity": "antigravity"}.get(provider)
 
 
 def api_transcript(session_id):
     hits = glob.glob(os.path.join(API_SESSIONS, "*", f"{session_id}.jsonl"))
     return max(hits, key=os.path.getmtime) if hits else None
-
-
-def transcript_path(provider, session_id):
-    """The session file of an agent's conversation, or None (Gemini keeps none we can read)."""
-    if not session_id:
-        return None
-    if provider == "claude":
-        return claude_transcript(session_id)
-    if provider == "codex":
-        return codex_rollout(session_id)
-    if provider == "api":
-        return api_transcript(session_id)
-    if provider == "hermes":  # a session in Hermes' state.db: hermes:<db>#<id>
-        from . import hermes
-        for d in [a["config_dir"] for a in accounts() if a["kind"] == "hermes" and a["config_dir"]] + [None]:
-            p = hermes.path_for(session_id, d)
-            if p:
-                return p
-    return None
 
 
 def claude_transcript(session_id):
@@ -248,6 +231,34 @@ def subagents(hours=72, model=None):
     return out
 
 
+def transcript_path(provider, sid, account=None):
+    """Where an agent's conversation is: a Claude jsonl, a Codex rollout, or a Hermes session (hermes:<db>#<id>)."""
+    if not sid:
+        return None
+    if provider == "claude":
+        return claude_transcript(sid)
+    if provider == "codex":
+        return codex_rollout(sid)
+    if provider == "api":
+        return api_transcript(sid)
+    if provider == "hermes":
+        from . import hermes
+        d = next((a["config_dir"] for a in accounts() if a["name"] == account and a["kind"] == "hermes"), None)
+        if d or account:
+            return hermes.path_for(sid, d)
+        for d in [a["config_dir"] for a in accounts() if a["kind"] == "hermes" and a["config_dir"]] + [None]:
+            p = hermes.path_for(sid, d)
+            if p:
+                return p
+        return None
+    if provider == "antigravity":
+        from . import antigravity
+        d = next((a["config_dir"] for a in accounts() if a["name"] == account and a["kind"] == "antigravity"), None)
+        p = antigravity.path_for(sid, d)
+        return p if p and os.path.exists(p) else None
+    return None
+
+
 def recent_codex_rollouts(days=7):
     """[(mtime, path, meta)] for rollouts touched recently, newest first."""
     cutoff = time.time() - days * 86400
@@ -295,8 +306,8 @@ def _text(content):
 
 
 def last_assistant_text(path, provider):
-    """Last assistant text in a transcript (Claude jsonl or Codex rollout)."""
-    if provider == "hermes":
+    """Last assistant text in a transcript (Claude jsonl, Codex rollout, Hermes or Antigravity session)."""
+    if provider in ("hermes", "antigravity"):
         from . import transcript
         return transcript.last_reply(path, provider)[0]
     for line in reversed(_tail_lines(path)):
@@ -320,14 +331,48 @@ def last_assistant_text(path, provider):
     return ""
 
 
+_SET_MODEL = re.compile(r"Set model to\s+[`*]*(?:\x1b\[[0-9;]*m)*([^`*\x1b\n<]+)")
+
+
+def _model_cmd(line):
+    """Model id from the TUI's `/model` echo ("Set model to `Fable 5.2` ..."): display name -> claude-fable-5-2."""
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return None
+    c = (e.get("message") or {}).get("content")
+    if isinstance(c, list):
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+    m = _SET_MODEL.search(c or "")
+    if not m:
+        return None
+    name = m.group(1).strip()
+    d = re.match(r"(?i)default\s*\((.+)\)", name)  # "Default (Opus 5.5)"
+    name = re.sub(r"\s*\(.*\)\s*$", "", d.group(1) if d else name).strip()  # drop "(1M context)"
+    if not name:
+        return None
+    if re.fullmatch(r"[\w.\[\]-]+", name) and "-" in name:  # already an id (claude-opus-5-5)
+        return name
+    slug = re.sub(r"[\s.]+", "-", name.lower())
+    return slug if slug.startswith("claude-") else "claude-" + slug
+
+
 def last_model(path, provider):
     """Model of the newest main-thread reply (Claude) or turn (Codex): follows /model switches made in the TUI."""
     if provider == "hermes":
         from . import hermes
         return hermes.last_model(path)
+    if provider == "antigravity":
+        from . import antigravity
+        return antigravity.last_model(path)
     from .transcript import _reverse_lines
     for line in _reverse_lines(path, 16 << 20):
         if provider != "codex":  # Claude and built-in agent transcripts share a format
+            if "Set model to" in line and "local-command-stdout" in line:  # /model typed in the TUI, before any reply on it
+                m = _model_cmd(line)
+                if m:
+                    return m
+                continue
             if '"type":"assistant"' not in line or '"isSidechain":true' in line:
                 continue
             try:
@@ -351,11 +396,16 @@ def transcript_has_user_text(path, provider, needle, since_epoch):
     if provider == "hermes":
         from . import hermes
         return hermes.has_user_text(path, needle, since_epoch)
+    if provider == "antigravity":
+        from . import antigravity
+        return antigravity.has_user_text(path, needle, since_epoch)
     from .store import epoch
     from .transcript import _reverse_lines
     needle = " ".join(needle.split())[:80]
+    probe = needle[:40]
+    escaped = json.dumps(probe)[1:-1]  # as the jsonl line spells it: a quote or backslash in the text is escaped there
     for line in _reverse_lines(path, 64 << 20):  # newest first; entries can be huge, so no fixed tail window
-        if needle[:40] not in " ".join(line.split()) and needle[:40] not in line:
+        if escaped not in line and probe not in " ".join(line.split()) and probe not in line:
             m = re.search(r'"timestamp":\s*"([^"]+)"', line[:4000])
             if m and epoch(m.group(1)) < since_epoch - 300:
                 break

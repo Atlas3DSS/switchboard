@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -145,7 +146,7 @@ class WorkboardTests(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], ["submit", "acquire", "start"])
         self.assertIn("--protected", calls[0])
         self.assertIn("alpha", calls[0])
-        self.assertEqual(calls[0][calls[0].index("--gpu") + 1], "GPU-DOC")
+        self.assertEqual(calls[0][calls[0].index("--gpu") + 1], "any")
         self.assertIn("--unit", calls[2])
         self.assertIn("CUDA_VISIBLE_DEVICES=GPU-FAKE-0001", unit_props(j["unit"], ["Environment"])["Environment"])
         jobs.tick(self.h)
@@ -156,6 +157,41 @@ class WorkboardTests(unittest.TestCase):
         self.assertEqual(len(fin), 1)
         self.assertEqual(fin[0][fin[0].index("--outcome") + 1], "released")
 
+    def test_gpu_uuid_pin_reaches_the_board_unchanged(self):
+        os.environ["FAKE_WB_UUID"] = "GPU-DOC"
+        try:
+            j = jobs.submit(self.h, {"name": "gpu-pin", "argv": ["sleep", "60"], "gpu_mib": 2048, "mem_mib": 128,
+                                     "hours": 1, "cwd": "/tmp", "agent": "a1", "gpu_uuid": "GPU-DOC"})
+        finally:
+            os.environ.pop("FAKE_WB_UUID", None)
+        self.assertEqual(j["state"], "running", j["reason"])
+        self.assertEqual(j["gpu_pin"], "GPU-DOC")
+        calls = wb_calls(self.log)
+        self.assertEqual(calls[0][calls[0].index("--gpu") + 1], "GPU-DOC", "the pin lives at the board")
+        self.assertIn("CUDA_VISIBLE_DEVICES=GPU-DOC", unit_props(j["unit"], ["Environment"])["Environment"])
+        jobs.stop(self.h, j["id"], "a1")
+        os.environ["FAKE_WB_UUID"] = "GPU-OTHER"  # the board hands out a different card: fail closed
+        try:
+            j = jobs.submit(self.h, {"name": "gpu-sub", "argv": ["sleep", "60"], "gpu_mib": 2048, "mem_mib": 128,
+                                     "hours": 1, "cwd": "/tmp", "agent": "a1", "gpu_uuid": "GPU-DOC"})
+        finally:
+            os.environ.pop("FAKE_WB_UUID", None)
+        self.assertEqual(j["state"], "failed")
+        self.assertIn("not the pinned card GPU-DOC", j["reason"])
+        fin = [c for c in wb_calls(self.log) if c[0] == "finish"]
+        self.assertTrue(fin and fin[-1][fin[-1].index("--outcome") + 1] == "released", "the lease goes back")
+        self.assertFalse([c for c in wb_calls(self.log) if c[0] == "start" and j["board_id"] in c], "never started")
+        with self.assertRaises(ValueError):
+            jobs.submit(self.h, {"name": "x", "argv": ["true"], "gpu_mib": 2048, "mem_mib": 128, "hours": 1,
+                                 "cwd": "/tmp", "agent": "a1", "gpu_uuid": "card0"})
+        with self.assertRaises(ValueError):
+            jobs.submit(self.h, {"name": "x", "argv": ["true"], "mem_mib": 128, "hours": 1, "cwd": "/tmp",
+                                 "agent": "a1", "gpu_uuid": "GPU-DOC"})
+        j = jobs.submit(self.h, {"name": "gpu-absent", "argv": ["sleep", "60"], "gpu_mib": 2048, "mem_mib": 128,
+                                 "hours": 1, "cwd": "/tmp", "agent": "a1", "gpu_uuid": "GPU-ELSEWHERE"})
+        self.assertEqual(j["state"], "queued")
+        self.assertIn("no card GPU-ELSEWHERE", j["reason"])
+
     def test_board_refusal_queues_and_retries_without_resubmitting(self):
         os.environ["FAKE_WB_DENY"] = "card lacks room"
         j = jobs.submit(self.h, {"name": "gpu-wait", "argv": ["sleep", "60"], "gpu_mib": 2048, "mem_mib": 128, "hours": 1,
@@ -163,12 +199,68 @@ class WorkboardTests(unittest.TestCase):
         self.assertEqual(j["state"], "queued")
         self.assertEqual(j["reason"], "GPU workboard: card lacks room")
         self.assertEqual(j["board_id"], "gpu-fake-1")
+        submitted = wb_calls(self.log)[0]
+        self.assertEqual(submitted[submitted.index("--gpu") + 1], "any",
+                         "a queued request must remain eligible for another card")
         jobs.launch_queued(self.h)
         self.assertEqual([c[0] for c in wb_calls(self.log)], ["submit", "acquire", "acquire"], "no second submit")
         del os.environ["FAKE_WB_DENY"]
         jobs.launch_queued(self.h)
         self.assertEqual(jobs._row(self.h, j["id"])["state"], "running")
         jobs.stop(self.h, j["id"], "a1")
+
+    def _queued_gpu_row(self, jid, created="2026-01-01T00:00:00Z"):
+        self.h.s.x("INSERT INTO jobs(id,name,host,unit,cwd,argv,threads,mem_mib,gpu_mib,hours,state,created_at) VALUES"
+                   f"('{jid}','{jid}',NULL,'sb-job-{jid}.service','/tmp','[\"true\"]',1,64,2048,1,'queued','{created}')")
+
+    def _race(self, nested):
+        """Run launch_queued with a second launcher arriving during the first submit (the live double submit, 2026-11-06)."""
+        os.environ["FAKE_WB_DENY"] = "1"  # acquire refused: every job stays queued, as behind a busy card
+        real, calls, h = placers.wb_submit, [], hosts.load_config()["hosts"][0]
+        def submit(host, cfg, job, pin):
+            calls.append(job["id"])
+            if len(calls) == 1:
+                jobs.launch_queued(self.h, only=nested)
+            return real(host, cfg, job, pin)
+        with mock.patch.object(jobs, "place", return_value=(h, {"uuid": "GPU-DOC"}, None)), \
+                mock.patch.object(placers, "wb_submit", submit):
+            jobs.launch_queued(self.h)  # its list of queued jobs is read before the nested launcher runs
+        return calls
+
+    def test_job_submitted_by_another_launcher_is_not_submitted_again(self):
+        self._queued_gpu_row("job-a"); self._queued_gpu_row("job-b", "2026-01-02T00:00:00Z")
+        calls = self._race("job-b")
+        self.assertEqual(sorted(calls), ["job-a", "job-b"], "one board entry per job")
+
+    def test_job_in_flight_is_left_to_its_launcher(self):
+        self._queued_gpu_row("job-a")
+        self.assertEqual(self._race("job-a"), ["job-a"])
+
+    def test_old_board_client_without_lane_still_submits(self):
+        os.environ["FAKE_WB_OLD"] = "1"
+        try:
+            j = jobs.submit(self.h, {"name": "gpu-old", "argv": ["sleep", "60"], "gpu_mib": 2048, "mem_mib": 128,
+                                     "hours": 1, "cwd": "/tmp", "protected": True})
+            self.assertEqual(j["state"], "running", j["reason"])
+            first, second = wb_calls(self.log)[:2]
+            self.assertIn("--lane", first)
+            self.assertNotIn("--lane", second)
+            self.assertNotIn("batch", second)
+            self.assertNotIn("--protected", second)
+            self.assertEqual(second[second.index("--gpu") + 1], "any")
+            jobs.stop(self.h, j["id"], "a1")
+        finally:
+            del os.environ["FAKE_WB_OLD"]
+
+    def test_lease_without_a_card_never_runs_on_the_snapshot_card(self):
+        os.environ["FAKE_WB_NO_UUID"] = "1"
+        try:
+            j = jobs.submit(self.h, {"name": "gpu-nouuid", "argv": ["sleep", "60"], "gpu_mib": 2048, "mem_mib": 128,
+                                     "hours": 1, "cwd": "/tmp"})
+            self.assertEqual(j["state"], "queued")
+            self.assertIn("without a card UUID", j["reason"])
+        finally:
+            del os.environ["FAKE_WB_NO_UUID"]
 
     def test_preemption_is_its_own_state(self):
         j = jobs.submit(self.h, {"name": "gpu-pre", "argv": ["sleep", "100"], "gpu_mib": 2048, "mem_mib": 128, "hours": 1,
@@ -197,7 +289,7 @@ class CpuRunTests(unittest.TestCase):
             os.environ.pop(k, None)
         os.environ["FAKE_CPU_LOG"] = os.path.join(tempfile.mkdtemp(dir=TMP), "cpu.jsonl")
         write_hosts([{"name": "here", "ssh": None, "desktop": True, "reserve": {"cores": 1, "ram_gib": 1},
-                      "cpu_run_name": "devbox"}],
+                      "cpu_run_name": "homebox"}],
                     jobs={"gpu_workboard": None, "cpu_run": FAKE_CPU})
         hosts.tick(self.h)
 
@@ -207,7 +299,7 @@ class CpuRunTests(unittest.TestCase):
             subprocess.run(["systemctl", "--user", "reset-failed", r["unit"]], capture_output=True)
 
     def test_advice_pins_cpus(self):
-        os.environ["FAKE_CPU_HOST"], os.environ["FAKE_CPU_CPUS"] = "devbox", "0,1"
+        os.environ["FAKE_CPU_HOST"], os.environ["FAKE_CPU_CPUS"] = "homebox", "0,1"
         j = jobs.submit(self.h, {"name": "cpu-pin", "argv": ["sleep", "60"], "mem_mib": 128, "hours": 1, "cwd": "/tmp"})
         self.assertEqual(j["state"], "running", j["reason"])
         self.assertEqual(j["placer"], "cpu-run")

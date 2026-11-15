@@ -16,7 +16,8 @@
       <span>Switchboard</span>
     </a>
     <span class="tb-sum" id="tb-sum"></span>
-    <button class="pbtn" id="tb-inbox" type="button" title="What agents need from you (sb ask, sb notify)">Inbox </button>
+    <button class="pbtn tb-inbox" id="tb-inbox" type="button" aria-pressed="false" title="Requests agents filed for you: questions to answer and needs to acknowledge">Inbox<span class="badge" id="tb-inbox-n" hidden></span></button>
+    <a class="pbtn" id="tb-insights" href="#/insights" title="Usage across every agent: tokens, cost, activity, tools">Insights</a>
     <button class="pbtn" id="tb-setup" type="button" title="Your AI subscriptions and API keys">Setup</button>
     <button class="pbtn" id="tb-shell" type="button" title="Open a plain shell (for example to log in to a CLI)">Shell</button>
     <button class="pbtn" id="tb-phone" type="button" title="Pair your phone so it can open Switchboard from anywhere" hidden>Phone</button>
@@ -32,7 +33,7 @@
   <script src="vendor/addon-fit.js"></script>
   <script src="vendor/qrcode.js"></script>
   <script src="setup.js"></script>
-  <script src="inbox.js"></script>
+  <script src="viz.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

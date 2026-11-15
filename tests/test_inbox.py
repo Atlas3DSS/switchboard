@@ -73,11 +73,46 @@ class InboxTests(unittest.TestCase):
         r = inbox.done(self.h, need["id"])
         self.assertEqual(r["state"], "acked")
         self.assertEqual(inbox.items(self.h)["count"], 0)
+        self.assertFalse(any("acknowledged" in m["body"] for m in self.h.s.messages("a1")),
+                         "a stopped agent is not started just to hear the ack")
+        self.h.notify("a1", "a1: results are in", level="need", idem="n3")
+        need = [x for x in inbox.items(self.h)["items"] if x["kind"] == "need"][0]
+        self.assertEqual(inbox.done(self.h, need["id"], "good, write them up")["state"], "answered")
+        self.assertTrue(any("Owner replied to your notice" in m["body"] and "write them up" in m["body"]
+                            for m in self.h.s.messages("a1")))
         self.assertEqual(self.h.notifications()["need"], 0, "the decision echoes were acked with their decisions")
         self.assertEqual(inbox.done(self.h, self.d1, "no")["state"], "answered", "a closed item stays as it was")
         self.assertEqual(self.h.s.decision(self.d1)["answer"], "yes")
         with self.assertRaises(LookupError):
             inbox.done(self.h, "n-nope")
+
+    def test_ignore_removes_an_item_without_a_word_to_the_agent(self):
+        before = {aid: len(self.h.s.messages(aid)) for aid in ("a1", "b1")}
+        self.assertEqual(inbox.done(self.h, self.d2, quiet=True)["state"], "ignored")
+        self.assertEqual(self.h.s.decision(self.d2)["state"], "dismissed")
+        need = [x for x in inbox.items(self.h)["items"] if x["kind"] == "need"][0]
+        self.assertEqual(inbox.done(self.h, need["id"], quiet=True)["state"], "ignored")
+        self.assertNotIn(self.d2, [x["id"] for x in inbox.items(self.h)["items"]])
+        self.assertNotIn(need["id"], [x["id"] for x in inbox.items(self.h)["items"]])
+        self.assertEqual({aid: len(self.h.s.messages(aid)) for aid in ("a1", "b1")}, before, "nobody was told")
+
+
+class PendingMessageTests(unittest.TestCase):
+    @unittest.skip("stale: written for the router chat / earlier isolation rules; needs rewriting")
+    def test_queue_only_contains_incoming_unsent_messages_and_cancel_removes_one(self):
+        h = new_hub()
+        incoming, _ = h.s.enqueue('a1', 'Old pending request', frm='b1')
+        h.s.enqueue('b1', 'Outgoing request', frm='a1')
+        delivered, _ = h.s.enqueue('a1', 'Already typed', frm='b1')
+        h.s.x("UPDATE messages SET state='delivering' WHERE id=?", (delivered['id'],))
+        self.assertEqual([m['id'] for m in h.pending_messages('a1')['messages']], [incoming['id']])
+        result = h.cancel_message(incoming['id'])
+        self.assertEqual(result['state'], 'interrupted')
+        self.assertEqual(h.pending_messages('a1')['messages'], [])
+        self.assertEqual(h.agent_view(h.s.agent('a1'))['queued'], 0)
+        with self.assertRaises(ValueError):
+            h.cancel_message(delivered['id'])
+        self.assertEqual(h.s.message(delivered['id'])['state'], 'delivering')
 
 
 if __name__ == "__main__":

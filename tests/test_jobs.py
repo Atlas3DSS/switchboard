@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -88,6 +89,7 @@ class PlacementTests(unittest.TestCase):
         return {**base, **kw}
 
     def cfg(self, names, **jobs_cfg):
+        jobs_cfg.setdefault("priority_projects", ["ops-priority"])
         write_hosts([{"name": n, "ssh": None if i == 0 else n, "order": i + 1} for i, n in enumerate(names)],
                     jobs=jobs_cfg)
         return hosts.load_config()
@@ -124,6 +126,20 @@ class PlacementTests(unittest.TestCase):
         self.assertIsNone(h)
         self.assertIn("no GPU with 50000 MiB free", why)
 
+    def test_interactive_lane_reaches_the_board_when_cards_are_full(self):
+        cfg = self.cfg(["gpu2"])
+        rows = {"gpu2": fake_row("gpu2", gpus=[gpu("M", 6115)])}
+        batch = self.job(gpu_mib=6144, lane="batch")
+        h, g, why = jobs.place(self.h, cfg, batch, rows, board=True)
+        self.assertIsNone(h, "batch waits for the inventory")
+        self.assertIn("no GPU with 6144 MiB free", why)
+        inter = self.job(gpu_mib=6144, lane="interactive")
+        h, g, why = jobs.place(self.h, cfg, inter, rows, board=False)
+        self.assertIsNone(h, "without a board the inventory is the only arbiter")
+        h, g, why = jobs.place(self.h, cfg, inter, rows, board=True)
+        self.assertEqual((h["name"], g["uuid"], why), ("gpu2", "M", None))
+        self.assertIn("no GPU with 6144 MiB free", inter["board_only"], "the pick is provisional: the board decides")
+
     def test_running_jobs_reserve_capacity(self):
         cfg = self.cfg(["only"])
         rows = {"only": fake_row("only", threads=8, cores=8, gpus=[gpu("G", 10000)])}
@@ -135,6 +151,96 @@ class PlacementTests(unittest.TestCase):
         self.assertIsNone(h)  # 10000 - 8000 held < 4000
         h, g, why = jobs.place(self.h, cfg, self.job(threads=1, gpu_mib=1500), rows)
         self.assertEqual(g["uuid"], "G")
+
+    def test_vram_realized_per_card_when_no_pid_matches(self):
+        """A Windows host attributes VRAM to no pid, and on Linux the VRAM sits in a child of the unit's main pid: the
+        card's measured use counts as the job's, so the lease is not held twice over."""
+        cfg = self.cfg(["gpu2"])
+        self.h.s.x("INSERT INTO jobs(id,name,host,unit,threads,mem_mib,gpu_mib,gpu_uuid,pid,state,created_at) "
+                   "VALUES('j1','labels','gpu2','u1',4,4096,19456,'M',324377,'running','2026-01-01T00:00:00Z')")
+        card = {**gpu("M", 6540), "vram_total_mib": 24564, "vram_used_mib": 18024}  # Windows: procs=[]
+        rows = {"gpu2": fake_row("gpu2", threads=16, cores=16, gpus=[card])}
+        held = jobs.reserved(self.h, "gpu2", {"gpus": [card]})
+        self.assertEqual(held["gpu_unrealized"]["M"], 19456 - 18024)
+        h, g, why = jobs.place(self.h, cfg, self.job(gpu_mib=3584), rows)
+        self.assertEqual((h["name"], g["uuid"]), ("gpu2", "M"), why)
+        h, g, why = jobs.place(self.h, cfg, self.job(gpu_mib=6000), rows)
+        self.assertIsNone(h, "the unallocated 1432 MiB of the lease is still held")
+        child = {**card, "procs": [{"pid": 324380, "name": "python", "vram_mib": 18000}]}  # a child, not the main pid
+        self.assertEqual(jobs.reserved(self.h, "gpu2", {"gpus": [child]})["gpu_unrealized"]["M"], 19456 - 18024)
+        exact = {**card, "procs": [{"pid": 324377, "name": "python", "vram_mib": 17000}]}
+        self.assertEqual(jobs.reserved(self.h, "gpu2", {"gpus": [exact]})["gpu_unrealized"]["M"], 19456 - 17000)
+
+    def test_memory_hold_settles_to_observed_peak(self):
+        """A job that declared far more RAM than it ever used stops blocking the host once it has settled
+        (a job: 96 GiB declared, 7.5 GiB peak)."""
+        now = time.time()
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        self.assertEqual(jobs.mem_hold_mib(98304, None, iso(now - 7200), now), 98304, "no peak probed: declaration")
+        self.assertEqual(jobs.mem_hold_mib(98304, 7680, iso(now - 60), now), 98304, "still settling: declaration")
+        self.assertEqual(jobs.mem_hold_mib(98304, 7680, iso(now - 7200), now), 9728, "settled: peak + 2 GiB")
+        self.assertEqual(jobs.mem_hold_mib(98304, 40960, iso(now - 7200), now), 51200, "settled: peak x1.25")
+        self.assertEqual(jobs.mem_hold_mib(32768, 30000, iso(now - 7200), now), 32768, "never above the declaration")
+        cfg = self.cfg(["q"])
+        rows = {"q": fake_row("q", avail_mib=60 * 1024)}  # 60 GiB available - 8 reserve = 52 GiB before holds
+        self.h.s.x("INSERT INTO jobs(id,name,host,unit,threads,mem_mib,mem_cur_mib,state,created_at,started_at) "
+                   "VALUES('jb','abl','q','u-abl',1,98304,3000,'running','2026-01-01T00:00:00Z',?)", (iso(now - 7200),))
+        h, g, why = jobs.place(self.h, cfg, self.job(mem_mib=32768), rows)
+        self.assertIsNone(h, "without a probed peak the full 96 GiB declaration is held")
+        doc = json.loads(rows["q"]["doc"])
+        doc["units"] = [{"unit": "u-abl", "mem_mib": 3000, "mem_peak_mib": 7680}]
+        rows["q"] = {**rows["q"], "doc": json.dumps(doc)}
+        h, g, why = jobs.place(self.h, cfg, self.job(mem_mib=32768), rows)
+        self.assertEqual(h["name"], "q", why)
+
+    def test_disjoint_cpus_avoid_other_jobs_pins(self):
+        ins = ("INSERT INTO jobs(id,name,host,unit,threads,mem_mib,cpus,state,created_at) VALUES(?,?,'d',?,2,64,?,?,"
+               "'2026-01-01T00:00:00Z')")
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 8, [0, 1], 2), [0, 1], "nothing held: the advice stands")
+        self.h.s.x(ins, ("j1", "a", "u1", "[0, 1]", "running"))
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 8, [0, 1], 2), [2, 3])
+        self.h.s.x(ins, ("j2", "b", "u2", "[2, 3]", "stopping"))
+        self.h.s.x(ins, ("j3", "c", "u3", "[4, 5]", "finished"))  # finished: its CPUs are free again
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 8, [0, 1], 2), [4, 5])
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 8, [4, 5], 2), [4, 5], "free advice is kept as given")
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 5, [0, 1], 2), [0, 1], "too few free CPUs: the advice stands")
+
+    def test_priority_and_tiny_jobs_cut_past_the_thread_gate(self):
+        cfg = self.cfg(["full", "roomy"])
+        rows = {"full": fake_row("full", threads=32, cores=16, load=38.0), "roomy": fake_row("roomy")}
+        long1 = self.job(threads=1, hours=12, project="chem", host_pref="full")
+        h, g, why = jobs.place(self.h, cfg, long1, rows)
+        self.assertIsNone(h)
+        self.assertIn("full: 0 threads free, need 1", why)
+        tiny = self.job(threads=1, hours=1, project="chem", host_pref="full")
+        self.assertEqual(jobs.cuts_in(cfg, tiny), "tiny job")
+        self.assertEqual(jobs.place(self.h, cfg, tiny, rows)[0]["name"], "full")
+        self.assertEqual(jobs.place(self.h, cfg, {**tiny, "host_pref": None}, rows)[0]["name"], "roomy",
+                         "room elsewhere wins over squeezing onto the full box")
+        prio = self.job(threads=8, hours=12, project="ops-priority", host_pref="full")
+        self.assertEqual(jobs.cuts_in(cfg, prio), "priority project")
+        self.assertEqual(jobs.place(self.h, cfg, prio, rows)[0]["name"], "full")
+        self.assertIsNone(jobs.place(self.h, cfg, {**prio, "mem_mib": 10 ** 7}, rows)[0], "memory still applies")
+        self.assertIsNone(jobs.cuts_in(self.cfg(["full"], priority_projects=[]), prio))
+        self.assertIsNone(jobs.cuts_in(cfg, self.job(threads=1, hours=1, gpu_mib=1024, project="chem")))
+
+    def test_priority_gpu_job_reaches_the_board_like_interactive(self):
+        cfg = self.cfg(["gpu2"])
+        rows = {"gpu2": fake_row("gpu2", gpus=[gpu("M", 6115)])}
+        h, g, why = jobs.place(self.h, cfg, self.job(gpu_mib=6144, lane="batch", project="ops-priority"), rows, board=True)
+        self.assertEqual((h["name"], g["uuid"]), ("gpu2", "M"))
+
+    def test_cut_ins_launch_first(self):
+        self.cfg(["here"])
+        for jid, proj, thr, hrs, at in (("job-old", "chem", 6, 12, "2026-01-01T00:00:00Z"),
+                                        ("job-tiny", "chem", 1, 1, "2026-01-01T00:02:00Z"),
+                                        ("job-prio", "ops-priority", 4, 12, "2026-01-01T00:03:00Z")):
+            self.h.s.x("INSERT INTO jobs(id,name,project,host,unit,cwd,argv,threads,mem_mib,hours,state,created_at) VALUES"
+                       "(?,?,?,NULL,?,'/tmp','[\"true\"]',?,64,?,'queued',?)", (jid, jid, proj, f"sb-{jid}.service", thr, hrs, at))
+        seen = []
+        with mock.patch.object(jobs, "_launch_one", side_effect=lambda hub, cfg, job, *a: seen.append(job["id"])):
+            jobs.launch_queued(self.h)
+        self.assertEqual(seen, ["job-tiny", "job-prio", "job-old"])
 
     def test_host_pref_limits_candidates(self):
         cfg = self.cfg(["a", "b"])
@@ -169,6 +275,30 @@ class SubmitValidationTests(unittest.TestCase):
         finally:
             hosts.resume(self.h, "tester")
 
+    def test_host_scoped_halt_stops_only_that_host(self):
+        write_hosts([{"name": "here", "ssh": None}, {"name": "far", "ssh": "far"}])
+        self.h.s.set_setting("halt", {"by": "agent-3", "reason": "new card", "at": "2026-11-03T02:16:25Z",
+                                      "hosts": ["far"], "pending": [], "workloads": False, "scope": ["far"]})
+        cfg = hosts.load_config()
+        self.assertEqual(hosts.halted_hosts(self.h, cfg), {"far"})
+        with self.assertRaises(ValueError) as cm:
+            jobs.submit(self.h, {"name": "pinned", "argv": ["true"], "host": "far"})
+        self.assertIn("on far", str(cm.exception))
+        rows = {"here": fake_row("here"), "far": fake_row("far", threads=256, cores=128)}
+        h, g, why = jobs.place(self.h, {**cfg, "halted": {"far"}}, {"id": "j", "threads": 64, "mem_mib": 64,
+                                                                     "gpu_mib": None, "host_pref": None}, rows)
+        self.assertIsNone(h, "only far had room, and far is halted")
+        self.assertIn("far: HALT raised", why)
+        h, g, why = jobs.place(self.h, {**cfg, "halted": {"far"}}, {"id": "j", "threads": 1, "mem_mib": 64,
+                                                                     "gpu_mib": None, "host_pref": None}, rows)
+        self.assertEqual(h["name"], "here")
+        legacy = {"by": "x", "at": "t", "hosts": ["here", "far"], "pending": []}  # a fleet HALT before scope existed
+        self.h.s.set_setting("halt", legacy)
+        self.assertEqual(hosts.halted_hosts(self.h, cfg), {"here", "far"})
+        self.h.s.set_setting("halt", {**legacy, "hosts": ["here"], "scope": "all"})
+        self.assertEqual(hosts.halted_hosts(self.h, cfg), {"here", "far"}, "a fleet HALT covers every host")
+        self.h.s.set_setting("halt", None)
+
     def test_nothing_fits_means_queued_with_reason(self):
         hosts.tick(self.h)
         j = jobs.submit(self.h, {"name": "huge", "argv": ["true"], "threads": 4000, "agent": "a1"})
@@ -178,6 +308,55 @@ class SubmitValidationTests(unittest.TestCase):
         j = jobs.stop(self.h, j["id"], "a1")
         self.assertEqual(j["state"], "stopped")
         self.assertIn("before it was placed", j["reason"])
+
+    def test_fleet_view_lists_a_queued_job_no_host_has_taken(self):
+        hosts.tick(self.h)
+        j = jobs.submit(self.h, {"name": "huge", "argv": ["true"], "threads": 4000, "agent": "a1"})
+        v = hosts.fleet_view(self.h)
+        self.assertEqual([q["id"] for q in v["queued"]], [j["id"]], "the panel's Stop needs this row")
+        self.assertEqual(v["hosts"][0]["tracked"], [])
+        jobs.stop(self.h, j["id"], "a1")
+        self.assertEqual(hosts.fleet_view(self.h)["queued"], [])
+
+
+class LaunchOutcomeTests(unittest.TestCase):
+    """The launch result is read from the script output; no systemd is touched (hosts.run_on is replaced)."""
+
+    def setUp(self):
+        self.h = new_hub()
+        write_hosts([{"name": "here", "ssh": None, "desktop": True, "reserve": {"cores": 1, "ram_gib": 1}}])
+        hosts.tick(self.h)
+        self.real_run_on = hosts.run_on
+
+    def tearDown(self):
+        hosts.run_on = self.real_run_on
+
+    def launch_with(self, out, rc=0):
+        self.h.s.x("INSERT INTO jobs(id,name,host,unit,cwd,argv,threads,mem_mib,hours,state,created_at,host_pref) VALUES"
+                   "('job-o','o',NULL,'sb-job-job-o.service','/tmp','[\"./x.sh\"]',1,64,1,'queued',"
+                   "'2026-01-01T00:00:00Z',NULL)")
+        seen = []
+        hosts.run_on = lambda h, script, timeout=60: (seen.append(script), (rc, out, ""))[1]
+        jobs.launch_queued(self.h)
+        return jobs._row(self.h, "job-o"), next(x for x in seen if "systemd-run" in x)
+
+    def test_failed_launch_is_not_a_false_halt(self):
+        # systemd-run failed, so the unit does not exist and `systemctl show` answers ConditionResult=no for it
+        j, _ = self.launch_with("Failed to find executable ./x.sh: No such file or directory\nActiveState=inactive\n"
+                                "SubState=dead\nResult=success\nConditionResult=no\nMainPID=0\nInvocationID=\n")
+        self.assertEqual(j["state"], "failed")
+        self.assertIn("Failed to find executable", j["reason"])
+
+    def test_condition_on_a_created_unit_is_refused(self):
+        j, _ = self.launch_with("Running as unit: sb-job-job-o.service\nlaunched\nActiveState=inactive\n"
+                                "SubState=dead\nResult=success\nConditionResult=no\nMainPID=0\nInvocationID=\n")
+        self.assertEqual(j["state"], "refused")
+
+    def test_relative_command_resolves_in_the_job_directory(self):
+        _, script = self.launch_with("refused HALT\n")
+        lines = script.splitlines()
+        cd = next(i for i, l in enumerate(lines) if l.startswith("cd /tmp ||"))
+        self.assertLess(cd, next(i for i, l in enumerate(lines) if l.startswith("systemd-run")))
 
 
 @unittest.skipUnless(have_user_systemd(), "needs a systemd user manager")
@@ -218,6 +397,10 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(p["RuntimeMaxUSec"], "6min")
         self.assertIn(f"SB_JOB_ID={j['id']}", p["Environment"])
         self.assertIn("SB_AGENT=a1", p["Environment"])
+        path = next(e for e in p["Environment"].split() if e.startswith("PATH="))[5:].split(":")
+        self.assertEqual(path[0], jobs.SB_BIN, "sb is on a job's PATH")
+        self.assertIn("/usr/bin", path, "the manager's PATH follows")
+        self.assertIn("SB=" + os.path.join(jobs.SB_BIN, "sb"), p["Environment"])
         slice_file = os.path.join(os.environ["SB_SYSTEMD_USER_DIR"], "switchboard-jobs.slice")
         self.assertIn("CPUWeight=20", open(slice_file).read())
         done = self.settle(j["id"], ("finished", "failed", "lost"))

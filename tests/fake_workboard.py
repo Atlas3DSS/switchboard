@@ -12,6 +12,11 @@ args = sys.argv[1:]
 cmd = args[0] if args else ""
 with open(log, "a") as f:
     f.write(json.dumps(args) + "\n")
+if cmd == "submit" and os.environ.get("FAKE_WB_OLD"):  # an older client without --lane/--protected
+    bad = [a for a in args if a in ("--lane", "--protected")]
+    if bad:
+        sys.exit(f"usage: gpu-workboard submit ...\ngpu-workboard: error: unrecognized arguments: "
+                 + " ".join(bad + (["batch"] if "--lane" in bad else [])))
 if cmd == "submit":
     n = sum(1 for l in open(log) if l.startswith('["submit"')) if log != "/dev/null" else 1
     print(json.dumps({"id": f"gpu-fake-{n}", "status": "queued"}))
@@ -19,7 +24,10 @@ elif cmd == "acquire":
     if os.environ.get("FAKE_WB_DENY"):
         print(json.dumps({"acquired": False, "decision_reason": os.environ["FAKE_WB_DENY"]}))
         sys.exit(3)
-    print(json.dumps({"acquired": True, "assigned_uuid": os.environ.get("FAKE_WB_UUID", "GPU-FAKE-0001")}))
+    if os.environ.get("FAKE_WB_NO_UUID"):
+        print(json.dumps({"acquired": True, "job_id": args[-1]}))
+        sys.exit(0)
+    print(json.dumps({"acquired": True, "gpu_uuid": os.environ.get("FAKE_WB_UUID", "GPU-FAKE-0001")}))  # real shape
 elif cmd in ("start", "heartbeat", "finish", "cancel"):
     print(json.dumps({"ok": True}))
 elif cmd == "status":

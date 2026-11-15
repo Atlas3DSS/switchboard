@@ -11,10 +11,12 @@ const SUBS = [
     login: 'gemini   (then choose "Login with Google")' },
   { kind: 'hermes', vendor: 'Nous Research', plan: 'Hermes Agent, with the models and providers in its own config', cli: 'Hermes Agent', name: 'hermes',
     login: 'hermes setup' },
+  { kind: 'antigravity', vendor: 'Google', plan: 'Google AI Pro or Ultra subscription, through the Antigravity CLI', cli: 'Antigravity CLI', name: 'antigravity',
+    login: 'agy   (then sign in with Google)' },
 ];
 /* API presets that a vendor CLI can also run with the same key */
 const CLI_FOR_PRESET = { anthropic: 'claude', openai: 'codex', google: 'gemini' };
-const CLI_NAME = { claude: 'Claude Code', codex: 'Codex CLI', gemini: 'Gemini CLI', hermes: 'Hermes Agent' };
+const CLI_NAME = { claude: 'Claude Code', codex: 'Codex CLI', gemini: 'Gemini CLI', hermes: 'Hermes Agent', antigravity: 'Antigravity CLI' };
 
 function setupView() {
   let data = null;
@@ -147,7 +149,7 @@ function setupView() {
 
   function refreshRouter() {
     const cur = router.value || (data && data.router_account);
-    const opts = collect().filter((a) => a.kind !== 'gemini' && a.kind !== 'hermes' && a.name);
+    const opts = collect().filter((a) => a.kind !== 'gemini' && a.kind !== 'hermes' && a.kind !== 'antigravity' && a.name);
     router.replaceChildren(...(opts.length ? opts.map((a) => h('option', { value: a.name, text: `${a.name} (${a.kind === 'api' ? 'built-in agent' : CLI_NAME[a.kind]})` }))
       : [h('option', { value: '', text: 'add a Claude, ChatGPT or API account first' })]));
     if (opts.some((a) => a.name === cur)) router.value = cur;

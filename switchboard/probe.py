@@ -187,7 +187,7 @@ def _names(args):
 
 
 UNIT_PROPS = ["Id", "Description", "ActiveState", "SubState", "Result", "MainPID", "CPUUsageNSec", "MemoryCurrent",
-              "InvocationID", "ActiveEnterTimestamp", "ExecMainStatus", "ConditionResult"]
+              "MemoryPeak", "InvocationID", "ActiveEnterTimestamp", "ExecMainStatus", "ConditionResult"]
 
 
 def _unit_row(b):
@@ -199,6 +199,7 @@ def _unit_row(b):
             "sub": b.get("SubState"), "result": b.get("Result"), "pid": num("MainPID") or None,
             "cpu_s": round(cpu_ns / 1e9, 1) if cpu_ns is not None else None,
             "mem_mib": (num("MemoryCurrent") or 0) // (1024 * 1024) if num("MemoryCurrent") is not None else None,
+            "mem_peak_mib": num("MemoryPeak") // (1024 * 1024) if num("MemoryPeak") is not None else None,
             "invocation": b.get("InvocationID") or None, "since": b.get("ActiveEnterTimestamp") or None,
             "exit": num("ExecMainStatus"), "condition": b.get("ConditionResult") or None}
 

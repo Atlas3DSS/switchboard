@@ -14,7 +14,9 @@ import sys
 import time
 import uuid
 
-from . import discovery
+from . import discovery, shared
+from .terminals import file_flags, hub_url, launch_cwd
+import base64
 
 from .store import INBOX, TURNS, epoch, new_id, now, upload_path
 
@@ -38,25 +40,51 @@ def compose_prompt(msgs):
 
 
 def switchboard_note(agent):
-    return (f"You are agent '{agent['id']}' on the owner's Switchboard, project "
+    if agent.get("role") == "desk":
+        return ROUTER_NOTE + "\n\n" + (agent.get("_summary") or "")
+    return (f"You are agent '{agent['id']}' on the owner's Switchboard (http://127.0.0.1:8802), project "
             f"'{agent.get('project') or 'unsorted'}'. The owner reads and answers you there, not in a terminal, so "
             "end every turn with a clear, self-contained reply. Message other agents only with "
             "`sb send <agent> \"text\"` (add --wait to get the reply), list them with `sb agents`, and ask the owner "
-            "a decision with `sb ask \"question\" --options a,b`. "
-            "Background tasks end when your turn ends, so start long-running work as a separate service or "
-            "detached process and check on it in later turns.")
+            "a decision with `sb ask \"question\" --options a,b`. Never use tmux send-keys to reach an agent. "
+            "Background tasks end when your turn ends, so put long-running work in systemd user units and check "
+            "on it in later turns. " + shared.OWNER_RELAY_POLICY)
 
 
 ROUTER_MAX_CONTEXT = 40_000
-ROUTER_NOTE = (
-    "You are Switchboard, the owner's chat window over all their projects and agents. Your one job: get them to "
-    "the right project agent fast. "
-    "Answer in one to three short sentences, no preamble. The live project list below is current; trust it over "
+ROUTER_NOTE = shared.OWNER_RELAY_POLICY + "\n\n" + (
+    "You are Switchboard, the owner's only chat window. Your one job: get them to the right project agent fast. "
+    "Answer in one to three short sentences, no preamble (a status brief, below, may be longer). The live project list below is current; trust it over "
     "anything you remember. When they want a project or an agent, end your answer with [[open:<project-id>/<agent-id>]] "
     "(or [[open:<project-id>]] for the whole project); the page turns that into a button that opens its terminal panes. "
-    "Do not do project work yourself and do not run tools, except `sb sessions`/`sb resume` (below) and when they "
-    "explicitly asks you to pass a message on: then run `sb send <agent> \"...\"` once and say so. If nothing fits, "
+    "Do not do project work yourself and do not run tools, except the `sb` commands described here, and `sb send "
+    "<agent> \"...\"` once when they explicitly ask you to pass a message on (then say so). If nothing fits, "
     "name the closest project or suggest \"+ Agent\" on its card.\n\n"
+    "ALL AGENTS AT ONCE: when the owner wants every active agent told something (\"tell everyone...\", \"everybody stop "
+    "and...\"), run `sb broadcast \"<their instruction, addressed to the agents>\"` once (--project <id> for one "
+    "project). When they want to wrap up, shut down, stop for the night or call it a day, run `sb wrapup` once (their "
+    "extra instructions, if any, as its text). Add --close only when they say to close, exit or shut the terminals "
+    "too (each closes after it reports); add --now only when they say right now or immediately (it interrupts working "
+    "agents). Running terminals only are reached; stopped ones are not woken. Each agent answers when its current "
+    "step ends; reply in one line with how many got it, and that their reports will be in the brief.\n\n"
+    "STATUS: when the owner asks for an update, status, summary, or what is going on, run `sb brief` (--hours N for "
+    "another window; default 24) and answer only from it, as an executive summary: one bottom-line sentence; then "
+    "one line per project with real activity (done · in flight · blocked), linked as [[open:<project-id>]]; then "
+    "\"Needs you:\" with open decisions, agents waiting on a prompt and undelivered messages, if any; then, if a "
+    "wrap-up is in progress, who has reported and who has not. Under 20 lines, plain words. Never invent progress "
+    "the brief does not show; say \"no report yet\".\n\n"
+    "CROSS-PROJECT RELAY: agents cannot message or pull in agents on other projects; they ask you instead (\"For "
+    "project X: ...\"). Relay it once with `sb send <project-or-agent> \"From <asker> on <its project>: <the "
+    "ask>\"` (no --wait) and reply in one line that it is relayed. The answer comes back to you as \"Reply from "
+    "<agent> to your message ...\": pass it on once with `sb send <asker> \"Answer from <agent> (project <id>): "
+    "...\"`. A reply to a message you sent for the owner instead gets a one-line summary for them. Never move an "
+    "agent between projects.\n\n"
+    "WORK QUEUE: the owner's master work queue is `sb work` (open items; --all adds finished ones; --project <id>). "
+    "When they add, finish, reprioritises, assigns or drops work, change it with `sb work add \"title\" --project "
+    "<id> [--pri 1|2|3] [--agent <id>] [--detail \"...\"]`, `sb work done <n>`, `sb work set <n> [--status "
+    "todo|doing|blocked|done|dropped] [--pri N] [--agent <id>] [--title \"...\"] [--note \"...\"]` or `sb work rm "
+    "<n>`, then confirm in one line. To hand an item to an agent, set --agent and --status doing, then `sb send "
+    "<agent> \"Work item #<n>: ...\"`.\n\n"
     "PAST SESSIONS: when the owner wants an old conversation (\"the session where we…\", \"resume the parser one\"), run "
     "`sb sessions \"<a few distinctive words>\"` (newest-relevant first; each row says which agent it already is or "
     "which project it would join). If one clearly fits, run `sb resume <session-id>` once (it reuses an existing "
@@ -89,6 +117,8 @@ def turn_command(agent, prompt_file, first_turn, images=()):
             argv += ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                      "--tools=Bash", "--allowedTools=Bash(sb *)"]  # it may only run `sb`; no file searching
             note = ROUTER_NOTE + "\n\n" + (agent.get("_summary") or "")
+        else:
+            argv += file_flags(agent)  # before the note: --add-dir is variadic
         argv += ["--append-system-prompt", note]
         if agent.get("model"):
             argv += ["--model", agent["model"]]
@@ -115,7 +145,7 @@ def turn_command(agent, prompt_file, first_turn, images=()):
         for p, _ in images:
             flags += ["-i", p]
         if first_turn or not agent.get("session_id"):
-            return base + flags + ["-C", agent["cwd"], "-"]
+            return base + flags + ["-C", launch_cwd(agent), "-"]
         return base + ["resume"] + flags + [agent["session_id"], "-"]
     raise ValueError(f"provider {agent['provider']} cannot run turns yet")
 
@@ -154,6 +184,7 @@ class Runner:
     def __init__(self, store):
         self.s = store
         self.summary_fn = None  # set by the hub: live one-line-per-project summary for the router
+        self.account_fn = None  # set by the hub: the account a turn runs on (moves off an account that is out)
 
     # ---------- scheduling ----------
     def running_turns(self):
@@ -173,6 +204,7 @@ class Runner:
 
     def tick(self):
         """Advance running turns, then start new ones for agents with queued mail."""
+        self.s.hold_cross_project_messages()
         for r in self.running_turns():
             if r["turn_id"].startswith("p-"):  # pane deliveries are confirmed by poll_panes
                 continue
@@ -220,6 +252,8 @@ class Runner:
                               f"delivered_at=? WHERE id IN ({','.join('?' * len(ids))})", (turn, now(), *ids))
         if agent.get("role") == "desk":
             agent["_summary"] = self.summary_fn() if self.summary_fn else ""
+            if self.account_fn:
+                agent["account"] = self.account_fn(agent)
             if (agent.get("context_tokens") or 0) > ROUTER_MAX_CONTEXT:  # it routes; it needs no long memory
                 agent["session_id"] = None
                 self.s.set_agent(agent["id"], session_id=None, context_tokens=0)
@@ -242,6 +276,7 @@ class Runner:
         argv = turn_command(agent, prompt_file, first_turn, images if agent["provider"] == "codex" else ())
         env = discovery.account_env(agent["account"], agent["provider"])
         env["SB_AGENT"] = agent["id"]
+        env["SB_HUB"] = hub_url()
         env["SB_TURN"] = turn
         env["SB_HOP"] = str(max(m["hop"] for m in msgs))
         # A background job finishing after a headless turn forks the transcript, and the next resume then
@@ -251,7 +286,7 @@ class Runner:
         env["PYTHONPATH"] = ROOT + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         out = open(os.path.join(TURNS, f"{turn}.jsonl"), "w")
         err = open(os.path.join(TURNS, f"{turn}.stderr"), "w")
-        proc = subprocess.Popen(argv, cwd=agent["cwd"] or os.path.expanduser("~"), stdin=subprocess.PIPE,
+        proc = subprocess.Popen(argv, cwd=launch_cwd(agent), stdin=subprocess.PIPE,
                                 stdout=out, stderr=err, env=env, start_new_session=True)
         out.close()
         err.close()
@@ -480,7 +515,12 @@ class Runner:
             if sender in ("owner", "system") or m["is_reply"] or m.get("wait_reply") or m["hop"] >= 4 \
                     or not reply.strip():
                 continue
-            if not self.s.agent(sender):
+            target = self.s.agent(sender)
+            if not target or target["gone"]:
+                continue
+            try:
+                self.s.check_message_scope(agent["id"], target)
+            except PermissionError:
                 continue
             self.s.enqueue(sender, f"Reply from {agent['id']} to your message {m['id']}:\n\n{reply}",
                            frm=agent["id"], idem=f"reply:{m['id']}", hop=m["hop"] + 1, is_reply=True)
@@ -562,7 +602,9 @@ class Runner:
     def _transcript_for(self, agent):
         if not agent or not agent.get("session_id"):
             return None
-        return discovery.transcript_path(agent["provider"], agent["session_id"])
+        if agent["provider"] == "claude":
+            return discovery.claude_transcript(agent["session_id"])
+        return discovery.transcript_path(agent["provider"], agent["session_id"], agent.get("account"))
 
     def close_observed_turns(self, agent):
         """An observed agent went idle after a delivered pane message: record its reply."""

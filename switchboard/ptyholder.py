@@ -30,6 +30,14 @@ def frame(kind, payload=b""):
     return kind + struct.pack(">I", len(payload)) + payload
 
 
+def start_ticks(pid, proc="/proc"):
+    """When a process started (clock ticks since boot, /proc/<pid>/stat field 22): with the pid, it names one
+    process for good, since a pid can be reused but not together with its start time."""
+    with open(f"{proc}/{int(pid)}/stat") as f:
+        stat = f.read()
+    return int(stat[stat.rindex(")") + 2:].split()[19])
+
+
 class FrameReader:
     """Incremental decoder for the wire format."""
 
@@ -77,7 +85,8 @@ def main(spec_path):
     os.set_blocking(master, False)
     state = {"holder_pid": os.getpid(), "pid": proc.pid, "argv": spec["argv"], "cwd": spec.get("cwd"),
              "started_at": time.time(), "sock": sock_path, "agent": spec.get("agent"),
-             "account": spec.get("account"), "session_id": spec.get("session_id")}
+             "account": spec.get("account"), "session_id": spec.get("session_id"),
+             "holder_start": start_ticks(os.getpid()), "pid_start": start_ticks(proc.pid)}
     try:
         os.unlink(sock_path)
     except OSError:

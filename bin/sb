@@ -11,15 +11,41 @@
   sb relaunch <agent> [--model M] [--effort E] [--confirm]
                                     exit an agent's CLI and start it again on the same session with that model
                                     (--confirm: interrupt it if it is working)
+  sb helper "task" [--minutes 10] [--model M]
+                                    a temporary helper on a smaller model for one narrow task: it reports back to
+                                    you and retires at its deadline (at most two; helpers cannot start helpers)
+  sb helpers                        your helpers and where their results are
   sb subagents [--model haiku] [--hours 72] [--agent a]
                                     recent subagents (Agent tool) and the agent or session that spawned each
-  sb clear [agent]                  start the Switchboard chat (or another headless agent) over
+  sb clear [agent]                  start a headless agent over
   sb context [agent] [--n N]        your project's agents (last ask/reply) + shared notes; or one agent's recent talk
   sb context --search "words"       search every conversation on your project
+  sb context --project P ...        the same for a project the owner let yours read (read-only)
+  sb outside PROJECT [--read on|off] [--write on|off]
+                                    owner: let PROJECT's agents read / write files outside its folder (two toggles);
+                                    bare shows them. Idle Claude terminals relaunch to pick it up
+  sb reads PROJECT [P2 ...]         owner: let PROJECT's agents read P2... (context + files, never write); the list
+                                    replaces the old one, --none takes it back, PROJECT alone shows it
   sb note "text"                    leave a short note for the other agents on your project
+  sb memory [--n 8] [--project P]   your project's running memory, each line citing its source, and the conversations
+                                    on record (written by a small model when one is cleared, goes quiet or is removed)
+  sb memory <n>                     the outline of conversation n: each point cites message numbers and quotes them
+  sb memory <n> --at M [--around 2] message M and its neighbours in full, from the transcript on disk (--tail 20: its end)
+  sb memory --usage | --on | --off | --cap N | --idle HOURS | --model M   owner: cost and settings (--idle 0: no idle trigger)
+  sb memory --project P --versions | --restore [N] | --set FILE          owner: earlier versions, go back, correct by hand
+  sb retention [--run] [--set key=N ...]   owner: what the hub keeps and for how long, sizes, the last clean-up
   sb summon <agent> "task" [--fork] side agent beside <agent> (--fork: a copy of its whole conversation)
+  sb broadcast "text" [--project p]  (owner) type the text into every running agent once
+  sb wrapup ["extra"] [--close] [--now]  every running agent: stop at a safe point, save, report (--close exits them)
+  sb brief [--hours 24]             what every running or recently active agent was asked and said, wrap-up
+                                    replies, the work queue, open decisions: the input for an executive summary
+  sb work [--all] [--project p]     the owner's master work queue (open items)
+  sb work add "title" [--project p] [--pri 1|2|3] [--agent a] [--detail "..."]
+  sb work done|start|block|drop <n> [--note "..."]
+  sb work set <n> [--status s] [--pri N] [--agent a] [--project p] [--title "..."] [--note "..."]
+  sb work rm <n>
   sb ask "question" [--options a,b] file a decision for the owner on your project
-  sb inbox [--project p] [--json]   (owner / Switchboard chat) every open request agents filed for the owner, per project
+  sb inbox [--project p] [--json]   (owner) every open request agents filed for the owner, per project
   sb inbox done <id> ["answer"]     cross one off: answer a decision, or dismiss it / acknowledge a need with no answer
   sb notify "text" [--info]         put a note in the owner's Switchboard inbox (--info: FYI, no action needed)
   sb reply <turn> "text"            answer a pane pointer you received
@@ -29,7 +55,7 @@
   sb fleet show <host>              one host in full (top processes, units, GPUs, desktop lag numbers)
   sb fleet add-host NAME --ssh ALIAS [--desktop] [--order N]   probe it, then add it to ~/.config/switchboard/hosts.json
   sb fleet wsl-keepalive [DISTRO]   the Windows command that keeps a WSL host from stopping when its console closes
-  sb halt [--reason "..."] [--host H] [--workloads]
+  sb halt [--reason "..."] [--host H] [--workloads]   (owner only, like every fleet-wide command; agents read `sb fleet`)
                                     raise HALT on every host: tracked jobs stop, nothing launches; --workloads also
                                     disables every unit matching workload_units (never protected_units)
   sb halt --install-guards | --list-guards | --remove-guards   systemd drop-ins that refuse to start while HALT exists
@@ -44,6 +70,7 @@
                                     watch an existing unit as a job without relaunching it (never halted)
 """
 import argparse
+import http.client
 import json
 import os
 import re
@@ -58,20 +85,103 @@ import uuid
 HUB = os.environ.get("SB_HUB", "http://127.0.0.1:8802")
 
 
-def call(method, path, body=None):
+def call(method, path, body=None, retries=0):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(HUB + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(HUB + path, data=data, method=method, headers={"Content-Type": "application/json", "X-Switchboard-Agent": me()})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
+        if retries and e.code in (502, 503, 504):
+            time.sleep(1)
+            return call(method, path, body, retries - 1)
         try:
             msg = json.loads(e.read()).get("error")
         except ValueError:
             msg = str(e)
         sys.exit(f"sb: {msg}")
-    except urllib.error.URLError as e:
-        sys.exit(f"sb: hub not reachable at {HUB} ({e.reason}); is switchboard.service running?")
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
+        if retries:
+            time.sleep(1)
+            return call(method, path, body, retries - 1)
+        sys.exit(f"sb: hub not reachable at {HUB} ({e}); is switchboard.service running?")
+
+
+def memory_cmd(args):
+    """sb memory: a project's running memory, the outlines it cites, and the transcript under them."""
+    q = urllib.parse.urlencode({"from": me(), "n": args.n, "tail": args.tail, "at": args.at, "around": args.around})
+    upd = {k: v for k, v in (("enabled", True if args.on else False if args.off else None), ("daily_cap", args.cap),
+                             ("model", args.model), ("idle_hours", args.idle)) if v is not None}
+    if upd:
+        call("POST", "/api/settings", {"memory": upd})
+    if args.usage or upd:
+        u = call("GET", "/api/memory/usage")
+        idle = f"after {u['idle_hours']:g} h idle" if u["idle_hours"] else "idle trigger off"
+        print(f"project memory is {'on' if u['enabled'] else 'OFF'}: model {u['model']}; runs when a conversation is "
+              f"cleared, removed, or {idle}; at most {u['daily_cap']} conversations a day ({u['today']} today); keeps "
+              f"{u['versions']} earlier versions\nlast {u['days']} days: {u['calls']} conversations, "
+              f"{u['in_tokens']} tokens in, {u['out_tokens']} out, ${u['cost_usd']:.4f}")
+        return 0
+    if args.set_file or args.restore is not None or args.versions:
+        if not args.project:
+            sys.exit("sb: which project? (--project)")
+        if args.versions:
+            vs = call("GET", f"/api/projects/{args.project}/memory/versions")["versions"]
+            for v in vs:
+                print(f"\nVERSION {v['id']}  written {(v['written_at'] or '?')[:16]}, replaced {v['replaced_at'][:16]} "
+                      f"by {v['replaced_by']}  (sb memory --project {args.project} --restore {v['id']})\n{v['text']}")
+            if not vs:
+                print(f"{args.project}: no earlier versions")
+            return 0
+        body = {"restore": args.restore or True} if args.restore is not None else {"text": open(args.set_file).read()}
+        call("POST", f"/api/projects/{args.project}/memory", body)
+        print(f"memory of {args.project} " + ("put back to an earlier version" if "restore" in body else "replaced"))
+        return 0
+
+    def head(x):
+        when = (x["created_at"] or "")[:16].replace("T", " ")
+        print(f"\n#{x['id']}  {when}  {x['agent']} ({x['provider']} {x['model'] or ''}; {x['why']}"
+              + (f"; {x['messages']} messages" if x.get("messages") else "") + ")")
+        if x["summary"]:
+            print("  " + x["summary"])
+        else:
+            what = {"pending": "being outlined", "working": "being outlined"}.get(x["state"]) or \
+                f"not outlined ({x['note'] or x['state']})"
+            print(f"  {what}. First asked: {x['first_ask'] or '?'}" +
+                  (f"\n  Last asked: {x['last_ask']}" if x["last_ask"] and x["last_ask"] != x["first_ask"] else "") +
+                  (f"\n  Last said: {x['last_said']}" if x["last_said"] else ""))
+
+    if args.entry is not None:
+        x = call("GET", f"/api/memory/{args.entry}?{q}")
+        head(x)
+        for sec in (x.get("outline") or {}).get("sections") or []:
+            print(f"\n  {sec['h']}")
+            for pt in sec["points"]:
+                print(f"  - {pt['t']} [{', '.join(str(m) for m in pt['m'])}]\n      \"{pt['q']}\"")
+        if x["summary"] and x.get("note"):
+            print(f"\n  note: {x['note']}")
+        print(f"\n  transcript: {x['path']}" + ("" if x["transcript_on_disk"] else "  (no longer on disk)"))
+        if x.get("source"):
+            print(f"\nMESSAGES AROUND {args.at}, IN FULL\n" + x["source"])
+        if x.get("tail"):
+            print("\nLAST MESSAGES\n" + x["tail"])
+        if not x.get("source") and not x.get("tail"):
+            print(f"  [n] is a message number: sb memory {x['id']} --at n shows it and its neighbours in full "
+                  f"(--around K for more); --tail 20 its last messages; sb context --search \"words\" searches it")
+        return 0
+    res = call("GET", (f"/api/projects/{args.project}/memory" if args.project else "/api/memory") + "?" + q)
+    print(f"PROJECT MEMORY {res['project']}" + (f"  (updated {res['updated_at'][:16].replace('T', ' ')})"
+                                                if res["updated_at"] else ""))
+    print(res["memory"] or "(nothing yet: it is written when a conversation on this project is cleared, goes quiet "
+                           "or its agent is removed)")
+    if res["memory"]:
+        print("\n[#n] = the outline of conversation n (sb memory n), [nN] = a project note (sb context --notes 200)")
+    if res["sessions"]:
+        print(f"\nCONVERSATIONS ON RECORD (newest {len(res['sessions'])} of {res['total']}; sb memory <n> for its "
+              f"outline and transcript)")
+        for x in res["sessions"]:
+            head(x)
+    return 0
 
 
 def me():
@@ -178,8 +288,64 @@ def setup():
     return 0
 
 
+def work_line(w):
+    who = ", ".join(x for x in (w["project"], w["agent"] and "agent " + w["agent"]) if x)
+    return f"#{w['id']:<4} P{w['priority']} {w['status']:<7} {w['title']}" + (f"  ({who})" if who else "")
+
+
+def work(args):
+    act, arg = args.action, args.arg
+    if act == "list":
+        q = {"status": "all" if args.all else "open"}
+        for k in ("project", "agent"):
+            if getattr(args, k):
+                q[k] = getattr(args, k)
+        res = call("GET", "/api/work?" + urllib.parse.urlencode(q))
+        for w in res["items"]:
+            print(work_line(w))
+        if not res["items"]:
+            print("the work queue is empty" + ("" if args.all else " (open items; --all for finished ones)"))
+        return 0
+    if act == "add":
+        if not arg:
+            sys.exit("sb: sb work add \"title\"")
+        b = {"title": arg, "from": me()}
+        for k, v in (("project", args.project), ("agent", args.agent), ("priority", args.pri),
+                     ("status", args.status), ("detail", args.detail)):
+            if v is not None:
+                b[k] = v
+        print("added " + work_line(call("POST", "/api/work", b)))
+        return 0
+    if not arg or not arg.lstrip("#").isdigit():
+        sys.exit(f"sb: sb work {act} <item number>")
+    n = arg.lstrip("#")
+    if act == "show":
+        w = call("GET", f"/api/work/{n}")
+        print(work_line(w) + ("\n" + w["detail"] if w["detail"] else ""))
+        return 0
+    if act == "rm":
+        call("DELETE", f"/api/work/{n}")
+        print(f"removed #{n}")
+        return 0
+    b = {"from": me()}
+    if act != "set":
+        b["status"] = {"done": "done", "start": "doing", "block": "blocked", "drop": "dropped"}[act]
+    for k, v in (("status", args.status), ("priority", args.pri), ("agent", args.agent), ("project", args.project),
+                 ("title", args.title), ("detail", args.detail), ("note", args.note)):
+        if v is not None:
+            b[k] = v
+    print("now " + work_line(call("PATCH", f"/api/work/{n}", b)))
+    return 0
+
+
+
 def _gib(mib):
     return "-" if mib is None else f"{mib / 1024:.1f}G"
+
+
+def _count(v):
+    """A host's jobs arrive as a list (owner's view) or as a count (an agent's filtered view)."""
+    return v if isinstance(v, int) else len(v or [])
 
 
 def fleet_lines(hosts):
@@ -204,7 +370,7 @@ def fleet_lines(hosts):
         rows.append((h["name"], reach, f"{load[0]:.1f}" if load else "-",
                      f"{c.get('threads', '-')} ({c.get('free_threads', '-')})" if c else "-",
                      f"{c.get('free_ram_gib', '-')}/{c.get('ram_total_gib', '-')}G" if c else "-",
-                     gpus, desk, f"{len(h.get('jobs') or [])}/{len(h.get('untracked') or [])}" if c else "-"))
+                     gpus, desk, f"{_count(h.get('jobs'))}/{_count(h.get('untracked'))}" if c else "-"))
     widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
     out = ["  ".join(str(v).ljust(widths[i]) for i, v in enumerate(r)).rstrip() for r in rows]
     for h in hosts:
@@ -220,20 +386,22 @@ def fleet_cmd(args):
         if args.json:
             print(json.dumps(res, indent=1))
             return 0
-        print("\n".join(fleet_lines(res["hosts"])))
-        if res.get("halt"):
+        if res.get("halt"):  # first, so no fault in the table below can hide it
             h = res["halt"]
             print(f"HALT raised by {h['by']} at {h['at']}: {h['reason'] or 'no reason'}  (hosts: {', '.join(h['hosts']) or '-'}"
                   + (f"; still pending: {', '.join(h['pending'])}" if h.get("pending") else "") + ")")
+        print("\n".join(fleet_lines(res["hosts"])))
         pl = res.get("placers") or {}
         wb = pl.get("workboard")
         if wb and not wb.get("error"):
             open_jobs = wb.get("jobs") or []
             print(f"gpu-workboard: {len(wb.get('cards') or [])} cards, {len(open_jobs)} open lease(s)/queued"
+                  + (f"; {len(wb['preempted'])} preempted earlier (history, holding nothing)" if wb.get("preempted") else "")
                   + ("; cpu-run advisor on" if pl.get("cpu_run") else ""))
             for j in open_jobs[:8]:
                 print(f"   {j['id']}  {j['status']:<10} {j.get('project') or '-'}/{j.get('label') or '-'}  {j.get('host') or '-'}"
-                      + (f"  {j['reason']}" if j.get("reason") else ""))
+                      + (f"  {j['reason']}" if j.get("reason") else "")
+                      + (f"  IDLE {j['idle']['idle_min']}m, standing {j['idle']['standing']:.0%}" if j.get("idle") else ""))
         elif pl.get("cpu_run"):
             print("cpu-run advisor on")
         if not res["config"]["exists"]:
@@ -305,13 +473,15 @@ def _job_line(j):
 
 
 def run_cmd(args):
-    argv = [a for a in args.command if a != "--"] if args.command and args.command[0] == "--" else args.command
+    argv = args.command[1:] if args.command and args.command[0] == "--" else args.command  # only the separator
     if not argv:
         sys.exit("sb: sb run --name NAME [...] -- command args...")
     b = {"name": args.name, "argv": argv, "cwd": args.cwd or os.getcwd(), "threads": args.threads,
          "mem_mib": int(args.mem * 1024), "hours": args.hours, "host": args.host, "agent": me()}
     if args.gpu:
         b["gpu_mib"] = int(args.gpu * 1024)
+    if args.gpu_uuid:
+        b["gpu_uuid"] = args.gpu_uuid
     if args.project:
         b["project"] = args.project
     b["lane"], b["protected"] = args.lane, args.protected
@@ -373,10 +543,11 @@ def adopt_cmd(args):
 
 
 def inbox_cmd(args):
-    if args.action == "done":
+    if args.action in ("done", "ignore"):
         if not args.arg:
-            sys.exit("sb: sb inbox done <id> [\"answer\"]")
-        r = call("POST", f"/api/inbox/{args.arg}/done", {"answer": args.answer or "", "from": me()})
+            sys.exit(f"sb: sb inbox {args.action} <id>" + (' ["answer"]' if args.action == "done" else ""))
+        r = call("POST", f"/api/inbox/{args.arg}/done", {"answer": args.answer or "", "from": me(),
+                                                         "quiet": args.action == "ignore"})
         print(f"{r['id']}: {r['kind']} {r['state']}" + (f" ({r['answer']})" if r.get("answer") else ""))
         return 0
     res = call("GET", "/api/inbox" + (f"?project={urllib.parse.quote(args.project)}" if args.project else ""))
@@ -440,20 +611,71 @@ def main():
     rl.add_argument("agent")
     rl.add_argument("--model")
     rl.add_argument("--effort")
+    rl.add_argument("--provider", help="move to another CLI (claude, codex, gemini, hermes, antigravity): a new "
+                                       "conversation, given a carry-over note")
+    rl.add_argument("--account")
     rl.add_argument("--confirm", action="store_true")
+    hp = sub.add_parser("helper")
+    hp.add_argument("task")
+    hp.add_argument("--minutes", type=int, default=10)
+    hp.add_argument("--model")
+    sub.add_parser("helpers")
     sa = sub.add_parser("subagents")
     sa.add_argument("--model")
     sa.add_argument("--hours", type=float, default=72)
     sa.add_argument("--agent")
     sa.add_argument("--limit", type=int, default=15)
     cl = sub.add_parser("clear")
-    cl.add_argument("agent", nargs="?", default="desk")
+    cl.add_argument("agent")
     cx = sub.add_parser("context")
     cx.add_argument("agent", nargs="?")
     cx.add_argument("--project")
     cx.add_argument("--n", type=int, default=12)
     cx.add_argument("--tools", action="store_true")
     cx.add_argument("--search")
+    cx.add_argument("--notes", type=int, default=12)
+    rd = sub.add_parser("reads")
+    rd.add_argument("project")
+    rd.add_argument("others", nargs="*")
+    rd.add_argument("--none", action="store_true")
+    rd.add_argument("--quiet", action="store_true", help="do not message the project's agents about the change")
+    ou = sub.add_parser("outside")
+    ou.add_argument("project")
+    ou.add_argument("--read", choices=["on", "off"])
+    ou.add_argument("--write", choices=["on", "off"])
+    ou.add_argument("--quiet", action="store_true", help="do not message the project's agents about the change")
+    wk = sub.add_parser("wiki", help="a project's live wiki: goals, last deliverable, nodes, sessions")
+    wk.add_argument("project", nargs="?")
+    wk.add_argument("--all", action="store_true", help="one line per project")
+    wk.add_argument("--json", action="store_true")
+    nd = sub.add_parser("nodes", help="a project's seats (lead, architect, tasker, janitor); --set changes one")
+    nd.add_argument("project", nargs="?")
+    nd.add_argument("--set", metavar="ROLE")
+    nd.add_argument("--model")
+    nd.add_argument("--provider")
+    nd.add_argument("--agent", help="put this agent in the seat ('' lets the seat fill itself)")
+    nd.add_argument("--brief", metavar="ROLE", help="print what this seat is told on a clean start")
+    nd.add_argument("--fold", action="store_true", help="retire the agents outside the seats; conversations go to memory, work to the lead")
+    nd.add_argument("--pickup", metavar="ROLE", help="pick the seat back up: its session if used in the last 38 h, else a clean start")
+    mm = sub.add_parser("memory")
+    mm.add_argument("entry", nargs="?", type=int)
+    mm.add_argument("--project")
+    mm.add_argument("--n", type=int, default=8)
+    mm.add_argument("--tail", type=int, default=0)
+    mm.add_argument("--usage", action="store_true")
+    mm.add_argument("--on", action="store_true")
+    mm.add_argument("--off", action="store_true")
+    mm.add_argument("--cap", type=int)
+    mm.add_argument("--model")
+    mm.add_argument("--set", dest="set_file")
+    mm.add_argument("--restore", nargs="?", type=int, const=0)
+    mm.add_argument("--versions", action="store_true")
+    mm.add_argument("--at", type=int, default=0)
+    mm.add_argument("--around", type=int, default=2)
+    mm.add_argument("--idle", type=float)
+    rt = sub.add_parser("retention")
+    rt.add_argument("--run", action="store_true")
+    rt.add_argument("--set", dest="pairs", nargs="+", default=[])
     no = sub.add_parser("note")
     no.add_argument("text")
     no.add_argument("--project")
@@ -466,21 +688,32 @@ def main():
     nt = sub.add_parser("notify")
     nt.add_argument("text")
     nt.add_argument("--info", action="store_true")
-    ib = sub.add_parser("inbox")
-    ib.add_argument("action", nargs="?", default="list", choices=["list", "done"])
-    ib.add_argument("arg", nargs="?", help="the item id (done)")
-    ib.add_argument("answer", nargs="?", help="the answer (done); none dismisses or acknowledges")
-    ib.add_argument("--project")
-    ib.add_argument("--json", action="store_true")
-    a = sub.add_parser("ask")
-    a.add_argument("question")
-    a.add_argument("--options", default="")
-    a.add_argument("--project")
-    r = sub.add_parser("reply")
-    r.add_argument("turn")
-    r.add_argument("text")
-    st = sub.add_parser("status")
-    st.add_argument("id")
+    nt.add_argument("--idem", help="reuse this key when retrying the same notification")
+    bc = sub.add_parser("broadcast")
+    bc.add_argument("text")
+    bc.add_argument("--project")
+    bc.add_argument("--agents", help="comma-separated agent ids instead of every running agent")
+    bc.add_argument("--now", action="store_true", help="interrupt agents that are working so it lands now")
+    wu = sub.add_parser("wrapup")
+    wu.add_argument("text", nargs="?", default="")
+    wu.add_argument("--project")
+    wu.add_argument("--close", action="store_true", help="exit each terminal once it has reported")
+    wu.add_argument("--now", action="store_true")
+    br = sub.add_parser("brief")
+    br.add_argument("--hours", type=float, default=24)
+    br.add_argument("--json", action="store_true")
+    wk = sub.add_parser("work")
+    wk.add_argument("action", nargs="?", default="list",
+                    choices=["list", "add", "done", "start", "block", "drop", "set", "rm", "show"])
+    wk.add_argument("arg", nargs="?", help="the title (add) or the item number")
+    wk.add_argument("--project")
+    wk.add_argument("--agent")
+    wk.add_argument("--pri", type=int)
+    wk.add_argument("--status")
+    wk.add_argument("--title")
+    wk.add_argument("--detail")
+    wk.add_argument("--note")
+    wk.add_argument("--all", action="store_true")
     fl = sub.add_parser("fleet")
     fl.add_argument("action", nargs="?", default="list", choices=["list", "check", "show", "add-host", "wsl-keepalive"])
     fl.add_argument("arg", nargs="?", help="host name (show, add-host) or WSL distro (wsl-keepalive)")
@@ -503,10 +736,11 @@ def main():
     rn.add_argument("--threads", type=int, default=1)
     rn.add_argument("--mem", type=float, default=2.0, help="GiB")
     rn.add_argument("--gpu", type=float, help="VRAM in GiB")
+    rn.add_argument("--gpu-uuid", help="pin to this card: passed unchanged to the gpu-workboard's submit (needs --gpu)")
     rn.add_argument("--hours", type=float, default=12.0)
     rn.add_argument("--cwd")
     rn.add_argument("--project")
-    rn.add_argument("--lane", choices=["batch", "interactive"], default="batch")
+    rn.add_argument("--lane", choices=["batch", "interactive"], default=None, help="default batch; a priority project's jobs default to interactive")
     rn.add_argument("--protected", action="store_true", help="opt out of GPU checkpoint preemption (owner's call)")
     rn.add_argument("command", nargs=argparse.REMAINDER)
     jb = sub.add_parser("jobs")
@@ -528,6 +762,21 @@ def main():
     ad.add_argument("--threads", type=int, default=0)
     ad.add_argument("--mem", type=float, default=0.0)
     ad.add_argument("--gpu", type=float)
+    ib = sub.add_parser("inbox")
+    ib.add_argument("action", nargs="?", default="list", choices=["list", "done", "ignore"])
+    ib.add_argument("arg", nargs="?", help="the item id (done, ignore)")
+    ib.add_argument("answer", nargs="?", help="the answer (done); none dismisses or acknowledges; ignore tells the agent nothing")
+    ib.add_argument("--project")
+    ib.add_argument("--json", action="store_true")
+    a = sub.add_parser("ask")
+    a.add_argument("question")
+    a.add_argument("--options", default="")
+    a.add_argument("--project")
+    r = sub.add_parser("reply")
+    r.add_argument("turn")
+    r.add_argument("text")
+    st = sub.add_parser("status")
+    st.add_argument("id")
     args = ap.parse_args()
     if args.cmd == "setup":
         return setup()
@@ -585,11 +834,19 @@ def main():
             "new agent on new project" if res["created_project"] else "new agent")
         print(f"{a['id']} on {a['project']} ({how}); open: [[open:{a['project']}/{a['id']}]]")
     elif args.cmd == "relaunch":
-        b = {k: getattr(args, k) for k in ("model", "effort") if getattr(args, k) is not None}
+        b = {k: getattr(args, k) for k in ("model", "effort", "provider", "account") if getattr(args, k) is not None}
         a = call("POST", f"/api/agents/{args.agent}/relaunch", dict(b, confirm=args.confirm))
-        how = "next turn" if a["mode"] == "managed" else "relaunching on the same session"
+        how = "next turn" if a["mode"] == "managed" else (f"moving to {args.provider} (a new conversation)"
+                                                          if args.provider else "relaunching on the same session")
         print(f"{a['id']}: {how} (model {b.get('model') or a['model'] or 'default'}); "
               f"open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "helper":
+        r = call("POST", "/api/helpers", {"task": args.task, "minutes": args.minutes, "model": args.model, "from": me()})
+        print(f"helper {r['helper']} ({r['model']}) until {r['deadline']}; its result comes back to you as a message")
+    elif args.cmd == "helpers":
+        for h in call("GET", f"/api/helpers?parent={urllib.parse.quote(me())}")["helpers"]:
+            print(f"{h['id']:<24} {h['state']:<9} {h['model']:<18} until {h['deadline'][11:16]}Z  "
+                  f"{(h['result'] or ' '.join(h['task'].split())[:60])}")
     elif args.cmd == "subagents":
         q = {"hours": args.hours, "limit": args.limit}
         q.update({k: getattr(args, k) for k in ("model", "agent") if getattr(args, k)})
@@ -606,6 +863,35 @@ def main():
     elif args.cmd == "clear":
         a = call("POST", f"/api/agents/{args.agent}/clear", {})
         print(f"{a['id']} cleared; its next message starts a new conversation")
+    elif args.cmd == "reads":
+        if args.others or args.none:
+            res = call("POST", f"/api/projects/{args.project}/reads", {"reads": [] if args.none else args.others,
+                                                                       "tell": not args.quiet})
+            print(f"{res['project']} may read: {', '.join(res['reads']) or 'no other project'}"
+                  + (f"  (told: {', '.join(res['told'])})" if res["told"] else ""))
+            for g in res["grants"]:
+                print(f"  {g['id']}: {', '.join(g['folders']) or 'no working folder known'}")
+        else:
+            p = call("GET", f"/api/projects/{args.project}")
+            p = p.get("project") or p
+            print(f"{args.project} may read: " + ("every project (outside read access)" if p.get("outside_read") else
+                                                   ', '.join(p.get('reads') or []) or 'no other project')
+                  + ("; may message other projects' leads (outside write access)" if p.get("outside_write") else
+                     "; may not message other projects"))
+    elif args.cmd == "outside":
+        onoff = lambda v: "on" if v else "off"  # noqa: E731
+        if args.read or args.write:
+            res = call("POST", f"/api/projects/{args.project}/outside",
+                       {"read": None if args.read is None else args.read == "on",
+                        "write": None if args.write is None else args.write == "on", "tell": not args.quiet})
+            print(f"{res['project']} outside its folder: read {onoff(res['read'])}, write {onoff(res['write'])}"
+                  + (f"  (relaunched: {', '.join(res['relaunched'])})" if res["relaunched"] else "")
+                  + (f"  (busy, takes it on next start: {', '.join(res['next_start'])})" if res["next_start"] else ""))
+        else:
+            p = call("GET", f"/api/projects/{args.project}")
+            p = p.get("project") or p
+            print(f"{args.project} outside its folder: read {onoff(p.get('outside_read'))}, "
+                  f"write {onoff(p.get('outside_write'))}")
     elif args.cmd == "context":
         q = {"from": me()}
         if args.agent:
@@ -614,6 +900,7 @@ def main():
             return 0
         if args.search:
             q["q"] = args.search
+        q["notes"] = args.notes
         base = f"/api/projects/{args.project}/context" if args.project else "/api/context"
         res = call("GET", f"{base}?{urllib.parse.urlencode(q)}")
         if args.search:
@@ -622,7 +909,10 @@ def main():
             if not res["hits"]:
                 print(f"nothing on project {res['project']} mentions that")
             return 0
-        print(f"PROJECT {res['project']}")
+        print(f"PROJECT {res['project']}" + (" (read-only for you: look, never send, note or change anything there)"
+                                             if res.get("read_only") else "")
+              + (f"\nmay read (read-only): {', '.join(res['reads'])}  (sb context --project NAME)"
+                 if res.get("reads") and not res.get("read_only") else ""))
         for a in res["agents"]:
             fork = f", fork of {a['forked_from']}" if a["forked_from"] else ""
             print(f"\n{a['id']}{' (you)' if a['you'] else ''} - {a['title']} ({a['provider']} {a['model'] or ''}, "
@@ -632,9 +922,81 @@ def main():
             if a["said"]:
                 print(f"  last said:  {a['said']}")
         if res["notes"]:
-            print("\nNOTES")
+            older = (res.get("notes_total") or 0) - len(res["notes"])
+            print("\nNOTES" + (f" (the newest {len(res['notes'])}; {older} older: sb context --notes N)" if older > 0 else ""))
             for n in res["notes"]:
                 print(f"  [{n['created_at'][:16]}] {n['agent']}: {n['text']}")
+        mem = res.get("memory")
+        if mem:
+            print(f"\nMEMORY: {mem['sessions']} ended conversation{'' if mem['sessions'] == 1 else 's'} on record"
+                  + (f", running memory updated {mem['updated_at'][:16]}" if mem.get("updated_at") else "")
+                  + "  (sb memory" + (f" --project {res['project']}" if res.get("read_only") else "") + ")")
+    elif args.cmd == "memory":
+        return memory_cmd(args)
+    elif args.cmd in ("wiki", "nodes"):
+        frm = urllib.parse.urlencode({"from": me()})
+        if args.cmd == "wiki" and args.all:
+            v = call("GET", "/api/wiki")
+            if args.json:
+                print(json.dumps(v, indent=1))
+                return 0
+            for r in v["projects"]:
+                seats = " ".join(f"{k}={a or '-'}" for k, a in r["seats"].items())
+                print(f"{r['project']:<28} {(r['last_activity'] or '-')[:16]:<17} {seats}"
+                      + (f"  +{r['extras']} outside seats" if r["extras"] else "")
+                      + (f"  WAITING ON OWNER x{r['waiting_on_owner']}" if r["waiting_on_owner"] else ""))
+            return 0
+        pid = args.project or (call("GET", f"/api/context?{frm}&notes=0")["project"])
+        if args.cmd == "wiki":
+            v = call("GET", f"/api/projects/{pid}/wiki?{frm}" + ("" if args.json else "&format=md"))
+            print(json.dumps(v, indent=1) if args.json else v["markdown"], end="" if not args.json else "\n")
+            return 0
+        if args.brief:
+            prov = f"&provider={args.provider}" if args.provider else ""
+            print(call("GET", f"/api/projects/{pid}/brief?{frm}&role={args.brief}{prov}")["brief"], end="")
+            return 0
+        if args.fold:
+            r = call("POST", f"/api/projects/{pid}/nodes/fold", {})
+            for f in r["folded"]:
+                print(f"folded {f['agent']} (session {f['session_id'] or '-'}; {f['work_to_lead']} open work item(s) to {r['lead'] or 'nobody'})")
+            if r["left_busy"]:
+                print("left alone, busy: " + ", ".join(r["left_busy"]))
+            if not r["folded"] and not r["left_busy"]:
+                print("nothing outside the seats")
+            return 0
+        if args.pickup:
+            r = call("POST", f"/api/projects/{pid}/nodes/{args.pickup}/pickup", {})
+            print(f"{args.pickup}: {r['action']} {r['agent']}" + (f" on {r['provider']}/{r['account']} {r.get('model') or 'default model'}"
+                                                                   + (" (its own account type had no room)" if r.get("moved") else "")
+                                                                   if r["action"] == "started" else ""))
+            return 0
+        if args.set:
+            body = {k: v for k, v in (("model", args.model), ("provider", args.provider), ("agent", args.agent)) if v is not None}
+            v = call("POST", f"/api/projects/{pid}/nodes/{args.set}", body)
+        else:
+            v = call("GET", f"/api/projects/{pid}/nodes?{frm}")
+        for n in v["seats"]:
+            who = f"{n['agent']} ({n['running_provider']}/{n['account']} {n['running_model']}, idle {n['idle_hours']} h)" if n["agent"] else "nobody"
+            print(f"{n['title']:<18} {n['provider']} {n['model']:<18} {who}  [{n['state']}: {n['pickup']}]")
+        print("Live Wiki          kept by Switchboard: sb wiki " + pid)
+        for x in v["extras"]:
+            print(f"outside the seats  {x['agent']} ({x['model']})")
+        return 0
+    elif args.cmd == "retention":
+        if args.pairs:
+            call("POST", "/api/settings", {"retention": dict(p.split("=", 1) for p in args.pairs)})
+        if args.run:
+            print("removed: " + (json.dumps(call("POST", "/api/retention/run", {})["removed"]) or "{}"))
+        v = call("GET", "/api/retention")
+        print(f"KEPT (clean-up every {v['every_hours']} h; 0 = rule off)")
+        for k, val in v["settings"].items():
+            print(f"  {k:20} {val}")
+        last = v.get("last") or {}
+        print(f"LAST CLEAN-UP: {last.get('at') or 'not yet'}  removed {json.dumps(last.get('removed') or {})}")
+        print(f"NOW: hub.db {v['sizes']['hub_db_bytes'] / 1e6:.1f} MB; rows " +
+              ", ".join(f"{k} {n}" for k, n in v["sizes"]["rows"].items()))
+        print("     folders " + ", ".join(f"{k} {d['files']} files {d['bytes'] / 1e6:.1f} MB"
+                                           for k, d in v["sizes"]["folders"].items()))
     elif args.cmd == "note":
         call("POST", "/api/notes", {"text": args.text, "from": me(), "project": args.project})
         print("noted for the project's agents")
@@ -644,6 +1006,8 @@ def main():
                                            "idem": str(uuid.uuid4())})
         a = res["agent"]
         print(f"{a['id']} on {a['project']}{' (forked)' if res['forked'] else ''}; open: [[open:{a['project']}/{a['id']}]]")
+    elif args.cmd == "work":
+        return work(args)
     elif args.cmd == "fleet":
         return fleet_cmd(args)
     elif args.cmd == "halt":
@@ -659,8 +1023,9 @@ def main():
     elif args.cmd == "adopt":
         return adopt_cmd(args)
     elif args.cmd == "notify":
-        n = call("POST", "/api/notifications", {"agent": me(), "text": args.text, "level": "info" if args.info else "need"})
-        print(f"{n['id']} in the owner's Switchboard inbox")
+        n = call("POST", "/api/notifications", {"agent": me(), "text": args.text,
+                 "level": "info" if args.info else "need", "idem": args.idem or 'notify:' + uuid.uuid4().hex}, retries=4)
+        print(f"{n['id']} saved for the owner; inbox: {HUB}/#/inbox")
     elif args.cmd == "inbox":
         return inbox_cmd(args)
     elif args.cmd == "ask":
