@@ -26,6 +26,9 @@
   sb trust [--hours 168]            owner: per agent, the claims the hub checked (jobs and files a message named)
                                     and how many did not hold; watched agents are asked "are you sure?"
   sb whoami                         who you are here and what your project may reach: your launch note, again
+  sb wiki [project] [--all]         a project's live wiki: goals, last deliverable, seats, sessions (--all: every project)
+  sb nodes [project] [--set ROLE --agent A --model M --provider P] [--pickup ROLE] [--reserve A] [--fold]
+                                    a project's seats (lead, architect, tasker, janitor) and who holds each
   sb context [agent] [--n N]        your project's agents (last ask/reply) + shared notes; or one agent's recent talk
   sb context --search "words"       search every conversation on your project
   sb context --project P ...        the same for a project the owner let yours read (read-only)

@@ -35,13 +35,18 @@ browser ──HTTP/WebSocket──▶ hub (hub.py) ──unix socket──▶ pt
 | `boardwatch.py`, `leasedecay.py` | optional, with a GPU workboard: page when a host's cards go stale, and release leases that sit idle |
 | `memory.py` | project memory: an outline per ended conversation and a short running record, each line citing its source |
 | `retention.py` | what the hub keeps and for how long; one sweep at start and every few hours |
-| `autoclear.py` | clears a Claude agent's context at a natural pause once it passes its model's limit, instead of compacting |
+| `autoclear.py` | clears a Claude, Codex or Antigravity agent's context at a natural pause once it passes its model's limit, instead of compacting |
 | `handoff.py`, `accounts.py` | moves a Claude agent to another account before (or when) its account runs out; limits come from an optional usage cache |
 | `helpers.py` | temporary helpers: one narrow task on a smaller model, with a deadline |
-| `nodes.py` | the same seats on every project (lead, architect, tasker, janitor) and the project wiki |
+| `nodes.py` | the same seats on every project (lead, architect, tasker, janitor), the lead / illustrator / architect marks the owner pins on agents, and the project wiki |
 | `insights.py`, `trace.py`, `team.py` | the Insights page, one agent's context view, a project's team view |
 | `rewind.py` | owner tools on one agent's history: memory files and rewinding to before a message |
-| `antigravity.py` | Google Antigravity CLI sessions, read as transcripts |
+| `antigravity.py` | Google Antigravity CLI sessions, read as transcripts; its usage and quota readings |
+| `stuck.py` | an Antigravity terminal at rest on a compact request or an API error: typed past, relaunched, or reported |
+| `claims.py` | `sb attest` and claim checks: job ids and file paths an agent names are checked before "done" is passed on |
+| `ghost.py` | ghost agents: sealed to their own task, erased when removed |
+| `kill.py` | removing a project entirely: agents, conversations and hub records; files stay |
+| `colab.py` | Google Colab compute units on the Antigravity account card, read from the `colab` CLI |
 
 ## Accounts and providers
 

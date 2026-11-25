@@ -181,6 +181,10 @@ function projectAgents(pid) {
   return [...S.agents.values()].filter((a) => a.project === pid)
     .sort((x, y) => { const i = order.indexOf(x.id), j = order.indexOf(y.id); return (i < 0 ? 1e9 : i) - (j < 0 ? 1e9 : j); });
 }
+function normLimit(l) {
+  const used = l.used != null ? l.used : (l.left != null ? 100 - l.left : null);
+  return { key: l.key || l.label, label: LIMIT_LABEL[l.label] || l.label || LIMIT_LABEL[l.key] || l.key, used, resets: l.resets };
+}
 function accountAgentIds(acc) {
   const ids = Array.isArray(acc.agents) ? acc.agents : [...S.agents.values()].filter((a) => a.account === acc.name).map((a) => a.id);
   return ids.filter((id) => S.agents.has(id));          // the Switchboard desk is not shown as an agent

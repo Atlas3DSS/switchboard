@@ -1,65 +1,66 @@
 # Switchboard
 
-**One local page for all your projects and all your AI coding agents.**
+A local web page that runs your AI coding agents as terminals, grouped by project, on your own machine.
 
-Switchboard runs your agents (Claude Code, Codex, Gemini CLI, Hermes Agent, Antigravity CLI, or its own built-in
-agent for any OpenAI-compatible API) as real terminals in your browser, grouped by project. Agents can message each other, read each other's
-context on demand, and ask you questions without you juggling a dozen terminal tabs.
+Switchboard starts each agent as the vendor's own interactive CLI (Claude Code, Codex, Gemini CLI, Hermes Agent,
+Antigravity CLI) or as its built-in agent for any OpenAI-compatible API. Agents on a project can message each other,
+read each other's context on demand, and file questions for you. The hub listens on `127.0.0.1` only and keeps its
+state in `~/.local/state/switchboard`.
 
-![Overview: the work queue, your accounts, project cards with their agents, and the fleet](docs/screenshots/overview.png)
+![Overview: the work queue, accounts with their limits, and project cards with their agents](docs/screenshots/overview.png)
 
-- **Bring the subscriptions and keys you already have.** Claude Pro/Max, ChatGPT Plus/Pro, a Google account,
-  Anthropic / OpenAI / Gemini / OpenRouter API keys, or any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio,
-  a company gateway). A setup page asks what you have the first time you open it.
-- **Agents are real terminals.** Each agent is the vendor's own interactive CLI (or the built-in agent) in a
-  pseudo-terminal that outlives the hub and your browser tab. Up to four side by side, full keyboard, image paste.
-- **Messages land exactly once.** `sb send <agent> "text"` types into that agent's terminal only when it's idle
-  with an empty input box (background jobs it left running don't count), then confirms the message from the session
-  transcript. It never types twice. Messages that arrive while an agent works go in together, as one batch that
-  names each sender (every message in full in a private file), and if the oldest has waited 5 minutes the agent
-  gets one Esc so the batch can land. A queue that doesn't move says why: paused, mid-turn, a draft in its input
-  box, or a choice on screen that only you can answer (never answered for you).
-- **Shared context, pulled on demand.** Agents on a project can run `sb context` to see what the others were
-  last asked and said, search their conversations, and leave notes. Nothing gets pushed into anyone's context.
-- **Projects are islands.** An agent acts inside its own project: it messages, reads and launches there and
-  nowhere else, and the hub knows who is calling from the calling process, not from what it claims. You open the
-  door per project (`sb reads`, `sb outside`); agents of the project named `switchboard` are yours and act anywhere.
-- **One work queue.** A master list on the overview that you and every agent edit (`sb work`), with priority,
-  status, owner agent and project.
-- **A memory per project.** When a conversation is cleared, goes quiet or its agent is removed, a small model
-  writes an outline of it and updates the project's running record. Every line cites the messages it came from,
-  and the hub throws away anything whose quote is not in the transcript (`sb memory`).
-- **See where the tokens go.** Insights (usage, cost, tools, activity per agent and project), a context view per
-  agent, and a team view of the traffic between a project's agents and you.
-- **Agents that keep going.** A Claude agent is cleared at a natural pause when its context passes its model's
-  limit, moved to another of your accounts before a usage limit stops it, and can hand one narrow task to a
-  temporary helper on a smaller model (`sb helper`).
-- **On your phone, and only your phone.** An optional gate lets exactly one paired phone in over HTTPS, through
-  Tailscale or your own domain. Scan a QR code to pair; pairing another phone signs the old one out.
-  [docs/PHONE.md](docs/PHONE.md)
-- **An inbox for you.** Agents ask decisions (`sb ask`) and page you (`sb notify`). A terminal stuck on a
-  permission prompt shows up there too.
+What it does:
 
-Everything stays on your machine: the hub listens on `127.0.0.1` only and keeps its state in
-`~/.local/state/switchboard`.
+- **Accounts you already have.** Claude Pro/Max, ChatGPT Plus/Pro, a Google account or Google AI plan, API keys for
+  Anthropic / OpenAI / Gemini / OpenRouter, or any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio, a company
+  gateway). Setup asks what you have on first run.
+- **Agents are terminals.** Each agent runs in a pseudo-terminal that outlives the hub and the browser tab. One to
+  four panes side by side, full keyboard, image paste.
+- **Messages are typed once.** `sb send <agent> "text"` types into the agent's terminal only when it is idle with an
+  empty input box, then confirms the message from the session transcript. Messages that arrive while an agent works
+  are delivered together as one batch that names each sender. A queue that is not moving says why (paused, mid-turn,
+  a draft in the input box, or a choice on screen that only you can answer).
+- **Roles you can see and change.** Each project has seats (lead, architect, tasker, janitor). Three icons on every
+  agent's pane pin or unpin it as the project's lead, illustrator or architect; a message sent to a project goes to
+  its lead.
+- **Projects are separate.** An agent messages, reads and launches inside its own project. The hub identifies the
+  caller from the calling process, not from what it claims. You open access per project (`sb reads`, `sb outside`);
+  agents of the project named `switchboard` act for you across all projects.
+- **Shared context on demand.** `sb context` shows what the other agents on the project were last asked and said,
+  searches their conversations and holds short notes. `sb wiki` gives the project's goals, last deliverable, seats
+  and sessions on one page. Nothing is pushed into an agent's context.
+- **A work queue.** One list on the overview that you and every agent edit (`sb work`), with priority, status, owner
+  and project. An item can carry a check command that must pass before it can be marked done.
+- **Project memory.** When a conversation is cleared, goes quiet or its agent is removed, a small model writes an
+  outline of it and updates the project's record. Every line cites the messages it came from (`sb memory`).
+- **Checked claims.** `sb attest` has the hub check the jobs and files an agent names before it reports work as
+  done. An agent with the attest box ticked gets "Are you sure?" when a claim does not hold.
+- **Agents that keep going.** A conversation is cleared at a pause when its context passes its model's limit; an
+  agent is moved to another of your accounts before a usage limit stops it; an Antigravity terminal stuck on a
+  compact request or an API error is recovered or reported.
+- **Fleet and jobs.** `sb run` places work on the machines the hub can reach, as bounded systemd units tracked under
+  the agent that launched them. `sb halt` stops tracked work everywhere.
+- **Inbox and phone.** Agents file decisions (`sb ask`) and notices (`sb notify`); a terminal waiting on a
+  permission prompt appears there too. An optional gate lets one paired phone in over HTTPS
+  ([docs/PHONE.md](docs/PHONE.md)).
 
-| A project with two agents side by side | Agents ask you things in the Inbox |
+| A project: two agents side by side, with the lead, illustration and architect marks on tabs and panes | The inbox: questions with one-click answers |
 |---|---|
-| ![Two agent terminals on one project, each on a different account and model](docs/screenshots/project.png) | ![Inbox: an agent's question with one-click answers, and a need to acknowledge](docs/screenshots/inbox.png) |
+| ![Two agent terminals on one project; the tabs show which agent is lead, illustrator and architect](docs/screenshots/project.png) | ![Inbox: agents' questions grouped by project, with answer buttons](docs/screenshots/inbox.png) |
 
-| The fleet: hosts, jobs and untracked work | Insights: tokens, cost, tools and activity |
+| Projects with their seats, the fleet and tracked jobs | A project's team: who talked to whom |
 |---|---|
-| ![Fleet panel: three hosts with free threads, RAM and GPUs, and one untracked process](docs/screenshots/fleet.png) | ![Insights page: billed tokens, estimated cost, tool calls and per-agent cards](docs/screenshots/insights.png) |
+| ![Project cards with seats and marked agents, three hosts with free threads, RAM and GPUs, and four running jobs](docs/screenshots/fleet.png) | ![Team view: the agent network, message counts and a cross-agent timeline](docs/screenshots/team.png) |
 
-| A project's team: who talked to whom | First-run setup |
+| Insights: tokens, cost, tools and activity | First-run setup |
 |---|---|
-| ![Team view: the agent network, message counts and a cross-agent timeline](docs/screenshots/team.png) | ![Setup page: subscriptions detected on this machine, plus an Ollama endpoint tested and an OpenRouter key being added](docs/screenshots/setup.png) |
+| ![Insights page: billed tokens, estimated cost, tool calls and per-agent cards](docs/screenshots/insights.png) | ![Setup page: subscriptions detected on this machine and API endpoints](docs/screenshots/setup.png) |
 
 | Hermes Agent next to the built-in agent | Pair your phone with a QR code |
 |---|---|
 | ![A Hermes Agent terminal and a built-in agent terminal side by side on one project](docs/screenshots/hermes.png) | ![The Phone dialog showing a one-time QR code that pairs exactly one phone](docs/screenshots/phone-pair.png) |
 
-Every screenshot here is a demo instance with made-up projects, hosts and conversations.
+Every screenshot is a demo instance with made-up projects, hosts and conversations.
 
 ## Quick start
 
@@ -114,15 +115,29 @@ No systemd (e.g. WSL without it)? Run `./install.sh --no-service`, then start th
 
 ### The page
 
-- **Overview** (`#/`): the work queue, your accounts with the agents on each, a card per project, and the fleet.
-  `+ Project` makes a project with its own folder in your workspace; `+ Agent` on a card adds an agent (pick the
-  account, model, folder, or a session id to resume). Nothing launches until you open the agent or send to it.
-- **A project page**: its agents as tabs and 1 to 4 terminal panes. The control bar changes the focused agent's
-  account, model or project, pauses its queue, stops it, or removes it. Buttons along the top:
-  **Summon** (a side agent beside the focused one, optionally a fork of its whole conversation), **+ Shell**,
-  **Read out / Write out** (let this project read or write outside its folder), **Team**, **Insights**,
-  **Memory** (the project's memory files and conversation outlines; rewind an agent to before a message),
-  **Shared** (notes and what each agent last said), **Context** (what fills each agent's context) and **Sources**.
+- **Overview** (`#/`): the work queue, your accounts, a card per project, and the fleet.
+  - `+ Project` makes a project with its own folder in your workspace. `+ Agent` on a card adds an agent: pick the
+    account, model and folder, or give a session id to resume. Tick **Ghost** for an agent sealed to its own task:
+    it cannot read the project's context, memory or other agents, and every record of it is erased when you remove
+    it. Nothing launches until you open the agent or send to it.
+  - Each account card lists its agents and, when a usage reading exists, its limits and reset times.
+    **Move agents here** moves every agent of that type to the account and makes it the default for new ones.
+  - Each project card shows its seats. Click a filled seat to open its agent, an empty or stale one to start it from
+    the seat's brief. **Wiki** opens the project's live wiki. **Fold** retires the agents outside the seats; their
+    conversations go to the project's memory and stay resumable.
+- **A project page**: its agents as tabs (drag to reorder) and 1 to 4 terminal panes.
+  - Pane header: the agent picker, **✎** to rename the panel (no relaunch; the id other agents write to stays the
+    same; double-clicking a tab's name does the same), and three marks: crown for lead, brush for illustration,
+    compass for architect. Solid means you pinned it, a dashed outline means Switchboard chose that agent because
+    nobody is pinned. Click to pin or unpin. Pinning the lead changes where `sb send <project>` lands.
+  - **attest** on a pane makes that agent back any "done" with `sb attest`.
+  - **Context** shows what fills the agent's context, **Memory** its memory files and conversation outlines,
+    **Transcript** rewinds it to before one of its messages or edits an entry.
+  - The control bar changes the focused agent's account, model or project, pauses its queue, stops it, or removes it.
+  - Along the top: **Summon** (a side agent beside the focused one, optionally a fork of its whole conversation),
+    **+ Shell**, **Read out / Write out** (let this project read or write outside its folder), **Team**,
+    **Insights**, **Memory**, **Shared** (notes and what each agent last said), **Context**, **Sources**, and
+    **Kill project** (removes the project's agents, conversations and hub records; its files stay).
 - **Inbox** (top bar, or `#/inbox`): every open question (`sb ask`) and need (`sb notify`) agents filed for you,
   grouped by project. Answer, acknowledge, dismiss or ignore. A terminal stuck on a permission prompt shows up too.
 - **Insights** (top bar): usage across every agent, by day, project, model and tool.
@@ -139,7 +154,10 @@ sb send <agent|project> "text"     message an agent once (a project goes to its 
 sb context [agent] [--search w]    what the other agents on this project are doing / said
 sb note "text"                     leave a short note for the project's other agents
 sb memory [n] [--at M]             the project's running memory; one conversation's outline; a message in full
-sb work | sb work add "title" | sb work done <n>     the master work queue
+sb wiki                            the project's goals, last deliverable, seats and sessions
+sb whoami                          who you are here and what your project may reach
+sb attest --claim "..." [--job ID] [--file PATH]     have the hub check your evidence before you report done
+sb work | sb work add "title" [--check 'cmd'] | sb work done <n>     the master work queue
 sb ask "question" --options a,b    ask the owner a decision (the answer arrives as a message)
 sb notify "text" [--info]          put something in the owner's inbox
 sb summon <agent> "task" [--fork]  start a side agent beside another
@@ -163,6 +181,9 @@ sb reads PROJECT P2 ...            let PROJECT's agents read P2's context and fi
 sb outside PROJECT --read on|off --write on|off     let PROJECT read / write outside its folder
 sb sessions "words" / sb resume <id>   find and reopen a past Claude / Codex / built-in session
 sb dispatch <project> "task"       start a new agent on a project with one task
+sb nodes PROJECT [--set ROLE --agent A] [--pickup ROLE] [--fold]     a project's seats and who holds each
+sb trust [--require|--release AGENT]   claims the hub checked per agent; tick or untick an agent's attest box
+sb projects kill <project>         remove a project's agents, conversations and hub records (files stay)
 sb halt | sb unhalt                stop tracked jobs everywhere and keep them stopped
 sb memory --usage | --off | --cap N    what project memory costs, and its switches
 sb retention                       what the hub keeps and for how long
@@ -175,9 +196,10 @@ work across all the others.
 
 Three layers, each citing the one below: the project's memory (a short record, every line ending in its source), an
 outline per conversation (points under ASKED / DONE / DECIDED / OPEN, each quoting the messages it came from), and
-the transcript on disk. The outlines are written by a small Claude model (Haiku, no tools) through a Claude account,
-so it needs one; secrets are redacted before anything is sent; the cost is capped per day; and nothing is pushed to
-agents. They are told it exists and pull it with `sb memory`.
+the transcript on disk. The outlines are written by a small model with no tools: Claude Haiku through a Claude
+account, else a small Gemini model through the Antigravity CLI, else a small Codex model. Secrets are redacted before
+anything is sent, the cost is capped per day, and nothing is pushed to agents: they are told it exists and pull it
+with `sb memory`.
 
 ### Accounts that run out
 
@@ -185,7 +207,8 @@ If you have more than one Claude account, an agent whose account hits a usage li
 and told to carry on; both accounts must share transcripts (point their `projects/` folders at the same place).
 Switchboard can also move an agent *before* the limit if something tells it how full each account is: write
 `~/.cache/switchboard/usage.json` (format at the top of `switchboard/accounts.py`) and the limits appear on the
-account cards.
+account cards. Accounts listed as parked in the handoff settings are never picked automatically. An Antigravity
+account reads its limits from `agy` itself, and shows Google Colab compute units when the `colab` CLI is signed in.
 
 **The built-in agent** is a small terminal coding agent (`switchboard/agent.py`) for any OpenAI-compatible
 endpoint. It has four tools (run a shell command, read, write, and edit files) and asks before every command or edit
@@ -194,7 +217,8 @@ saved under `~/.local/state/switchboard/api-sessions/` and can be searched and r
 sessions.
 
 **Antigravity CLI** (`agy`) runs on a Google AI subscription. It has no system-prompt flag, so a new conversation
-opens with Switchboard's note; its conversations are read from `~/.gemini/antigravity-cli`.
+opens with Switchboard's note; its conversations are read from `~/.gemini/antigravity-cli`. A terminal whose turn
+ends asking for `/compact` gets it typed, and one whose turn dies on an API error is reported in the inbox.
 
 **Hermes Agent** runs as `hermes chat` with your own Hermes config (models, providers, skills). Switchboard passes
 its note in `HERMES_EPHEMERAL_SYSTEM_PROMPT` (sent with each call, never stored), finds the new session in
@@ -209,7 +233,8 @@ in `~/.config/switchboard/hosts.json`; this machine alone with no file), with fr
 to launch work: placed on a host that has room, run as a bounded systemd unit in its own slice, tracked under the
 agent that launched it (`sb jobs`, `sb stop`). `sb halt` stops tracked jobs and raises a flag that systemd itself
 honours, so timers and restart loops cannot bring work back until `sb unhalt`. A tiny job (one thread, no GPU, at
-most an hour) and jobs of projects you list under `jobs.priority_projects` go ahead of the queue. Heavy processes
+most an hour) and jobs of projects you list under `jobs.priority_projects` go ahead of the queue, in the order
+listed. After 20 minutes a job is booked at what it uses, not what it declared. Heavy processes
 that were not launched with `sb run` show up as untracked, with Adopt and Stop. Details: [docs/FLEET.md](docs/FLEET.md).
 
 ## Files
@@ -251,6 +276,7 @@ for t in tests/test_*.py; do python3 -m unittest tests.$(basename $t .py) || bre
 
 `tests.test_terminals` drives real ptys with a fake CLI and takes a couple of minutes; run it on its own. A few
 cases are skipped for now: they describe the earlier router chat and need rewriting for project isolation.
+`tests.test_placers` reads the CPUs really in use on the machine it runs on, so its pinning case can fail on a busy host.
 
 The browser checks drive a headless Chromium (set `CHROME=/path/to/chrome`, or `npx playwright install chromium`)
 against a test-mode hub whose agents run `tests/fake_cli.py`:
@@ -276,8 +302,9 @@ top of the file).
   message from the screen and doesn't record replies. Past-session search covers Claude Code, Codex and the built-in
   agent; `sb context` also covers Hermes.
 - Hermes Agent and Antigravity run in terminals only and can't be forked by Summon.
-- Project memory, auto-clear and account handoff are for Claude Code agents. The memory writer needs a Claude
-  account.
+- Auto-clear covers Claude Code, Codex and Antigravity agents. Account handoff is for Claude Code agents. The
+  memory writer needs a Claude account, the Antigravity CLI or Codex.
+- Claim checks (`sb attest`) verify job ids and file paths; they do not judge whether the work is correct.
 - Optional: if you run agents inside tmux, Switchboard also finds Claude and Codex sessions open there and lists
   them. It works without tmux.
 
