@@ -203,5 +203,148 @@ class RewindTests(Base):
             self.assertTrue(barrier.agent_may(method, path, "switchboard"), path)  # the owner's own project is not limited
 
 
+
+class EditTests(Base):
+    def test_edit_a_text_of_a_claude_record_and_the_whole_record(self):
+        sid = self.agent("a1", "alpha")
+        eid = self.end("a1")
+        before = self.hub.s.one("SELECT size FROM memory_sessions WHERE id=?", (eid,))["size"]
+        got = rewind.records(self.hub, "a1", sid, limit=50)
+        e = next(x for x in got["entries"] if x["text"].startswith("ask 2 of a1"))
+        rec = rewind.record(self.hub, "a1", sid, e["at"])
+        self.assertEqual([p["text"][:11] for p in rec["parts"]], ["ask 2 of a1"])
+        r = rewind.edit(self.hub, "a1", {"session": sid, "at": e["at"], "sig": rec["sig"],
+                                         "parts": {"0": "a much longer corrected ask, by the owner"}})
+        self.assertFalse(r["relaunch"])
+        texts = [x["text"] for x in rewind.records(self.hub, "a1", sid, limit=50)["entries"]]
+        self.assertIn("a much longer corrected ask, by the owner", texts)
+        self.assertFalse(any(t.startswith("ask 2 of a1") for t in texts))
+        self.assertTrue(any(t.startswith("reply 5 of a1") for t in texts))  # what follows is intact
+        self.assertEqual(self.hub.s.one("SELECT size FROM memory_sessions WHERE id=?", (eid,))["size"],
+                         os.path.getsize(self.path(sid)))
+        self.assertNotEqual(before, os.path.getsize(self.path(sid)))
+        with self.assertRaises(ValueError):  # read before the edit: stale
+            rewind.edit(self.hub, "a1", {"session": sid, "at": e["at"], "sig": rec["sig"], "parts": {"0": "x"}})
+        rec = rewind.record(self.hub, "a1", sid, e["at"])
+        raw = json.loads(rec["raw"])
+        raw["message"]["content"] = "replaced whole"
+        rewind.edit(self.hub, "a1", {"session": sid, "at": e["at"], "sig": rec["sig"], "raw": json.dumps(raw)})
+        self.assertIn("replaced whole", [x["text"] for x in rewind.records(self.hub, "a1", sid, limit=50)["entries"]])
+        with self.assertRaises(ValueError):  # not the start of a record
+            rewind.record(self.hub, "a1", sid, e["at"] + 3)
+        self.assertFalse(barrier.agent_may("POST", "/api/agents/a1/edit", "alpha"))
+        self.assertFalse(barrier.agent_may("GET", "/api/agents/a1/records", "alpha"))
+
+    def test_edit_an_outline(self):
+        self.agent("a1", "alpha")
+        eid = self.end("a1")
+        o = {"sections": [{"h": "What", "points": [{"t": "the owner's point", "m": [1]}]}]}
+        rewind.edit_outline(self.hub, eid, {"summary": "corrected", "outline": o})
+        got = memory.entry(self.hub, eid, "owner")
+        self.assertEqual((got["summary"], got["outline"]), ("corrected", o))
+        with self.assertRaises(ValueError):
+            rewind.edit_outline(self.hub, eid, {"outline": {"sections": [{"h": 1}]}})
+
+
+class AntigravityTests(Base):
+    """A conversation as agy keeps it: steps in conversations/<cid>.db, logs under brain/<cid>."""
+    def conv(self, aid="g1", turns=4):
+        from switchboard import antigravity as agy
+        import sqlite3
+        cid = str(uuid.uuid4())
+        home = os.path.join(self.tmp, "agy")
+        logs = os.path.join(home, "brain", cid, ".system_generated", "logs")
+        os.makedirs(logs)
+        os.makedirs(os.path.join(home, "conversations"), exist_ok=True)
+        db = sqlite3.connect(agy.db_for(cid, home))
+        db.executescript("CREATE TABLE steps(idx integer primary key, step_type integer, step_payload blob);"
+                         "CREATE TABLE gen_metadata(idx integer primary key, data blob, size integer default 0);"
+                         "CREATE TABLE executor_metadata(idx integer primary key, data blob);"
+                         "CREATE TABLE parent_references(idx integer primary key, data blob);"
+                         "CREATE TABLE battle_mode_infos(idx integer primary key, data blob);")
+        rows = []
+        for i in range(turns):
+            ask, say = f"ask {i} of {aid}".encode(), f"reply {i} of {aid}".encode()
+            db.execute("INSERT INTO steps VALUES(?,?,?)", (2 * i, 14, agy._build([
+                (1, 0, 14), (19, 2, agy._build([(2, 2, ask), (3, 2, agy._build([(1, 2, ask)]))]))])))
+            db.execute("INSERT INTO steps VALUES(?,?,?)", (2 * i + 1, 15, agy._build([
+                (1, 0, 15), (20, 2, agy._build([(1, 2, say), (8, 2, say)]))])))
+            db.execute("INSERT INTO gen_metadata(idx,data) VALUES(?,?)", (i, agy._build([(2, 2, bytes([2 * i + 1]))])))
+            rows.append({"step_index": 2 * i, "type": "USER_INPUT", "created_at": ts(2 * i),
+                         "content": f"<USER_REQUEST>\n{ask.decode()}\n</USER_REQUEST>"})
+            rows.append({"step_index": 2 * i + 1, "type": "PLANNER_RESPONSE", "created_at": ts(2 * i + 1),
+                         "content": say.decode()})
+        db.execute("INSERT INTO executor_metadata VALUES(0,?)", (agy._build([(1, 0, 4), (3, 0, 2 * turns - 1)]),))
+        db.commit()
+        db.close()
+        for name in ("transcript.jsonl", "transcript_full.jsonl"):
+            with open(os.path.join(logs, name), "w") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows)
+        os.makedirs(os.path.join(home, "brain", cid, ".system_generated", "steps", str(2 * turns - 1)))
+        self.hub.s.add_agent({"id": aid, "project": "alpha", "title": aid, "provider": "antigravity",
+                              "account": "antigravity", "mode": "terminal", "session_id": cid, "cwd": self.tmp,
+                              "state": "idle", "model": "gemini"})
+        return cid, home
+
+    def run_with(self, home, fn):
+        from switchboard import antigravity as agy
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_HOME": home}):
+            self.assertEqual(agy.home(), home)
+            return fn()
+
+    def test_rewind_cuts_the_database_agy_resumes_from(self):
+        import sqlite3
+        from switchboard import antigravity as agy
+        cid, home = self.conv()
+
+        def go():
+            v = rewind.moments(self.hub, "g1")
+            self.assertTrue(v["rewind"])
+            ms = v["sessions"][0]["moments"]
+            self.assertEqual([m["text"] for m in ms], [f"ask {i} of g1" for i in (3, 2, 1, 0)])
+            target = ms[1]  # ask 2: step 4
+            self.assertEqual((target["offset"], target["later"]), (4, 1))
+            r = rewind.rewind(self.hub, "g1", {"session": cid, "offset": 4, "keep_copy": True})
+            self.assertFalse(r["relaunch"])
+            self.assertTrue(os.path.exists(r["backup"][:-6] + ".db"))
+            with self.assertRaises(ValueError):  # step 1 is a reply, not a message of the owner's
+                rewind.rewind(self.hub, "g1", {"session": cid, "offset": 1})
+        self.run_with(home, go)
+        db = sqlite3.connect(agy.db_for(cid, home))
+        self.assertEqual([r[0] for r in db.execute("SELECT idx FROM steps ORDER BY idx")], [0, 1, 2, 3])
+        self.assertEqual([r[0] for r in db.execute("SELECT idx FROM gen_metadata ORDER BY idx")], [0, 1])
+        ex = agy._fields(db.execute("SELECT data FROM executor_metadata").fetchone()[0])
+        self.assertIn((3, 0, 3), ex)  # the run of the CLI that spanned the cut now ends at the last step kept
+        db.close()
+        log = open(agy.path_for(cid, home)).read()
+        self.assertIn("reply 1 of g1", log)
+        self.assertNotIn("ask 2 of g1", log)
+        self.assertFalse(os.path.exists(os.path.join(home, "brain", cid, ".system_generated", "steps", "7")))
+        self.assertEqual(self.hub.s.agent("g1")["session_id"], cid)
+
+    def test_edit_a_step(self):
+        import sqlite3
+        from switchboard import antigravity as agy
+        cid, home = self.conv("g2")
+
+        def go():
+            e = next(x for x in rewind.records(self.hub, "g2", cid)["entries"] if x["text"] == "reply 1 of g2")
+            rec = rewind.record(self.hub, "g2", cid, e["at"])
+            self.assertEqual([p["text"] for p in rec["parts"]], ["reply 1 of g2"])
+            rewind.edit(self.hub, "g2", {"session": cid, "at": e["at"], "sig": rec["sig"],
+                                         "parts": {"0": "what the owner says it said, at length"}})
+            return e["at"]
+        at = self.run_with(home, go)
+        db = sqlite3.connect(agy.db_for(cid, home))
+        blob = db.execute("SELECT step_payload FROM steps WHERE idx=?", (at,)).fetchone()[0]
+        db.close()
+        inner = dict((f, v) for f, w, v in agy._fields(dict((f, v) for f, w, v in agy._fields(blob))[20]))
+        self.assertEqual(inner[1], b"what the owner says it said, at length")
+        self.assertEqual(inner[8], inner[1])
+        log = open(agy.path_for(cid, home)).read()
+        self.assertIn("what the owner says it said, at length", log)
+        self.assertNotIn("reply 1 of g2", log)
+        self.assertIn("reply 2 of g2", log)
+
 if __name__ == "__main__":
     unittest.main()

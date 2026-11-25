@@ -4,6 +4,7 @@
   sb setup                          tell Switchboard which AI subscriptions / API keys you have (or use the web page)
   sb agents                         list agents and their state
   sb projects                       list projects
+  sb projects kill <project>        owner: remove a project entirely (agents, conversations, hub records; files stay)
   sb send <agent|project> "text"     type into that terminal exactly once (project -> its lead); --wait prints the reply
   sb dispatch <project> "task"      start a new agent on a project with this task
   sb sessions ["words"] [--all]     search past Claude/Codex sessions (the owner's asks, titles, folders)
@@ -18,6 +19,13 @@
   sb subagents [--model haiku] [--hours 72] [--agent a]
                                     recent subagents (Agent tool) and the agent or session that spawned each
   sb clear [agent]                  start a headless agent over
+  sb attest --claim 'what you report' [--job ID] [--file PATH] [--quote PATH 'text'] ...
+                                    before reporting work as done: the hub checks the evidence and prints a receipt
+                                    id (att-...) to put in the report, or "Are you sure?" with what did not hold
+  sb trust --require|--release AGENT   owner: tick or untick an agent's attest box (also on its pane)
+  sb trust [--hours 168]            owner: per agent, the claims the hub checked (jobs and files a message named)
+                                    and how many did not hold; watched agents are asked "are you sure?"
+  sb whoami                         who you are here and what your project may reach: your launch note, again
   sb context [agent] [--n N]        your project's agents (last ask/reply) + shared notes; or one agent's recent talk
   sb context --search "words"       search every conversation on your project
   sb context --project P ...        the same for a project the owner let yours read (read-only)
@@ -41,6 +49,7 @@
                                     replies, the work queue, open decisions: the input for an executive summary
   sb work [--all] [--project p]     the owner's master work queue (open items)
   sb work add "title" [--project p] [--pri 1|2|3] [--agent a] [--detail "..."]
+  sb work add "title" --check 'command'   the item can be marked done only when the hub runs this and it exits 0
   sb work done|start|block|drop <n> [--note "..."]
   sb work set <n> [--status s] [--pri N] [--agent a] [--project p] [--title "..."] [--note "..."]
   sb work rm <n>
@@ -85,7 +94,14 @@ import uuid
 HUB = os.environ.get("SB_HUB", "http://127.0.0.1:8802")
 
 
-def call(method, path, body=None, retries=0):
+class HubAway(Exception):
+    """call(..., soft=True): the hub did not answer, or answered with an error (status in .code, None if away)."""
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
+
+
+def call(method, path, body=None, retries=0, soft=False):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(HUB + path, data=data, method=method, headers={"Content-Type": "application/json", "X-Switchboard-Agent": me()})
     try:
@@ -94,16 +110,20 @@ def call(method, path, body=None, retries=0):
     except urllib.error.HTTPError as e:
         if retries and e.code in (502, 503, 504):
             time.sleep(1)
-            return call(method, path, body, retries - 1)
+            return call(method, path, body, retries - 1, soft)
         try:
             msg = json.loads(e.read()).get("error")
         except ValueError:
             msg = str(e)
+        if soft:
+            raise HubAway(msg, e.code)
         sys.exit(f"sb: {msg}")
     except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
         if retries:
             time.sleep(1)
-            return call(method, path, body, retries - 1)
+            return call(method, path, body, retries - 1, soft)
+        if soft:
+            raise HubAway(str(e))
         sys.exit(f"sb: hub not reachable at {HUB} ({e}); is switchboard.service running?")
 
 
@@ -290,7 +310,8 @@ def setup():
 
 def work_line(w):
     who = ", ".join(x for x in (w["project"], w["agent"] and "agent " + w["agent"]) if x)
-    return f"#{w['id']:<4} P{w['priority']} {w['status']:<7} {w['title']}" + (f"  ({who})" if who else "")
+    return f"#{w['id']:<4} P{w['priority']} {w['status']:<7} {w['title']}" + (f"  ({who})" if who else "") \
+        + ("  [check]" if w.get("check_cmd") else "")
 
 
 def work(args):
@@ -311,7 +332,7 @@ def work(args):
             sys.exit("sb: sb work add \"title\"")
         b = {"title": arg, "from": me()}
         for k, v in (("project", args.project), ("agent", args.agent), ("priority", args.pri),
-                     ("status", args.status), ("detail", args.detail)):
+                     ("status", args.status), ("detail", args.detail), ("check", args.check)):
             if v is not None:
                 b[k] = v
         print("added " + work_line(call("POST", "/api/work", b)))
@@ -321,7 +342,9 @@ def work(args):
     n = arg.lstrip("#")
     if act == "show":
         w = call("GET", f"/api/work/{n}")
-        print(work_line(w) + ("\n" + w["detail"] if w["detail"] else ""))
+        print(work_line(w) + ("\n" + w["detail"] if w["detail"] else "")
+              + (f"\ncheck (set by {w.get('check_by') or 'owner'}; must pass before done): {w['check_cmd']}"
+                 if w.get("check_cmd") else ""))
         return 0
     if act == "rm":
         call("DELETE", f"/api/work/{n}")
@@ -331,12 +354,22 @@ def work(args):
     if act != "set":
         b["status"] = {"done": "done", "start": "doing", "block": "blocked", "drop": "dropped"}[act]
     for k, v in (("status", args.status), ("priority", args.pri), ("agent", args.agent), ("project", args.project),
-                 ("title", args.title), ("detail", args.detail), ("note", args.note)):
+                 ("title", args.title), ("detail", args.detail), ("note", args.note), ("check", args.check)):
         if v is not None:
             b[k] = v
     print("now " + work_line(call("PATCH", f"/api/work/{n}", b)))
     return 0
 
+
+def _ranges(cpus):
+    """[1,2,3,7] -> '1-3,7'"""
+    out, cpus = [], sorted(set(cpus))
+    for c in cpus:
+        if out and c == out[-1][1] + 1:
+            out[-1][1] = c
+        else:
+            out.append([c, c])
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in out)
 
 
 def _gib(mib):
@@ -467,7 +500,9 @@ def _job_line(j):
     tail = f"  {j['reason']}" if j.get("reason") else ""
     via = f"  via {j['placer']}" if j.get("placer") and j["placer"] != "hub" else ""
     via += f" {j['board_id']}" if j.get("board_id") else ""
-    via += f"  cpus {','.join(map(str, j['cpus']))}" if j.get("cpus") else ""
+    via += f"  cpus {_ranges(j['cpus'])}" if j.get("cpus") else ""
+    if j.get("cpus_seen") and j["cpus_seen"] != (j.get("cpus") or None):  # where its processes really are
+        via += f"  {'but ' if j.get('cpus') else ''}really on {_ranges(j['cpus_seen'])}"
     return (f"{j['id']:<14} {j['state']:<9} {j['name']:<22} {j.get('host') or '-':<10} {res:<16}{run:<8} "
             f"{who}{'  adopted' if j.get('adopted') else ''}{via}{tail}")
 
@@ -542,7 +577,37 @@ def adopt_cmd(args):
     return 0
 
 
+def notify_origin():
+    """Where a notice comes from when no agent files it: the systemd unit this runs in and the places that tell its
+    project (the unit file, which is usually a link into the project's folder, and the working directory)."""
+    unit, paths = None, []
+    try:
+        last = open("/proc/self/cgroup").read().strip().splitlines()[-1].rsplit("/", 1)[-1]
+        if last.endswith(".service") and not last.startswith(("user@", "tmux", "switchboard")):
+            unit = last
+            for scope in ("--user", "--system"):
+                frag = subprocess.run(["systemctl", scope, "show", unit, "-p", "FragmentPath", "--value"],
+                                      capture_output=True, text=True, timeout=5).stdout.strip()
+                if frag:
+                    paths.append(os.path.realpath(frag))
+                    break
+    except (OSError, IndexError, subprocess.SubprocessError):
+        pass
+    try:
+        paths.append(os.getcwd())
+    except OSError:
+        pass
+    return unit, paths
+
+
 def inbox_cmd(args):
+    if args.action == "adopt":
+        if not (args.arg and args.answer):
+            sys.exit("sb: sb inbox adopt <id> <project>")
+        r = call("POST", f"/api/inbox/{args.arg}/adopt", {"project": args.answer})
+        print(f"{r['id']}: filed under {r['project']}" + (f"; {r['source']} lands there from now on"
+              + (f" ({r['moved'] - 1} more moved)" if r["moved"] > 1 else "") if r.get("source") else ""))
+        return 0
     if args.action in ("done", "ignore"):
         if not args.arg:
             sys.exit(f"sb: sb inbox {args.action} <id>" + (' ["answer"]' if args.action == "done" else ""))
@@ -585,7 +650,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup")
     sub.add_parser("agents")
-    sub.add_parser("projects")
+    s = sub.add_parser("projects")
+    s.add_argument("action", nargs="?", choices=["kill"])
+    s.add_argument("project", nargs="?")
     s = sub.add_parser("send")
     s.add_argument("to")
     s.add_argument("text", nargs="?", help="message text; '-' or omitted reads stdin")
@@ -655,6 +722,11 @@ def main():
     nd.add_argument("--provider")
     nd.add_argument("--agent", help="put this agent in the seat ('' lets the seat fill itself)")
     nd.add_argument("--brief", metavar="ROLE", help="print what this seat is told on a clean start")
+    nd.add_argument("--reserve", metavar="AGENT", help="owner: keep this agent outside the seats (no seat fills itself with it)")
+    nd.add_argument("--unreserve", metavar="AGENT", help="owner: let it hold a seat again")
+    nd.add_argument("--default-provider", metavar="TYPE",
+                    help="owner: the account type every seat (and sb dispatch) starts on unless that seat has its own: "
+                         "claude, codex, antigravity, deepseek, hermes ('' goes back to each seat's built-in one)")
     nd.add_argument("--fold", action="store_true", help="retire the agents outside the seats; conversations go to memory, work to the lead")
     nd.add_argument("--pickup", metavar="ROLE", help="pick the seat back up: its session if used in the last 38 h, else a clean start")
     mm = sub.add_parser("memory")
@@ -689,6 +761,7 @@ def main():
     nt.add_argument("text")
     nt.add_argument("--info", action="store_true")
     nt.add_argument("--idem", help="reuse this key when retrying the same notification")
+    nt.add_argument("--project", help="the project this belongs to, for a script or timer that is no agent")
     bc = sub.add_parser("broadcast")
     bc.add_argument("text")
     bc.add_argument("--project")
@@ -713,6 +786,9 @@ def main():
     wk.add_argument("--title")
     wk.add_argument("--detail")
     wk.add_argument("--note")
+    wk.add_argument("--check", metavar="COMMAND",
+                    help="a quick command the hub runs in the project's folder when the item is marked done; the item "
+                         "closes only if it exits 0 ('' removes it; only whoever set it, or the owner, changes it)")
     wk.add_argument("--all", action="store_true")
     fl = sub.add_parser("fleet")
     fl.add_argument("action", nargs="?", default="list", choices=["list", "check", "show", "add-host", "wsl-keepalive"])
@@ -763,7 +839,7 @@ def main():
     ad.add_argument("--mem", type=float, default=0.0)
     ad.add_argument("--gpu", type=float)
     ib = sub.add_parser("inbox")
-    ib.add_argument("action", nargs="?", default="list", choices=["list", "done", "ignore"])
+    ib.add_argument("action", nargs="?", default="list", choices=["list", "done", "ignore", "adopt"])
     ib.add_argument("arg", nargs="?", help="the item id (done, ignore)")
     ib.add_argument("answer", nargs="?", help="the answer (done); none dismisses or acknowledges; ignore tells the agent nothing")
     ib.add_argument("--project")
@@ -775,6 +851,17 @@ def main():
     r = sub.add_parser("reply")
     r.add_argument("turn")
     r.add_argument("text")
+    sub.add_parser("whoami")
+    tr = sub.add_parser("trust")
+    tr.add_argument("--hours", type=float, default=168)
+    tr.add_argument("--require", metavar="AGENT", help="owner: tick this agent's attest box")
+    tr.add_argument("--release", metavar="AGENT", help="owner: untick it")
+    at = sub.add_parser("attest")
+    at.add_argument("--claim", required=True, help="one sentence: what you are reporting as done")
+    at.add_argument("--job", action="append", default=[], metavar="JOB_ID")
+    at.add_argument("--file", action="append", default=[], metavar="PATH")
+    at.add_argument("--quote", action="append", default=[], nargs=2, metavar=("PATH", "TEXT"),
+                    help="exact text that is in that file (a result line, a number)")
     st = sub.add_parser("status")
     st.add_argument("id")
     args = ap.parse_args()
@@ -785,6 +872,15 @@ def main():
         for x in call("GET", "/api/agents")["agents"]:
             print(f"{x['id']:<28} {x['state']:<9} {x['provider']}/{x['account'] or '-':<8} {x['mode']:<9} "
                   f"{x['project'] or '-':<18} {(x['last_text'] or '').splitlines()[-1][:60] if x['last_text'] else ''}")
+    elif args.cmd == "projects" and args.action == "kill":
+        if not args.project:
+            sys.exit("sb projects kill <project-id>")
+        r = call("DELETE", f"/api/projects/{args.project}")
+        print(f"killed {r['project']}: {r['agents']} agents, {r['sessions']} sessions deleted"
+              + (f"; stopped jobs: {', '.join(r['jobs_stopped'])}" if r["jobs_stopped"] else "")
+              + (f"; still running: {', '.join(r['left_running'])}" if r["left_running"] else "")
+              + (f"; memory folder kept (another project's agent uses it): {', '.join(r['memory_shared'])}"
+                 if r.get("memory_shared") else ""))
     elif args.cmd == "projects":
         for p in call("GET", "/api/overview")["projects"]:
             print(f"{p['id']:<22} {len(p['agent_ids'])} agents  {p['next_step'][:80]}")
@@ -955,6 +1051,10 @@ def main():
             prov = f"&provider={args.provider}" if args.provider else ""
             print(call("GET", f"/api/projects/{pid}/brief?{frm}&role={args.brief}{prov}")["brief"], end="")
             return 0
+        if args.default_provider is not None:
+            r = call("POST", "/api/nodes/default", {"provider": args.default_provider})
+            print(f"seats start on: {r['default_provider'] or 'their built-in account type (claude)'}")
+            return 0
         if args.fold:
             r = call("POST", f"/api/projects/{pid}/nodes/fold", {})
             for f in r["folded"]:
@@ -970,7 +1070,9 @@ def main():
                                                                    + (" (its own account type had no room)" if r.get("moved") else "")
                                                                    if r["action"] == "started" else ""))
             return 0
-        if args.set:
+        if args.reserve or args.unreserve:
+            v = call("POST", f"/api/projects/{pid}/nodes/reserve", {"agent": args.reserve or args.unreserve, "on": bool(args.reserve)})
+        elif args.set:
             body = {k: v for k, v in (("model", args.model), ("provider", args.provider), ("agent", args.agent)) if v is not None}
             v = call("POST", f"/api/projects/{pid}/nodes/{args.set}", body)
         else:
@@ -979,8 +1081,10 @@ def main():
             who = f"{n['agent']} ({n['running_provider']}/{n['account']} {n['running_model']}, idle {n['idle_hours']} h)" if n["agent"] else "nobody"
             print(f"{n['title']:<18} {n['provider']} {n['model']:<18} {who}  [{n['state']}: {n['pickup']}]")
         print("Live Wiki          kept by Switchboard: sb wiki " + pid)
+        if v.get("default_provider"):
+            print(f"new seats start on {v['default_provider']} (sb nodes --default-provider)")
         for x in v["extras"]:
-            print(f"outside the seats  {x['agent']} ({x['model']})")
+            print(f"outside the seats  {x['agent']} ({x['model']})" + ("  [held in reserve]" if x.get("reserve") else ""))
         return 0
     elif args.cmd == "retention":
         if args.pairs:
@@ -1023,7 +1127,9 @@ def main():
     elif args.cmd == "adopt":
         return adopt_cmd(args)
     elif args.cmd == "notify":
-        n = call("POST", "/api/notifications", {"agent": me(), "text": args.text,
+        unit, paths = notify_origin()
+        n = call("POST", "/api/notifications", {"agent": me(), "text": args.text, "project": args.project,
+                 "unit": unit, "paths": paths,
                  "level": "info" if args.info else "need", "idem": args.idem or 'notify:' + uuid.uuid4().hex}, retries=4)
         print(f"{n['id']} saved for the owner; inbox: {HUB}/#/inbox")
     elif args.cmd == "inbox":
@@ -1036,6 +1142,33 @@ def main():
     elif args.cmd == "reply":
         call("POST", "/api/reply", {"turn": args.turn, "body": args.text})
         print("reply recorded")
+    elif args.cmd == "attest":
+        r = call("POST", "/api/attest", {"from": me(), "claim": args.claim, "jobs": args.job, "files": args.file,
+                                         "quotes": args.quote})
+        print(r["say"])
+        return 0 if r["ok"] else 1
+    elif args.cmd == "trust":
+        if args.require or args.release:
+            r = call("POST", "/api/trust/require", {"agent": args.require or args.release, "on": bool(args.require)})
+            print(f"{r['agent']}: attest {'required' if r['attest'] else 'not required'}")
+            return 0
+        r = call("GET", f"/api/trust?hours={args.hours}")
+        print(f"claims the hub checked in the last {r['hours']:g} h (a claim: a message that says something is done "
+              "and names a job or a file)")
+        print(f"{'agent':<28} {'project':<22} {'claims':>6} {'did not hold':>12} {'asked':>6} {'attests':>8}  newest failure")
+        for a in r["agents"]:
+            lf = a["last_failed"]
+            what = "; ".join(f"{c['what']}: {c['why']}" for c in lf["what"])[:110] if lf else ""
+            att = f"{a['attests'] - a['attests_failed']}/{a['attests']}" if a.get("attests") else "-"
+            print(f"{a['agent']:<28} {(a['project'] or '-'):<22} {a['claims']:>6} {a['failed']:>12} {a['asked']:>6} {att:>8}  "
+                  + (f"{lf['at'][5:16].replace('T', ' ')} {what}" if lf else ""))
+        if not r["agents"]:
+            print("(none yet)")
+    elif args.cmd == "whoami":
+        r = call("GET", "/api/whoami?" + urllib.parse.urlencode({"from": me()}))
+        if r["agent"]:
+            print(f"agent {r['agent']}, project {r['project']}, {r['provider']} {r.get('model') or 'default model'}\n")
+        print(r["note"])
     elif args.cmd == "status":
         print(json.dumps(call("GET", f"/api/messages/{args.id}"), indent=1))
     return 0

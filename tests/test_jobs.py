@@ -29,7 +29,7 @@ os.environ.setdefault("SB_WORKSPACE", os.path.join(TMP, "ws"))
 os.environ.setdefault("SB_CLAUDE_BIN", os.path.join(HERE, "fake_cli.py"))
 os.environ.setdefault("SB_CODEX_BIN", os.path.join(HERE, "fake_cli.py"))
 
-assert "/.config/" not in os.environ["SB_HOSTS"], "tests must never touch the real hosts file"  # 2026-11-01: one run overwrote it
+assert "/.config/" not in os.environ["SB_HOSTS"], "tests must never touch the real hosts file"
 from switchboard import hosts, jobs, shared  # noqa: E402
 from switchboard.hub import Hub  # noqa: E402
 from switchboard.store import Store  # noqa: E402
@@ -111,7 +111,15 @@ class PlacementTests(unittest.TestCase):
         h, g, why = jobs.place(self.h, cfg, self.job(mem_mib=2048), rows)
         self.assertIsNone(h)
         self.assertIn("a: unreachable", why)
-        self.assertIn("b: 1024 MiB free, need 2048", why)
+        self.assertIn("b: RAM 1024 MiB free, need 2048", why)
+
+    def test_ram_short_warns_but_does_not_block_a_gpu_job(self):
+        cfg = self.cfg(["b"])
+        rows = {"b": fake_row("b", avail_mib=9 * 1024, gpus=[gpu("T", 24000)])}
+        job = self.job(mem_mib=20480, gpu_mib=20480)
+        h, g, why = jobs.place(self.h, cfg, job, rows)
+        self.assertEqual((h["name"], g["uuid"]), ("b", "T"))
+        self.assertIn("warning: b: RAM 1024 MiB free, need 20480", job["ram_warn"])
 
     def test_display_gpu_avoided_then_used_as_fallback_never_under_never(self):
         cfg = self.cfg(["desk", "box"], display_gpu="avoid")
@@ -205,6 +213,33 @@ class PlacementTests(unittest.TestCase):
         self.assertEqual(jobs.disjoint_cpus(self.h, "d", 8, [4, 5], 2), [4, 5], "free advice is kept as given")
         self.assertEqual(jobs.disjoint_cpus(self.h, "d", 5, [0, 1], 2), [0, 1], "too few free CPUs: the advice stands")
 
+    def test_cpus_something_is_really_on_are_never_handed_out(self):
+        doc = {"pins": [{"unit": "sb-job-gpu1.service", "cpus": [9, 10, 11, 12], "cpu": 0.0},   # a GPU job: no label
+                        {"unit": None, "pid": 7, "cpus": [5, 6], "cpu": 180.0},                  # untracked, self-pinned
+                        {"unit": "idle.service", "cpus": [20, 21], "cpu": 0.3}]}                 # pinned but idle
+        self.assertEqual(jobs.pinned_cpus(doc), {5, 6, 9, 10, 11, 12})
+        self.assertEqual(jobs.pinned_cpus(doc, but="sb-job-gpu1.service"), {5, 6})
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 16, [9, 10, 11, 12], 4, doc), [0, 1, 2, 3])
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 16, [20, 21], 2, doc), [20, 21], "an idle pin is not in the way")
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 16, [9, 10], 2), [9, 10], "no probe to go by: the advice stands")
+        doc["cpu"] = {"siblings": [[0, 8], [5, 13], [6, 14]]}  # the other thread of a busy core is taken with it
+        self.assertEqual(jobs.pinned_cpus(doc), {5, 6, 13, 14, 9, 10, 11, 12})
+        self.h.s.x("INSERT INTO jobs(id,name,host,unit,threads,mem_mib,cpus,state,created_at) VALUES('jx','a','d',"
+                   "'sb-job-gpu1.service',2,64,'[0, 1]','running','2026-01-01T00:00:00Z')")
+        self.assertEqual(jobs.disjoint_cpus(self.h, "d", 16, [0, 1], 2, doc), [0, 1],
+                         "a job seen elsewhere does not hold the CPUs on its label")
+
+    def test_a_host_that_does_not_enforce_allowed_cpus_pins_the_command_itself(self):
+        cfg = jobs.hosts.load_config()
+        h = cfg["hosts"][0]
+        job = {"id": "j", "name": "n", "project": "p", "agent": "a", "unit": "sb-job-j.service", "cwd": "/tmp",
+               "mem_mib": 64, "hours": 1, "cpus": "[4, 5]", "argv": json.dumps(["python3", "x.py"])}
+        loose = jobs._launch_script(cfg, h, {"cpuset": False}, job, None)
+        self.assertIn("AllowedCPUs=4,5", loose)
+        self.assertIn("-- taskset -c 4,5 python3 x.py", loose)
+        self.assertIn("-- python3 x.py", jobs._launch_script(cfg, h, {"cpuset": True}, job, None))
+        self.assertNotIn("taskset", jobs._launch_script(cfg, h, {"cpuset": False}, dict(job, cpus=None), None))
+
     def test_priority_and_tiny_jobs_cut_past_the_thread_gate(self):
         cfg = self.cfg(["full", "roomy"])
         rows = {"full": fake_row("full", threads=32, cores=16, load=38.0), "roomy": fake_row("roomy")}
@@ -240,7 +275,8 @@ class PlacementTests(unittest.TestCase):
         seen = []
         with mock.patch.object(jobs, "_launch_one", side_effect=lambda hub, cfg, job, *a: seen.append(job["id"])):
             jobs.launch_queued(self.h)
-        self.assertEqual(seen, ["job-tiny", "job-prio", "job-old"])
+        # priority projects in their order first, then tiny jobs, then oldest first
+        self.assertEqual(seen, ["job-prio", "job-tiny", "job-old"])
 
     def test_host_pref_limits_candidates(self):
         cfg = self.cfg(["a", "b"])

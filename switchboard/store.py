@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS notifications (
   id TEXT PRIMARY KEY, idem TEXT UNIQUE, agent TEXT, project TEXT, kind TEXT, level TEXT, text TEXT,
   created_at TEXT, acked_at TEXT);
+CREATE TABLE IF NOT EXISTS adoptions (
+  source TEXT PRIMARY KEY, project TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, agent TEXT, text TEXT, created_at TEXT);
 CREATE INDEX IF NOT EXISTS notes_project ON notes(project, id);
@@ -69,7 +71,7 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE TABLE IF NOT EXISTS memory_sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, agent TEXT, provider TEXT, account TEXT, model TEXT,
   session_id TEXT, path TEXT, why TEXT, state TEXT DEFAULT 'pending', start INTEGER DEFAULT 0, size INTEGER,
-  first_ask TEXT, last_ask TEXT, last_said TEXT, summary TEXT, note TEXT, in_tokens INTEGER, out_tokens INTEGER,
+  first_ask TEXT, last_ask TEXT, last_said TEXT, last_tail TEXT, summary TEXT, note TEXT, in_tokens INTEGER, out_tokens INTEGER,
   cost_usd REAL, created_at TEXT, done_at TEXT);
 CREATE INDEX IF NOT EXISTS memory_sessions_project ON memory_sessions(project, id);
 CREATE TABLE IF NOT EXISTS memory_versions (
@@ -128,10 +130,12 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        if "source" not in {r[1] for r in self.db.execute("PRAGMA table_info(notifications)")}:
+            self.db.execute("ALTER TABLE notifications ADD COLUMN source TEXT")  # what filed it, when no agent did
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(messages)")}
         if "wait_reply" not in cols:
             self.db.execute("ALTER TABLE messages ADD COLUMN wait_reply INTEGER DEFAULT 0")
-        for col, decl in (("attachments", "TEXT DEFAULT '[]'"), ("mode", "TEXT DEFAULT 'queue'")):
+        for col, decl in (("attachments", "TEXT DEFAULT '[]'"), ("mode", "TEXT DEFAULT 'queue'"), ("read_at", "TEXT")):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
         pcols = {r[1] for r in self.db.execute("PRAGMA table_info(projects)")}
@@ -149,8 +153,9 @@ class Store:
                           ("placer", "TEXT"), ("gpu_pin", "TEXT")):
             if col not in jcols:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
-        for table, adds in (("memory_sessions", (("outline", "TEXT"), ("messages", "INTEGER"))),
-                            ("memory", (("notes_through", "INTEGER DEFAULT 0"),))):
+        for table, adds in (("memory_sessions", (("outline", "TEXT"), ("messages", "INTEGER"), ("last_tail", "TEXT"))),
+                            ("memory", (("notes_through", "INTEGER DEFAULT 0"),)),
+                            ("work", (("check_cmd", "TEXT"), ("check_by", "TEXT"))),):
             have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for col, decl in adds:
                 if col not in have:
@@ -159,7 +164,8 @@ class Store:
         for col, decl in (("account_pending", "TEXT"), ("migrate_state", "TEXT"), ("migrate_note", "TEXT"),
                           ("migrate_since", "TEXT"), ("last_reply_at", "TEXT"), ("context_tokens", "INTEGER"),
                           ("context_window", "INTEGER"), ("tokens_24h", "INTEGER"), ("last_turn", "TEXT"),
-                          ("role", "TEXT"), ("default_mode", "TEXT"), ("fork_from", "TEXT")):
+                          ("role", "TEXT"), ("default_mode", "TEXT"), ("fork_from", "TEXT"),
+                          ("ghost", "INTEGER DEFAULT 0")):
             if col not in acols:
                 self.db.execute(f"ALTER TABLE agents ADD COLUMN {col} {decl}")
 

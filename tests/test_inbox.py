@@ -114,6 +114,36 @@ class PendingMessageTests(unittest.TestCase):
             h.cancel_message(delivered['id'])
         self.assertEqual(h.s.message(delivered['id'])['state'], 'delivering')
 
+class AdoptionTests(unittest.TestCase):
+    """A notice no agent filed (a timer, a script) finds a project, and the owner can give it one that sticks."""
+
+    def setUp(self):
+        self.h = new_hub()
+        self.dir = tempfile.mkdtemp(dir=TMP)
+        self.h.s.upsert_project({"id": "alpha", "match": {"cwd": [self.dir]}})
+
+    def test_unit_file_in_a_project_folder_decides(self):
+        n = self.h.notify("owner", "cve-watch: exposed", source="cve-watch.service",
+                          paths=[os.path.join(self.dir, "systemd", "cve-watch.service"), "/"])
+        self.assertEqual((n["project"], n["source"]), ("alpha", "cve-watch"))
+        self.assertEqual(self.h.notify("owner", "x", project="beta", paths=[self.dir])["project"], "beta")
+        with self.assertRaises(ValueError):
+            self.h.notify("owner", "x", project="nope")
+
+    def test_owner_adopts_a_lost_notice_and_its_source_sticks(self):
+        a = self.h.notify("owner", "disk-watch: /data 91% full")
+        b = self.h.notify("owner", "disk-watch: /home 95% full")
+        other = self.h.notify("owner", "no prefix here")
+        self.assertEqual(inbox.items(self.h)["by_project"], {"unsorted": 3})
+        r = self.h.adopt(a["id"], "beta")
+        self.assertEqual((r["source"], r["moved"]), ("disk-watch", 2))
+        self.assertEqual(inbox.items(self.h)["by_project"], {"beta": 2, "unsorted": 1})
+        self.assertEqual(self.h.notify("owner", "disk-watch: /var 99% full")["project"], "beta")
+        self.assertEqual(self.h.adopt(other["id"], "alpha")["source"], None)
+        self.assertIsNone(self.h.notify("owner", "another stray")["project"])
+        with self.assertRaises(ValueError):
+            self.h.adopt(b["id"], "nope")
+
 
 if __name__ == "__main__":
     unittest.main()

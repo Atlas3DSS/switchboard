@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 
-from . import autoclear, discovery, shared
+from . import autoclear, claims, discovery, shared, stuck
 from .ptyholder import KEEP, FrameReader, frame
 from .store import INBOX, STATE, epoch, iso_from_epoch, new_id, now
 from .vtscreen import Screen
@@ -25,10 +25,45 @@ from .vtscreen import Screen
 PTY_DIR = os.path.join(STATE, "pty")
 BATCHES = INBOX  # full text of each batch of waiting messages (owner-only batch-*.md files)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIRM_S = 180  # a typed message must show up in the transcript within this long
+CONFIRM_S = 180  # a typed message must be accepted into the CLI within this long
 BATCH_MAX = 500  # everything waiting for an agent goes in as one batch (a backstop, not a split point)
-INTERRUPT_AFTER_S = 300  # oldest message waited this long while the agent works: one Esc, then the batch
+INTERRUPT_AFTER_S = 120  # Codex/Hermes (and non-push fallback): one Esc after 2 min (docs/DELIVERY-PUSH.md)
+PUSH_CEILING_S = 120  # 2-minute rule: no intra-agent message waits longer than this to be typed or paged
+PUSH_STALE_S = 900  # accepted-but-unread for 15 min: one Esc (Claude) or owner page (docs/DELIVERY-PUSH.md §4)
+ACCEPTED_IDLE_S = 30  # accepted-but-unread while idle this long: CLI dropped/lost it; requeue once or fail
+PUSH_PROVIDERS = ("claude", "antigravity")
+DELIVERY_DEFAULTS = {"push": False, "push_only": [], "push_off": []}
+PUSH_NOTE = ("(This arrived while you were working. Finish the step you are on, then deal with it. "
+             "If the sender needs an answer before your turn ends, reply with sb send.)")
+ACCEPTED_WAIT = "waiting: typed; the agent reads it at its next step"
+AGY_QUEUED_RX = re.compile(r"Sending to agent\.\.\.|Press up to edit queued messages|\(alt\+m to send immediately\)", re.I)
 BATCH_KEEP_S = 7 * 86400
+
+
+def delivery_settings(store):
+    """Push-delivery settings from store ('delivery'), merged with DELIVERY_DEFAULTS."""
+    cfg = dict(DELIVERY_DEFAULTS)
+    cfg.update(store.setting("delivery", {}) or {})
+    return cfg
+
+
+def can_push_now(store, agent, oldest_age):
+    """Whether a waiting batch may be typed into this busy terminal right now (docs/DELIVERY-PUSH.md §1a, §2)."""
+    if agent["provider"] not in PUSH_PROVIDERS:
+        return False
+    cfg = delivery_settings(store)
+    aid = agent["id"]
+    only = set(cfg.get("push_only") or ())
+    off = set(cfg.get("push_off") or ())
+    if only:
+        if aid in only:
+            return True
+        return bool(cfg.get("push")) and oldest_age >= PUSH_CEILING_S
+    if not cfg.get("push"):
+        return False
+    if aid in off:
+        return oldest_age >= PUSH_CEILING_S
+    return True
 
 
 def cli_size(pid):
@@ -93,9 +128,12 @@ def memory_dir(agent):
     time; --add-dir and allow rules do not change that. Its one exemption is its own memory folder, and that does not
     match through the symlink, so each memory write stopped the agent at a prompt until the owner came back. Claude Code
     names the folder after the main checkout of the git repository (worktrees and subfolders share it)."""
+    if agent.get("ghost"):  # an empty folder of its own, erased with it: never the project's memory
+        from . import ghost
+        os.makedirs(ghost.memdir(agent), mode=0o700, exist_ok=True)
+        return ghost.memdir(agent)
     real = launch_cwd(agent)
-    cfg = discovery.account_env(agent.get("account"), "claude").get("CLAUDE_CONFIG_DIR") or \
-        os.path.expanduser("~/.claude")
+    cfg = agent_config_dir(agent)
     try:
         common = subprocess.run(["git", "-C", real, "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                 capture_output=True, text=True, timeout=10).stdout.strip()
@@ -123,6 +161,12 @@ def file_flags(agent):
     return ["--settings", json.dumps(settings)] + [x for d in extra_dirs(agent) for x in ("--add-dir", d)]
 
 
+def agent_config_dir(agent):
+    """The config folder a Claude agent runs on: its endpoint's own home, else its account's."""
+    e = discovery.endpoint(agent)
+    return e["home"] if e else claude_config_dir(agent.get("account"))
+
+
 def claude_config_dir(account):
     return discovery.account_env(account, "claude").get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 
@@ -148,6 +192,8 @@ def seed_trust(agent):
     if agent.get("provider") != "claude":
         return None
     folder = launch_cwd(agent)
+    if discovery.endpoint(agent):  # its own home is prepared at launch (discovery.endpoint_home)
+        return None
     target = claude_config_dir(agent.get("account"))
     if _trusts(target, folder) is not False:
         return None
@@ -220,12 +266,16 @@ def launch_argv(agent):
             argv += ["--effort", agent["effort"]]
         return argv + file_flags(agent) + ["--append-system-prompt", note]
     if agent["provider"] == "antigravity":  # no system-prompt flag: a new conversation opens with the note (-i)
-        from . import antigravity
+        from . import antigravity, barrier
         antigravity.trust(agent["cwd"])  # else the CLI opens on a trust question
-        argv = [exe, "--dangerously-skip-permissions"]
+        pid = agent.get("project") or "unsorted"
+        out = shared.outside(pid)
+        allow_out = bool(barrier.unlimited(pid) or out.get("read") or out.get("write") or shared.read_grants(pid))
+        argv = [exe, "--dangerously-skip-permissions",
+                "--settings", json.dumps(antigravity.session_settings(allow_out), separators=(",", ":"))]
         argv += ["--conversation", agent["session_id"]] if has_history(agent) else ["-i", note]
         if agent.get("model"):
-            argv += ["--model", agent["model"]]
+            argv += ["--model", antigravity.model_arg(agent["model"], exe)]  # the label: a bare slug can ask for xhigh
         if agent.get("effort"):
             argv += ["--effort", agent["effort"]]
         return argv
@@ -268,6 +318,7 @@ def launch_env(agent):
         env["SB_STATE"] = STATE
     if agent["provider"] == "hermes":  # Hermes' --append-system-prompt: sent with every call, never stored
         env["HERMES_EPHEMERAL_SYSTEM_PROMPT"] = shared.launch_note(agent)
+    env.update(discovery.endpoint_env(agent, launch_cwd(agent)))
     return env
 
 
@@ -292,6 +343,8 @@ TURN_MARKERS = [
     (re.compile(r"\bWorking\b.*\(\d+s", re.I), "codex is working"),
     (re.compile(r"esc to cancel", re.I), "gemini is working"),
     (re.compile(r"enter interrupt\b|type to redirect this turn", re.I), "hermes is working"),
+    (re.compile(r"^\s*Press up to edit queued messages\s*$|\(alt\+m to send immediately\)|"
+                r"Thinking\.\.\. \(Enter/Esc to cancel\)", re.I | re.M), "antigravity is working"),
 ]
 # Background work under an idle composer: a message may be typed in, but exiting the CLI would kill it.
 BACKGROUND_MARKERS = [
@@ -299,6 +352,7 @@ BACKGROUND_MARKERS = [
     (re.compile(r"\b\d+\s+shells?\b", re.I), "background shells are running"),
     (re.compile(r"\b\d+\s+(background\s+)?(tasks?|monitors?)\b", re.I), "background tasks are running"),
     (re.compile(r"^\s*[◯◐●]\s+\S+.*\d+\s*[ms]\b.*tokens", re.M), "subagents are running"),
+    (re.compile(r"^\s*●\s*\[\d{1,2}:\d\d:\d\d\]\s.*\brunning\s*$", re.M), "background commands are running"),
 ]
 BUSY_MARKERS = TURN_MARKERS + BACKGROUND_MARKERS
 PLACEHOLDERS = re.compile(r"^(Try \"|Ask Codex|Implement \{|Find and fix|Explain this|Summarize|Write tests|"
@@ -365,6 +419,13 @@ class Term:
         return lines, max((i for i, l in enumerate(lines) if re.match(r"^\s*[❯›»]\s?", l) or re.match(r"^\s*>\s", l)),
                           default=None)
 
+    def composer_tail(self):
+        """Lines right around the composer (same 6-line window view() uses), so scrollback never matches."""
+        lines, idx = self._composer()
+        if idx is None:
+            return ""
+        return "\n".join(lines[max(0, idx - 6):idx + 4])
+
     def view(self):
         """(ready, busy, composer text) from the mirrored screen. busy = a turn is running; background shells and
         monitors under an idle composer do not count (a message can be typed in), see background()."""
@@ -374,8 +435,13 @@ class Term:
         lines, idx = self._composer()
         if idx is None:
             return False, False, ""
-        tail = "\n".join(lines[max(0, idx - 4):])
+        tail = "\n".join(lines[max(0, idx - 6):])
         busy = any(rx.search(tail) for rx, _ in TURN_MARKERS)
+        if self.provider == "antigravity" and busy:
+            below = [l.strip() for l in lines[idx + 1:] if l.strip()]
+            above = "\n".join(lines[max(0, idx - 6):idx])
+            if below and below[-1] == "? for shortcuts" and "(alt+m to send immediately)" not in above.lower():
+                busy = False  # idle footer won over any stale scrollback line above it
         comp = composer_text("\n".join(lines[:idx + 1]))
         if comp and self.provider == "hermes":  # Hermes greys a suggestion in after the cursor of an empty composer
             y, x = self.screen.cursor
@@ -498,6 +564,9 @@ class Terminals:
         self.last_esc = {}  # aid -> when the last such Esc was sent
         self.reattached = {}  # aid -> recent quiet reattach times
         self.pruned = 0.0
+        self.on_page = None  # hub callback(aid, text, idem): an agent stuck at rest (stuck.py)
+        self.stuck = {}  # aid -> what stuck.py last judged
+        self.hub = None  # set by the hub: claims.check_reply reads jobs through it
         self.on_waiting = None  # hub callback(aid, waiting, why): a prompt only the owner can answer
         self.before_launch = None  # hub callback(agent) -> account to start on (account handoff)
         self.before_deliver = None  # hub callback(agent) -> True while it moves to another account first
@@ -505,6 +574,7 @@ class Terminals:
         self.on_reply = None  # hub callback(agent, message, reply) when a typed message is answered
         self.waiting = {}
         self.launched_at = {}
+        self.retried_enter = {}  # turn_id -> ts of the one extra Enter before failing an unaccepted push
         self._procs_cache = (0.0, [])
         # agents the owner stopped: opening their terminal shows the scrollback and a Start button instead of
         # launching the CLI again (which made Stop look like it did nothing). Cleared by any launch.
@@ -921,6 +991,15 @@ class Terminals:
                         autoclear.check(self, cur, t)
                     except Exception as e:
                         self.s.event(t.aid, "error", f"auto-clear: {e}")
+                    try:
+                        stuck.check(self, cur, t)
+                    except Exception as e:
+                        self.s.event(t.aid, "error", f"stuck check: {e}")
+                    try:
+                        if self.hub:
+                            claims.check_reply(self, cur, t)
+                    except Exception as e:
+                        self.s.event(t.aid, "error", f"claims check: {e}")
             elif self.waiting.pop(t.aid, None) and self.on_waiting:
                 self.on_waiting(t.aid, False)
         self._confirm()
@@ -978,7 +1057,7 @@ class Terminals:
             return
         folder = launch_cwd(agent)
         donor = seed_trust(agent)
-        if not donor and not _trusts(claude_config_dir(agent["account"]), folder):
+        if not donor and not _trusts(agent_config_dir(agent), folder):
             return  # no account of the owner's trusts this folder: their question to answer
         self.healed[aid] = time.time()
         self.s.event(aid, "system", f"folder trust for {folder} copied to account {agent['account']}"
@@ -1003,9 +1082,25 @@ class Terminals:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def page(self, aid, text, idem):
+        """Page the owner about an agent (stuck.py); the hub sets on_page."""
+        if self.on_page:
+            self.on_page(aid, text, idem)
+
     def _waiting_on(self, aid, why):
         self.s.x("UPDATE messages SET error=? WHERE to_agent=? AND state='queued' AND error IS NOT ?",
                  ("waiting: " + why, aid, "waiting: " + why))
+
+    def _maybe_page_held(self, agent, why):
+        """Owner's draft or an open dialog is never typed over or Esc'd; after PUSH_CEILING_S page the owner once."""
+        aid = agent["id"]
+        row = self.s.one("SELECT id, created_at, (SELECT COUNT(*) FROM messages WHERE to_agent=? AND state='queued') n "
+                         "FROM messages WHERE to_agent=? AND state='queued' ORDER BY created_at, id LIMIT 1", (aid, aid))
+        if not row or not row["created_at"] or time.time() - epoch(row["created_at"]) < PUSH_CEILING_S:
+            return
+        n = row["n"]
+        self.page(aid, f"{n} message{'s' if n != 1 else ''} for {aid} {'are' if n != 1 else 'is'} held behind {why}",
+                  f"held-120:{aid}:{row['id']}")
 
     def _deliver_one(self, agent):
         aid = agent["id"]
@@ -1024,29 +1119,48 @@ class Terminals:
         asking = t.dialog()
         if asking:  # never answered for the owner: a choice stays the owner's
             self._waiting_on(aid, f"the CLI {asking}; answer it in the terminal")
+            self._maybe_page_held(agent, f"its open question ({asking})")
             return
         settled = t.steady_for() > 1.5 and time.time() - self.launched_at.get(aid, 0) > 1.5
+        oldest = self.s.one("SELECT MIN(created_at) t FROM messages WHERE to_agent=? AND state='queued'", (aid,))
+        oldest_age = time.time() - epoch(oldest["t"]) if oldest and oldest["t"] else 0.0
+        has_slash = False
+        pushing = False
         if busy and not comp:
-            self._maybe_interrupt(agent, t)
-        if not ready or busy or comp or not settled or aid in self.switching:
+            has_slash = bool(self.s.one("SELECT 1 n FROM messages WHERE to_agent=? AND state='queued' AND ltrim(body) LIKE '/%'", (aid,)))
+            if not has_slash and ready and settled and aid not in self.switching and can_push_now(self.s, agent, oldest_age):
+                pushing = True
+            else:
+                cfg = delivery_settings(self.s)
+                delayed_push = (not has_slash and agent["provider"] in PUSH_PROVIDERS
+                                and bool(cfg.get("push")) and aid in set(cfg.get("push_off") or ()))
+                if not delayed_push:
+                    self._maybe_interrupt(agent, t)
+        if comp:
+            self._maybe_page_held(agent, "your draft in the composer")
+        if not ready or (busy and not pushing) or comp or not settled or aid in self.switching:
             why = ("moving to another account" if aid in self.switching
                    else "no input box found on the agent's screen" if not ready
+                   else "slash command waits for an idle prompt" if (busy and has_slash)
                    else "the agent is in a turn" if busy
                    else f"unsent text in its composer: {comp[:40]!r}" if comp
                    else "its screen just changed; typing once it holds still for 1.5 s")
             if why:  # shown by sb status and the UI, so a queue that does not move says why
                 self._waiting_on(aid, why)
             return
-        if self.before_deliver and self.before_deliver(agent):
+        if not pushing and self.before_deliver and self.before_deliver(agent):
             return  # moving to another account first; the message is typed after the relaunch
         with self.s.tx():  # select and claim atomically against owner cancellation
             ms = self.s.q("SELECT * FROM messages WHERE to_agent=? AND state='queued' ORDER BY created_at LIMIT ?",
                           (aid, BATCH_MAX))
             if not ms:
                 return
+            if pushing and any((m["body"] or "").lstrip().startswith("/") for m in ms):
+                self._waiting_on(aid, "slash command waits for an idle prompt")
+                return
             bid = new_id("batch") if len(ms) > 1 else None
             turn = f"pty-{bid}" if bid else "pty-" + ms[0]["id"]
-            text = self._batch(agent, bid, ms) if bid else None  # the file exists before anything is claimed
+            text = self._batch(agent, bid, ms, pushed=pushing) if bid else None  # the file exists before anything is claimed
             for m in ms:
                 self.s.db.execute("UPDATE messages SET state='delivering', turn_id=?, attempts=attempts+1, "
                                   "delivered_at=?, error=NULL WHERE id=? AND state='queued'", (turn, now(), m["id"]))
@@ -1055,6 +1169,8 @@ class Terminals:
             text = m["body"] + "".join(" " + p for p in self._attachments(m))
             if m["from_agent"] and m["from_agent"] != "owner":
                 text = f"[from {m['from_agent']} via sb] {text}"
+            if pushing:
+                text = f"{text}\n{PUSH_NOTE}"
         text = autoclear.reminder(self.s, agent) + text  # once, after an auto-clear: where the old conversation went
         t.write("\x1b[200~" + text + "\x1b[201~")
         time.sleep(0.5)
@@ -1063,15 +1179,19 @@ class Terminals:
         time.sleep(1.5)
         # an Enter swallowed by a paste preview leaves our text in the composer: one more Enter submits it
         comp = t.view()[2]
-        if comp and (comp[:20] in text or comp.startswith("[Pasted")):
+        if comp and (" ".join(comp.split())[:20] in " ".join(text.split()) or comp.lower().startswith("[pasted")):
             t.write("\r")
+            if pushing and agent["provider"] == "antigravity":
+                time.sleep(0.3)
+        if pushing and agent["provider"] == "antigravity" and "(alt+m to send immediately)" in t.composer_tail().lower():
+            t.write("\x1bm")  # ONE single write of ESC+'m': split across two writes, ESC alone cancels the turn
 
     @staticmethod
     def _attachments(m):
         from .store import upload_path
         return [p for p in (upload_path(u)[0] for u in json.loads(m.get("attachments") or "[]")) if p]
 
-    def _batch(self, agent, bid, ms):
+    def _batch(self, agent, bid, ms, pushed=False):
         """Several waiting messages as one: a short attributed list to type, every message in full in an
         owner-only Markdown file. The reply to the batch answers each message once."""
         os.makedirs(BATCHES, exist_ok=True)
@@ -1087,6 +1207,8 @@ class Terminals:
         lines = [f"[sb batch {bid}: {len(ms)} messages, oldest first; every one in full in {path}]"]
         if self.interrupted.pop(agent["id"], None):
             lines.append("(Your last step was interrupted so these could reach you; pick it up again afterwards.)")
+        elif pushed:
+            lines.append(PUSH_NOTE)
         for m in ms:
             body = " ".join(m["body"].split())
             lines.append(f"- from {who(m)} ({m['id']}): {body[:300]}{' …' if len(body) > 300 else ''}")
@@ -1110,6 +1232,26 @@ class Terminals:
             self.interrupted[agent["id"]] = self.last_esc[agent["id"]] = time.time()
             self.s.event(agent["id"], "system", "interrupted: messages waited over "
                          f"{INTERRUPT_AFTER_S // 60} min; they go in as one batch at the prompt")
+
+    def _stale_accepted(self, agent, m, t):
+        """Accepted into a push provider's queue but unread for PUSH_STALE_S: Claude gets one Esc per window
+        (verified C3: queued message survives Esc and submits as the next turn); other push providers page the owner."""
+        aid = agent["id"]
+        if t.dialog() or t.view()[2]:  # never interrupt over an open choice or an owner draft in the composer
+            return
+        if agent["provider"] == "claude":
+            logged = self.s.one("SELECT MAX(ts) t FROM events WHERE agent=? AND kind='system' AND text LIKE 'interrupted:%'",
+                                (aid,))
+            last = max(self.interrupted.get(aid) or 0, self.last_esc.get(aid, 0),
+                       epoch(logged["t"]) if logged and logged["t"] else 0)
+            if time.time() - last > PUSH_STALE_S:
+                t.write("\x1b")
+                self.interrupted[aid] = self.last_esc[aid] = time.time()
+                self.s.event(aid, "system", f"interrupted: pushed message waited unread over "
+                             f"{PUSH_STALE_S // 60} min; sent one Esc")
+        else:
+            self.page(aid, f"pushed message {m['id']} accepted by {aid} but unread for over {PUSH_STALE_S // 60} min",
+                      f"push-stale:{m['id']}")
 
     def prune_batches(self):
         """Batch files of messages that are all finished, older than BATCH_KEEP_S."""
@@ -1151,9 +1293,51 @@ class Terminals:
                 body = f"[sb batch {m['turn_id'][4:]}:"
             elif m["from_agent"] and m["from_agent"] != "owner":
                 body = f"[from {m['from_agent']} via sb] {body}"
-            if path and discovery.transcript_has_user_text(path, agent["provider"], body, since):
-                self.s.x("UPDATE messages SET state='delivered' WHERE id=?", (m["id"],))
-            elif time.time() - since > CONFIRM_S:
+            read_ts = discovery.transcript_read_at(path, agent["provider"], body, since) if path else None
+            if read_ts:
+                r_iso = read_ts if isinstance(read_ts, str) else now()
+                self.s.x("UPDATE messages SET state='delivered', read_at=?, error=NULL WHERE id=?", (r_iso, m["id"]))
+                self.retried_enter.pop(m["turn_id"], None)
+                return
+            t = self.term(agent["id"])
+            accepted = (m.get("error") == ACCEPTED_WAIT
+                        or bool(path and discovery.transcript_accepted(path, agent["provider"], body, since))
+                        or (agent["provider"] == "antigravity" and bool(t) and not t.view()[2]
+                            and bool(AGY_QUEUED_RX.search(t.composer_tail()))))
+            if accepted:
+                if m.get("error") != ACCEPTED_WAIT:
+                    self.s.x("UPDATE messages SET error=? WHERE id=?", (ACCEPTED_WAIT, m["id"]))
+                if not t:
+                    lost = agent["id"] not in self.switching
+                else:
+                    ready, busy, comp = t.view()
+                    lost = ready and not busy and not comp and not t.dialog() and t.steady_for() >= ACCEPTED_IDLE_S
+                if lost:
+                    self.retried_enter.pop(m["turn_id"], None)
+                    if (m.get("attempts") or 0) < 2:
+                        self.s.x("UPDATE messages SET state='queued', turn_id=NULL, error=NULL "
+                                 "WHERE id=? AND state='delivering'", (m["id"],))
+                        self.s.event(agent["id"], "system",
+                                     f"requeued {m['id']}: accepted into the CLI queue but disappeared before being read")
+                    else:
+                        self.s.x("UPDATE messages SET state='failed', finished_at=?, error=? "
+                                 "WHERE id=? AND state='delivering'",
+                                 (now(), "accepted into the CLI queue twice but disappeared before being read; not retyped",
+                                  m["id"]))
+                    return
+                if t and t.view()[1] and time.time() - since > PUSH_STALE_S:
+                    self._stale_accepted(agent, m, t)
+                return
+            if time.time() - since > CONFIRM_S:
+                if t and m["turn_id"] not in self.retried_enter:
+                    comp = t.view()[2]
+                    if comp and (" ".join(comp.split())[:20] in " ".join(body.split()) or comp.lower().startswith("[pasted")):
+                        self.retried_enter[m["turn_id"]] = time.time()
+                        t.write("\r")
+                        return
+                if m["turn_id"] in self.retried_enter and time.time() - self.retried_enter[m["turn_id"]] < 15:
+                    return
+                self.retried_enter.pop(m["turn_id"], None)
                 self.s.x("UPDATE messages SET state='failed', finished_at=?, error=? WHERE id=?",
                          (now(), "typed once but not seen in the session transcript; not retyped", m["id"]))
             return
@@ -1192,13 +1376,10 @@ class Terminals:
             self.s.x("UPDATE messages SET state='done', finished_at=? WHERE id=?", (now(), m["id"]))
 
     def _find_codex_thread(self, agent, t):
-        started = t.state.get("started_at") or 0
-        for mtime, path, meta in discovery.recent_codex_rollouts(1):
-            if meta.get("cwd") in (agent.get("cwd"), launch_cwd(agent)) and meta.get("id") and \
-                    epoch(meta.get("timestamp")) >= started - 5:
-                if not self.s.one("SELECT 1 n FROM agents WHERE session_id=?", (meta["id"],)):
-                    self.s.set_agent(agent["id"], session_id=meta["id"])
-                    return
+        sid = autoclear.codex_claim(self.s, agent["id"], discovery.recent_codex_rollouts(1),
+                                    (agent.get("cwd"), launch_cwd(agent)), t.state.get("started_at") or 0)
+        if sid:
+            self.s.set_agent(agent["id"], session_id=sid)
 
     def _find_hermes_session(self, agent, t):
         """Hermes and Antigravity: the newest unclaimed session started in the agent's folder since launch."""
@@ -1207,9 +1388,17 @@ class Terminals:
         else:
             from . import hermes
         taken = {r["session_id"] for r in self.s.q("SELECT session_id FROM agents WHERE session_id IS NOT NULL")}
+        st = autoclear.state(self.s, agent["id"]) or {}
+        since = t.state.get("started_at") or 0
+        if agent["provider"] == "antigravity" and st.get("antigravity"):
+            if st.get("from_session"):
+                taken.add(st["from_session"])  # after auto-clear: never re-claim the cleared conversation
+            since = max(since, st.get("ts") or 0)
         home = next((a["config_dir"] for a in discovery.accounts() if a["name"] == agent["account"]), None)
-        sid = hermes.new_session(agent["cwd"], t.state.get("started_at") or 0, taken, home or None)
+        sid = hermes.new_session(agent["cwd"], since, taken, home)
         if sid:
+            if agent["provider"] == "antigravity" and st.get("antigravity") and st.get("phase") == "moved":
+                self.s.set_setting(autoclear._key(agent["id"]), None)
             self.s.set_agent(agent["id"], session_id=sid)
 
 

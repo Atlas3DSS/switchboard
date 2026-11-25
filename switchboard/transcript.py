@@ -57,6 +57,24 @@ def _claude_entries(e):
             n_img = sum(1 for c in content if isinstance(c, dict) and c.get("type") == "image")
             if text or n_img:
                 out.append(("user", text, n_img))
+    elif t == "attachment":
+        att = e.get("attachment") or {}
+        origin = (att.get("origin") or {}).get("kind")
+        if att.get("type") == "queued_command" and not att.get("isMeta") and (
+                att.get("humanTurn") or origin == "human" or (origin is None and att.get("commandMode") in (None, "prompt"))):
+            prompt = att.get("prompt")
+            ts = ts or att.get("timestamp")
+            if isinstance(prompt, str):
+                text = prompt.strip()
+                if text and not text.startswith(SKIP_USER_PREFIXES) and not text.startswith(("<task-notification", "<agent-message")):
+                    out.append(("user", text))
+            elif isinstance(prompt, list):
+                texts = [c.get("text", "") for c in prompt if isinstance(c, dict) and c.get("type") == "text"]
+                text = "\n".join(x for x in texts if x and not x.lstrip().startswith(SKIP_USER_PREFIXES)
+                                 and not x.lstrip().startswith(("<task-notification", "<agent-message"))).strip()
+                n_img = sum(1 for c in prompt if isinstance(c, dict) and c.get("type") == "image")
+                if text or n_img:
+                    out.append(("user", text, n_img))
     elif t == "assistant":
         if msg.get("model") == "<synthetic>":  # "No response requested." after a stop, rate-limit notices
             return []
@@ -203,12 +221,20 @@ def read_chat(path, provider, limit=40, before=None, after=None):
 
 
 def last_reply(path, provider):
-    """(text, ts) of the newest assistant message, from the transcript tail."""
-    r = read_chat(path, provider, limit=30)
+    """(text, ts) of the newest user-facing assistant reply from the transcript tail (joining split trailing text blocks)."""
+    r = read_chat(path, provider, limit=40)
+    parts, ts = [], None
     for ent in reversed(r["entries"]):
         if ent["role"] == "assistant":
-            return ent["text"], ent["ts"]
-    return "", None
+            if ts is None:
+                ts = ent["ts"]
+            if ent["text"]:
+                parts.append(ent["text"])
+        elif parts:
+            break
+    if not parts:
+        return "", None
+    return "\n\n".join(reversed(parts))[:TEXT_CAP], ts
 
 
 def _reverse_lines(path, max_bytes=256 << 20):

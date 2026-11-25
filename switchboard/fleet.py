@@ -6,6 +6,7 @@ grouped under a broadcast id so the replies can be read together. Only the owner
 for them, may broadcast; an agent reaches other agents one at a time with `sb send`.
 """
 import json
+import os
 import threading
 import time
 
@@ -170,7 +171,7 @@ def brief(hub, hours=24):
     since = time.time() - hours * 3600
     agents = []
     for a in hub.s.agents():
-        if a.get("role") == "desk" or a["provider"] not in discovery.AGENT_CLIS:
+        if a.get("role") == "desk" or a["provider"] not in discovery.AGENT_CLIS or a.get("ghost"):
             continue
         st = hub.t.status(a)
         live = st["running"] or (a["mode"] == "observed" and a.get("pane"))
@@ -261,6 +262,7 @@ def _work_row(r):
 def work_line(w):
     who = ", ".join(x for x in (w["project"], w["agent"] and "agent " + w["agent"]) if x)
     return f"#{w['id']} [P{w['priority']} {w['status']}] {w['title']}" + (f" ({who})" if who else "") + \
+        (" [has a check]" if w.get("check_cmd") else "") + \
         (f" - {_clip(w['detail'], 200)}" if w["detail"] else "")
 
 
@@ -316,7 +318,32 @@ def _check(hub, b):
         if b["status"] not in WORK_STATUS:
             raise ValueError(f"status is one of {', '.join(WORK_STATUS)}")
         out["status"] = b["status"]
+    if "check" in b and b["check"] is not None:
+        out["check_cmd"] = b["check"].strip() or None
+        if out["check_cmd"] and len(out["check_cmd"]) > 1000:
+            raise ValueError("a check is one command of at most 1000 characters; put anything longer in a script")
     return out
+
+
+CHECK_TIMEOUT_S = 25  # under the CLI's own 30 s: a check is a quick command (a test, a curl, a grep), not a job
+
+
+def run_check(hub, w):
+    """(passed, what it printed) for an item's check: the command an item must pass before it can be marked done.
+    'Done' is then something the hub saw, not something an agent said. Run with bash in the project's folder; exit 0 passes."""
+    import subprocess
+    p = hub.s.project(w["project"]) if w.get("project") else None
+    cwd = (hub.project_dir(p) if p else None) or os.path.expanduser("~")
+    env = {k: v for k, v in os.environ.items() if k not in ("SB_AGENT", "SB_TURN", "SB_HOP")}
+    try:
+        r = subprocess.run(["bash", "-c", w["check_cmd"]], capture_output=True, text=True, timeout=CHECK_TIMEOUT_S,
+                           cwd=cwd if os.path.isdir(cwd) else None, env=env, stdin=subprocess.DEVNULL)
+        out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
+        return ok, (f"exit {r.returncode}" + (": " + out[-400:] if out else ""))
+    except subprocess.TimeoutExpired:
+        return False, f"no result in {CHECK_TIMEOUT_S} s"
+    except OSError as e:
+        return False, str(e)
 
 
 def work_item(hub, wid):
@@ -328,24 +355,42 @@ def work_item(hub, wid):
 
 def work_add(hub, b):
     frm = b.get("from") or "owner"
-    w = _check(hub, {"title": b.get("title"), **{k: b[k] for k in ("detail", "project", "agent", "priority", "status")
-                                                  if k in b}})
+    w = _check(hub, {"title": b.get("title"), **{k: b[k] for k in ("detail", "project", "agent", "priority", "status",
+                                                                    "check") if k in b}})
     if "project" not in b:  # an agent's item belongs to its own project
         me = hub.s.agent(frm) if frm != "owner" else None
         w["project"] = me["project"] if me and me.get("role") != "desk" else None
     if w.get("status") in ("done", "dropped"):
         raise ValueError("a new item is todo, doing or blocked")
     t = now()
-    cur = hub.s.x("INSERT INTO work(project,title,detail,status,priority,agent,created_by,created_at,updated_at) "
-                  "VALUES(?,?,?,?,?,?,?,?,?)", (w.get("project"), w["title"], w.get("detail") or "",
-                                                w.get("status") or "todo", w.get("priority") or 2, w.get("agent"),
-                                                frm, t, t))
+    cur = hub.s.x("INSERT INTO work(project,title,detail,status,priority,agent,created_by,created_at,updated_at,"
+                  "check_cmd,check_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  (w.get("project"), w["title"], w.get("detail") or "", w.get("status") or "todo",
+                   w.get("priority") or 2, w.get("agent"), frm, t, t, w.get("check_cmd"),
+                   frm if w.get("check_cmd") else None))
     return work_item(hub, cur.lastrowid)
 
 
 def work_update(hub, wid, b):
     cur = work_item(hub, wid)
     upd = _check(hub, b)
+    frm = b.get("from") or "owner"
+    if "check_cmd" in upd and upd["check_cmd"] != cur.get("check_cmd"):
+        # whoever set a check, or the owner, may change it: the one who must pass it cannot take it away
+        if cur.get("check_cmd") and frm not in ("owner", cur.get("check_by")):
+            raise PermissionError(f"#{cur['id']}'s check was set by {cur.get('check_by') or 'the owner'}; "
+                                  "only they or the owner change it")
+        upd["check_by"] = frm if upd["check_cmd"] else None
+    check = upd.get("check_cmd", cur.get("check_cmd"))
+    if upd.get("status") == "done" and cur["status"] != "done" and check:
+        ok, said = run_check(hub, {**cur, "check_cmd": check})
+        line = f"[{now()[:16].replace('T', ' ')} hub] check {'passed' if ok else 'FAILED'} ({frm} asked for done): {said}"
+        if not ok:
+            hub.s.x("UPDATE work SET detail=?, updated_at=? WHERE id=?",
+                    (((cur["detail"] or "") + "\n" + line).strip()[-4000:], now(), cur["id"]))
+            raise PermissionError(f"#{cur['id']} stays {cur['status']}: its check failed ({said}). "
+                                  f"The check: {check}")
+        upd["detail"] = ((upd.get("detail", cur["detail"]) or "") + "\n" + line).strip()[-4000:]
     if b.get("note"):
         line = f"[{now()[:16].replace('T', ' ')} {b.get('from') or 'owner'}] {' '.join(b['note'].split())}"
         upd["detail"] = ((upd.get("detail", cur["detail"]) or "") + "\n" + line).strip()[-4000:]

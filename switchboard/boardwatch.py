@@ -48,7 +48,7 @@ def check(hub, cfg, wb, rows, now=None, run=hosts.run_on):
         was = state.pop(name)
         if was.get("paged"):
             hub.notify(None, f"GPU scheduler sees {name} again after {int((now - was['since']) / 60)} min.",
-                       level="info", project="switchboard")
+                       level="info", project="switchboard" if hub.s.project("switchboard") else None)
         did.append(("recovered", name))
     byname = {h["name"]: h for h in cfg["hosts"]}
     for name, cards in bad.items():
@@ -64,7 +64,7 @@ def check(hub, cfg, wb, rows, now=None, run=hosts.run_on):
             hub.notify(None, f"GPU scheduler cannot see {name}: {len(cards)} card(s) stale for "
                              f"{int((now - st['since']) / 60)} min, so nothing can start there. Enabling the telemetry "
                              f"timer did not fix it ({st['note'] or 'no answer'}).",
-                       project="switchboard", idem=f"wb-stale:{name}:{int(st['since'])}")
+                       project="switchboard" if hub.s.project("switchboard") else None, idem=f"wb-stale:{name}:{int(st['since'])}")
             did.append(("paged", name))
     return did
 

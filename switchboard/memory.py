@@ -39,7 +39,15 @@ import time
 from . import discovery, shared, transcript
 from .store import STATE, iso_from_epoch, now, private_dir
 
-DEFAULTS = {"enabled": True, "model": "claude-haiku-5-5", "daily_cap": 60, "idle_hours": 2, "versions": 10}
+# `writers`: which subscriptions may write the memory, in order. The next one is used only when the one before it
+# cannot be reached at all (no login, subscription ended, CLI missing), so the memory keeps being written when a
+# provider is dropped. `model` is the Claude model; `writer_models` names the small model of each other writer.
+WRITERS = ("claude", "antigravity", "codex")
+DEFAULTS = {"enabled": True, "model": "claude-haiku-5-5", "daily_cap": 60, "idle_hours": 2, "versions": 10,
+            "writers": list(WRITERS),
+            "writer_models": {"antigravity": "gemini-3.8-flash-medium", "codex": "gpt-6.1-terra"}}
+NO_ACCESS = re.compile(r"authenticat|OAuth|log ?in|credential|subscription|billing|payment|unauthori[sz]ed|\b40[13]\b",
+                       re.I)
 WORKDIR = os.path.join(STATE, "memory")
 MIN_CHARS = 1500      # less talk than this is not worth a call
 DIGEST_CAP = 48000    # characters of numbered messages in one call (about 12k tokens)
@@ -165,8 +173,55 @@ def set_settings(store, upd):
     cfg["versions"] = max(1, min(int(cfg["versions"]), 100))
     if not isinstance(cfg["model"], str) or not cfg["model"].strip():
         raise ValueError("memory.model is a model name")
+    if isinstance(cfg["writers"], str):
+        cfg["writers"] = [w.strip() for w in cfg["writers"].split(",") if w.strip()]
+    if not cfg["writers"] or any(w not in WRITERS for w in cfg["writers"]):
+        raise ValueError(f"memory.writers is a list of {', '.join(WRITERS)}, in the order to try them")
+    cfg["writer_models"] = {**DEFAULTS["writer_models"], **{k: str(v) for k, v in (cfg["writer_models"] or {}).items()
+                                                            if k in WRITERS and str(v).strip()}}
     store.set_setting("memory", cfg)
     return cfg
+
+
+def last_tail_from(path, provider):
+    """Full redacted last user-facing assistant reply from a transcript file (preserving markdown and links)."""
+    if not path or not provider or not os.path.exists(path):
+        return ""
+    try:
+        text, _ = transcript.last_reply(path, provider)
+    except OSError:
+        return ""
+    return redact((text or "").strip())[:transcript.TEXT_CAP]
+
+
+def _autoclear_tail_key(aid):
+    return f"autoclear_tail:{aid}"
+
+
+def mark_autoclear(store, agent, session_id, row_id=None):
+    """Ensure the cleared conversation's full last reply is stored and un-dismissed for the owner's pane."""
+    aid = agent["id"]
+    path = discovery.transcript_path(agent["provider"], session_id, agent.get("account")) if session_id else None
+    tail = last_tail_from(path, agent["provider"]) if path else ""
+    if row_id:
+        r = store.one("SELECT id, agent, path, provider, last_tail FROM memory_sessions WHERE id=?", (row_id,))
+        if r and r["agent"] == aid:
+            if not tail and not (r.get("last_tail") or "") and r.get("path"):
+                tail = last_tail_from(r["path"], r["provider"])
+            store.x("UPDATE memory_sessions SET why=?, last_tail=COALESCE(NULLIF(last_tail,''), ?) WHERE id=?",
+                    ("auto-cleared at its context limit", tail or None, row_id))
+            seen = store.setting("recap_seen", {}) or {}
+            if (seen.get(aid) or 0) >= row_id:
+                seen[aid] = row_id - 1
+                store.set_setting("recap_seen", seen)
+            store.set_setting(_autoclear_tail_key(aid), None)
+            return row_id
+    if tail:
+        store.set_setting(_autoclear_tail_key(aid), {
+            "n": -int(time.time()), "why": "auto-cleared at its context limit", "at": now(),
+            "from_session": session_id, "last_tail": tail,
+        })
+    return None
 
 
 # ---------- the triggers ----------
@@ -175,8 +230,9 @@ def session_ended(hub, agent, session_id, why):
     s = hub.s
     if not agent or not session_id or not settings(s)["enabled"]:
         return None
-    if agent.get("provider") not in ("claude", "codex") or agent.get("role") in ("helper", "desk"):
-        return None  # a helper's result already went to its parent
+    if agent.get("provider") not in ("claude", "codex", "antigravity") or agent.get("role") in ("helper", "desk") \
+            or agent.get("ghost"):
+        return None  # a helper's result already went to its parent; a ghost leaves nothing in the project's memory
     pid = agent.get("project")
     if not pid or pid == "unsorted" or not s.project(pid):
         return None
@@ -191,10 +247,11 @@ def session_ended(hub, agent, session_id, why):
     # Only what was added since the last outline. A part that was too short, over the cap or failed is read again
     # with it: a failure is never retried by itself, but it does not lose that part of the conversation for good.
     start = ((prev["start"] if prev["state"] in ("skipped", "capped", "failed") else prev["size"]) or 0) if prev else 0
+    tail = last_tail_from(path, agent["provider"])
     cur = s.x("""INSERT INTO memory_sessions(project,agent,provider,account,model,session_id,path,why,state,start,size,
-                 created_at) VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?)""",
+                 last_tail,created_at) VALUES(?,?,?,?,?,?,?,?,'pending',?,?,?,?)""",
               (pid, agent["id"], agent["provider"], agent.get("account"), agent.get("model"), session_id, path, why,
-               start, size, now()))
+               start, size, tail or None, now()))
     return cur.lastrowid
 
 
@@ -206,7 +263,7 @@ def idle_sweep(hub):
         return 0
     n = 0
     for a in hub.s.agents():
-        if a["provider"] not in ("claude", "codex") or not a.get("session_id"):
+        if a["provider"] not in ("claude", "codex", "antigravity") or not a.get("session_id"):
             continue
         path = discovery.transcript_path(a["provider"], a["session_id"], a.get("account"))
         try:
@@ -404,9 +461,82 @@ def check_memory(reply, current, allowed):
 
 # ---------- the model calls ----------
 def _call(hub, row, system, prompt, cfg, spent):
-    """One call to the small model. Returns its text; adds what it cost to `spent`."""
-    from .terminals import cli_bin
+    """One call to the small model. Returns its text; adds what it cost to `spent`.
+    The writers are tried in order; the next is used only when the one before cannot be reached at all."""
+    first = None
+    for w in cfg.get("writers") or ["claude"]:
+        try:
+            return {"claude": _call_claude, "antigravity": _call_antigravity, "codex": _call_codex}[w](
+                hub, row, system, prompt, cfg, spent)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            gone = isinstance(e, (OSError, ConnectionError)) or (w == "claude" and NO_ACCESS.search(str(e)))
+            if w == "claude" and not gone:
+                raise  # Claude answered and the answer was an error: another model would not change that
+            first = first or RuntimeError(f"{w}: {e}")
+    raise first or RuntimeError("no memory writer is set")
+
+
+def _call_claude(hub, row, system, prompt, cfg, spent):
     account = row["account"] if row["provider"] == "claude" else hub.default_accounts().get("claude")
+    # An account whose login has expired answers in a tenth of a second and costs nothing: the next Claude account is
+    # tried, the handoff reserve last.
+    from . import handoff  # local: handoff pulls in terminals
+    parked = handoff.settings(hub.s)["parked"]
+    others = sorted((a["name"] for a in discovery.accounts()
+                     if a["kind"] == "claude" and a["name"] != account and a["name"] not in parked),
+                    key=lambda n: n in handoff.settings(hub.s)["reserve"])
+    if not account and not others:
+        raise ConnectionError("no Claude account")
+    err = None
+    for acct in ([account] if account else []) + others:
+        try:
+            return _call_on(acct, system, prompt, cfg, spent)
+        except RuntimeError as e:
+            if not NO_ACCESS.search(str(e)):
+                raise
+            err = e
+    raise err
+
+
+def _call_antigravity(hub, row, system, prompt, cfg, spent):
+    """The same call on the Google AI subscription: agy in print mode, sandboxed, text only (antigravity.consult). agy has
+    no system-prompt flag, so the instructions lead the one message."""
+    from . import antigravity
+    model = cfg["writer_models"]["antigravity"]
+    text, u = antigravity.consult(model, [antigravity.TEXT_ONLY + "\n\n" + system + "\n\n" + prompt], TIMEOUT_S)
+    for k in ("in_tokens", "out_tokens"):
+        spent[k] = (spent.get(k) or 0) + (int(u[k]) if str(u.get(k)).isdigit() else 0)
+    return text
+
+
+def _call_codex(hub, row, system, prompt, cfg, spent):
+    """The same call on the OpenAI subscription: `codex exec`, read-only sandbox, nothing kept, the last message read
+    from a file."""
+    from .terminals import cli_bin
+    private_dir(WORKDIR)
+    env = {k: v for k, v in os.environ.items() if k not in ("SB_AGENT", "SB_TURN", "SB_HOP")}
+    out = os.path.join(WORKDIR, f"codex-{os.getpid()}-{time.time_ns()}.txt")
+    try:
+        r = subprocess.run([cli_bin("codex"), "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+                            "-m", cfg["writer_models"]["codex"], "-o", out, "-"],
+                           input="Answer with text only; use no tool.\n\n" + system + "\n\n" + prompt,
+                           capture_output=True, text=True, timeout=TIMEOUT_S, cwd=WORKDIR, env=env)
+        if r.returncode:
+            raise ConnectionError(f"exit {r.returncode}: {(r.stderr or r.stdout).strip()[-600:]}")
+        with open(out) as f:
+            text = f.read()
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+    if not text.strip():
+        raise RuntimeError("codex gave no answer")
+    return text
+
+
+def _call_on(account, system, prompt, cfg, spent):
+    from .terminals import cli_bin
     env = discovery.account_env(account, "claude")
     for k in ("SB_AGENT", "SB_TURN", "SB_HOP"):
         env.pop(k, None)
@@ -417,7 +547,7 @@ def _call(hub, row, system, prompt, cfg, spent):
             "--disable-slash-commands", "--output-format", "json"]
     r = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=TIMEOUT_S, cwd=WORKDIR, env=env)
     if r.returncode:
-        raise RuntimeError(f"exit {r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+        raise RuntimeError(f"exit {r.returncode}: {(r.stderr or r.stdout).strip()[-600:]}")
     d = json.loads(r.stdout)
     u = d.get("usage") or {}
     spent["in_tokens"] = (spent.get("in_tokens") or 0) + sum(int(u.get(k) or 0) for k in (
@@ -610,6 +740,10 @@ def tick(hub):
     try:
         entries = dialogue(row["path"], row["provider"], row["start"] or 0, row["size"])
         upd.update(stub(entries), messages=len(entries))
+        if not (row.get("last_tail") or ""):
+            said = [t for r, t, _ in entries if r == "assistant"]
+            if said:
+                upd["last_tail"] = said[-1][:transcript.TEXT_CAP]
         if sum(len(_shown(t)) for _, t, _ in entries) < MIN_CHARS or not upd["first_ask"]:
             upd.update(state="skipped", note="too short to outline")
         elif not cfg["enabled"]:
@@ -649,17 +783,30 @@ def tick(hub):
 # ---------- reading it back ----------
 def recap(store, agent):
     """What happened in this agent's last conversation that ended (cleared by hand, cleared automatically, switched),
-    for the owner coming back to an empty terminal. It is the outline the small model already wrote, so showing it
-    costs nothing; a conversation that was not outlined gives its first ask, last ask and last reply instead.
+    for the owner coming back to an empty terminal. It is the outline the small model already wrote, plus the full
+    formatted last assistant reply (last_tail), captured when the session ended so auto-clears show it immediately.
     None once the owner has dismissed it, or when the agent's current conversation is the only one."""
     r = store.one("SELECT * FROM memory_sessions WHERE agent=? AND project=? AND session_id IS NOT ? "
                   "ORDER BY id DESC LIMIT 1", (agent["id"], agent.get("project"), agent.get("session_id")))
-    if not r or r["id"] <= ((store.setting("recap_seen", {}) or {}).get(agent["id"]) or 0):
+    seen = (store.setting("recap_seen", {}) or {}).get(agent["id"]) or 0
+    if not r or r["id"] <= seen:
+        fb = store.setting(_autoclear_tail_key(agent["id"]))
+        if fb and fb.get("last_tail") and fb.get("from_session") != agent.get("session_id"):
+            return {"n": fb.get("n") or -1, "why": fb.get("why") or "auto-cleared at its context limit",
+                    "auto": True, "state": "done", "at": fb.get("at"), "summary": "", "note": None,
+                    "sections": [], "first_ask": "", "last_ask": "",
+                    "last_said": _one_line(fb["last_tail"], 600), "last_tail": fb["last_tail"]}
         return None
-    out = {"n": r["id"], "why": r.get("why"), "state": r["state"], "at": r.get("done_at") or r.get("created_at"),
-           "summary": r.get("summary") or "", "note": r.get("note"), "sections": [],
-           "first_ask": (r.get("first_ask") or "")[:300], "last_ask": (r.get("last_ask") or "")[:300],
-           "last_said": (r.get("last_said") or "")[:600]}
+    tail = r.get("last_tail") or ""
+    if not tail and r.get("path"):
+        tail = last_tail_from(r["path"], r["provider"])
+        if tail:
+            store.x("UPDATE memory_sessions SET last_tail=? WHERE id=?", (tail, r["id"]))
+    why = r.get("why") or ""
+    out = {"n": r["id"], "why": why, "auto": "auto-clear" in why.lower(), "state": r["state"],
+           "at": r.get("done_at") or r.get("created_at"), "summary": r.get("summary") or "", "note": r.get("note"),
+           "sections": [], "first_ask": (r.get("first_ask") or "")[:300], "last_ask": (r.get("last_ask") or "")[:300],
+           "last_said": (r.get("last_said") or "")[:600], "last_tail": tail}
     try:
         outline = json.loads(r.get("outline") or "null") or {}
     except ValueError:
@@ -671,9 +818,12 @@ def recap(store, agent):
 
 
 def recap_seen(store, aid, n):
-    seen = store.setting("recap_seen", {}) or {}
-    seen[aid] = max(int(n), seen.get(aid) or 0)
-    store.set_setting("recap_seen", seen)
+    n = int(n)
+    if n > 0:
+        seen = store.setting("recap_seen", {}) or {}
+        seen[aid] = max(n, seen.get(aid) or 0)
+        store.set_setting("recap_seen", seen)
+    store.set_setting(_autoclear_tail_key(aid), None)
     return {"ok": True}
 
 

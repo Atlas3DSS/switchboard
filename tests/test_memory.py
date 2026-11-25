@@ -89,7 +89,9 @@ class Base(unittest.TestCase):
             f.write(FAKE)
         os.chmod(fake, os.stat(fake).st_mode | stat.S_IXUSR)
         self.log = os.path.join(self.tmp, "calls.jsonl")
-        env = mock.patch.dict(os.environ, {"SB_CLAUDE_BIN": fake, "FAKE_LOG": self.log, "FAKE_MODE": "ok"})
+        env = mock.patch.dict(os.environ, {"SB_CLAUDE_BIN": fake, "FAKE_LOG": self.log, "FAKE_MODE": "ok",
+                                           "SB_ANTIGRAVITY_BIN": os.path.join(self.tmp, "no-agy"),  # never the live CLIs
+                                           "SB_CODEX_BIN": os.path.join(self.tmp, "no-codex")})
         env.start()
         self.addCleanup(env.stop)
         self.hub = Hub(Store(os.path.join(self.tmp, "hub.db")))
@@ -384,6 +386,48 @@ class MemoryTests(Base):
                              ("GET", "/api/projects/alpha/memory/versions"), ("POST", "/api/projects/alpha/memory"),
                              ("POST", "/api/settings")):
             self.assertFalse(barrier.agent_may(method, path))
+
+
+class WriterTests(Base):
+    """The memory is written by the first writer that can be reached (memory.settings 'writers')."""
+
+    def call(self, **fakes):
+        spent = {}
+        row = {"provider": "claude", "account": "main", "project": "alpha"}
+        with mock.patch.multiple(memory, **fakes):
+            return memory._call(self.hub, row, "SYS", "PROMPT", memory.settings(self.hub.s), spent), spent
+
+    def test_claude_out_of_reach_goes_to_the_next_writer(self):
+        from switchboard import antigravity
+        gone = mock.Mock(side_effect=RuntimeError("exit 1: OAuth token has expired, please log in"))
+        with mock.patch.object(antigravity, "consult", return_value=("from gemini", {"in_tokens": "12", "out_tokens": "3"})) as c:
+            text, spent = self.call(_call_claude=gone)
+        self.assertEqual((text, spent["in_tokens"]), ("from gemini", 12))
+        self.assertEqual(c.call_args[0][0], "gemini-3.8-flash-medium")
+        self.assertIn("SYS", c.call_args[0][1][0])  # agy has no system prompt: the instructions lead the message
+
+    def test_an_error_claude_answered_with_is_not_passed_on(self):
+        from switchboard import antigravity
+        with mock.patch.object(antigravity, "consult") as c:
+            with self.assertRaises(RuntimeError):
+                self.call(_call_claude=mock.Mock(side_effect=RuntimeError("prompt is too long")))
+        c.assert_not_called()
+
+    def test_each_writer_in_turn_and_the_first_failure_is_the_one_reported(self):
+        gone = mock.Mock(side_effect=ConnectionError("no Claude account"))
+        text, spent = self.call(_call_claude=gone, _call_antigravity=mock.Mock(side_effect=ConnectionError("quota")),
+                                _call_codex=mock.Mock(return_value="from codex"))
+        self.assertEqual(text, "from codex")
+        with self.assertRaisesRegex(RuntimeError, "claude: no Claude account"):
+            self.call(_call_claude=gone, _call_antigravity=mock.Mock(side_effect=ConnectionError("quota")),
+                      _call_codex=mock.Mock(side_effect=OSError("no codex")))
+
+    def test_writers_setting(self):
+        cfg = memory.set_settings(self.hub.s, {"writers": "antigravity,codex", "writer_models": {"codex": "gpt-x"}})
+        self.assertEqual(cfg["writers"], ["antigravity", "codex"])
+        self.assertEqual(cfg["writer_models"], {"antigravity": "gemini-3.8-flash-medium", "codex": "gpt-x"})
+        with self.assertRaises(ValueError):
+            memory.set_settings(self.hub.s, {"writers": ["llama"]})
 
 
 class WorkCloseTests(Base):

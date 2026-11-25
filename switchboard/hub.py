@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -10,9 +11,9 @@ import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from . import accounts, autoclear, barrier, boardwatch, config, discovery, fleet, handoff, helpers, hosts, inbox, insights, jobs, leasedecay, memory, nodes, rewind, team, trace, phone, retention, sessions, shared, sources, transcript, ws
+from . import accounts, autoclear, barrier, boardwatch, claims, config, discovery, fleet, ghost, handoff, helpers, hosts, inbox, insights, jobs, kill, leasedecay, memory, nodes, rewind, team, terminals, trace, phone, retention, sessions, shared, sources, transcript, ws
 from .runner import Runner
 from .terminals import PROVIDERS, NeedsConfirm, Terminals, is_fable
 from .store import STATE, Store, epoch, iso_from_epoch, new_id, now, save_upload, upload_path
@@ -46,6 +47,164 @@ def code_fingerprint():
     return h.hexdigest()[:12]
 
 
+_SKIP_WALK_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", "Box", ".mypy_cache", ".pytest_cache"})
+_LINE_SUFFIX_RE = re.compile(r"(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)$")
+_URI_SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://")
+_NON_PATH_SCHEME_RE = re.compile(r"^(javascript|data|mailto|tel|vbscript|about|blob):", re.I)
+
+
+def _desktop_env():
+    """Environment for launching GUI desktop openers (gio / xdg-open) from a systemd user service."""
+    env = dict(os.environ)
+    uid = os.getuid()
+    env.setdefault("DISPLAY", ":0.0")
+    env.setdefault("XAUTHORITY", os.path.expanduser("~/.Xauthority"))
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    return env
+
+
+def _strip_location_suffix(path_str):
+    """Strip trailing #L12-L34 or :12:34 line/col markers when the raw path itself does not exist."""
+    if os.path.exists(path_str):
+        return path_str
+    stripped = _LINE_SUFFIX_RE.sub("", path_str)
+    return stripped or path_str
+
+
+def _shallow_find(root, rel, max_depth=4, max_dirs=400):
+    """Bounded symlink-safe search inside root for a relative path or filename suffix (never enters Box or symlinks)."""
+    if not root or not os.path.isdir(root):
+        return None
+    real_root = os.path.realpath(root)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if real_root in ("/", home, "/mnt", "/mnt/storage") or real_root.startswith("/mnt/storage/Box"):
+        return None
+    want = rel.strip("/")
+    if not want:
+        return None
+    want_suffix = "/" + want
+    queue = [(real_root, "", 0)]
+    visited = 0
+    best = None
+    while queue and visited < max_dirs:
+        cur, cur_rel, depth = queue.pop(0)
+        visited += 1
+        try:
+            entries = list(os.scandir(cur))
+        except OSError:
+            continue
+        for ent in entries:
+            name = ent.name
+            if name in _SKIP_WALK_DIRS:
+                continue
+            cand_rel = f"{cur_rel}/{name}" if cur_rel else name
+            if cand_rel == want or cand_rel.endswith(want_suffix):
+                if best is None or len(cand_rel) < len(best[0]):
+                    best = (cand_rel, ent.path)
+            if depth < max_depth:
+                try:
+                    if ent.is_dir(follow_symlinks=False):
+                        queue.append((ent.path, cand_rel, depth + 1))
+                except OSError:
+                    pass
+    return best[1] if best else None
+
+
+def resolve_local_path(raw, agent_cwd=None, project_cwd=None, workspace=None):
+    """Resolve a file:// URI, absolute path, ~/path, or partial/relative path against agent/project cwd."""
+    workspace = workspace or config.workspace()
+    s = (raw or "").strip().strip("`\"'<>")
+    if not s or any(c in s for c in "\x00\n\r"):
+        return None
+    if s.lower().startswith("file://"):
+        u = urlparse(s)
+        host = u.netloc or ""
+        path = unquote(u.path or "")
+        if host and host.lower() != "localhost":
+            s = unquote(host) + path
+        else:
+            s = path
+        if not s:
+            return None
+    s = _strip_location_suffix(s)
+    s = os.path.expanduser(s)
+    if os.path.isabs(s):
+        if os.path.exists(s):
+            return os.path.normpath(s)
+        # Try stripping a stray leading '/' (e.g. '/switchboard/hub.py' meaning repo-relative)
+        rel = s.lstrip("/")
+    else:
+        rel = s
+    rel_clean = _strip_location_suffix(rel).lstrip("./") if rel.startswith("./") else _strip_location_suffix(rel)
+    proj_roots = ([project_cwd] if isinstance(project_cwd, str) else list(project_cwd or []))
+    search_roots = [r for r in (agent_cwd, *proj_roots) if isinstance(r, str) and r]
+    bases = []
+    for b in search_roots:
+        cur = os.path.expanduser(b)
+        for _ in range(5):
+            if cur and cur not in bases:
+                bases.append(cur)
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur or cur == os.path.expanduser("~"):
+                break
+            cur = parent
+    for b in (workspace, os.path.join(workspace, "experiments"), os.path.expanduser("~")):
+        if b and b not in bases:
+            bases.append(b)
+    for base in bases:
+        cand = os.path.normpath(os.path.join(base, rel_clean))
+        if os.path.exists(cand):
+            return cand
+    # Bounded shallow search inside agent_cwd (then project_cwd dirs) for partial paths or bare filenames
+    for root in search_roots:
+        hit = _shallow_find(os.path.expanduser(root), rel_clean)
+        if hit and os.path.exists(hit):
+            return os.path.normpath(hit)
+    return None
+
+
+def _desktop_open_cmd():
+    """Prefer 'gio open' (inherits MIME supertypes like text/x-python -> text/plain without XDG_CURRENT_DESKTOP)."""
+    gio = shutil.which("gio")
+    return ([gio, "open"], "gio") if gio else (["xdg-open"], "xdg-open")
+
+
+def open_desktop(target, agent_cwd=None, project_cwd=None, workspace=None, spawn=subprocess.Popen):
+    """Open an http(s) URL in the owner's browser, a local folder in the file manager, or a local file via gio/xdg-open."""
+    workspace = workspace or config.workspace()
+    raw = (target or "").strip()
+    if not raw or any(c in raw for c in "\x00\n\r"):
+        raise ValueError("empty or invalid target")
+    env = _desktop_env()
+    m = _URI_SCHEME_RE.match(raw)
+    if m:
+        scheme = m.group(1).lower()
+        if scheme in ("http", "https"):
+            cmd, opener = _desktop_open_cmd()
+            spawn([*cmd, raw], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  start_new_session=True, env=env)
+            return {"ok": True, "kind": "url", "target": raw, "opener": opener}
+        if scheme != "file":
+            raise ValueError(f"unsupported link scheme: {scheme}")
+    else:
+        m2 = _NON_PATH_SCHEME_RE.match(raw)
+        if m2:
+            raise ValueError(f"unsupported link scheme: {m2.group(1).lower()}")
+    resolved = resolve_local_path(raw, agent_cwd=agent_cwd, project_cwd=project_cwd, workspace=workspace)
+    if not resolved:
+        raise LookupError(raw)
+    if os.path.isdir(resolved):
+        opener = shutil.which("thunar") or "xdg-open"
+        spawn([opener, resolved], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              start_new_session=True, env=env)
+        return {"ok": True, "kind": "dir", "path": resolved, "opener": os.path.basename(opener)}
+    cmd, opener = _desktop_open_cmd()
+    spawn([*cmd, resolved], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          start_new_session=True, env=env)
+    return {"ok": True, "kind": "file", "path": resolved, "opener": opener}
+
+
 CODE_AT_START = code_fingerprint()
 STARTED_AT = time.time()
 
@@ -55,6 +214,22 @@ def _talkable(a):
         and a.get("project") not in (None, "unsorted")
 
 
+def notice_source(source, text=""):
+    """What filed a notice no agent did: the systemd unit it ran in (suffix dropped), else the 'name: ' its text
+    opens with. None when neither tells."""
+    source = re.sub(r"\.(service|timer|scope)$", "", (source or "").strip())
+    if source:
+        return source[:80]
+    m = re.match(r"([A-Za-z0-9][\w.@-]{2,59}): ", text or "")
+    return m.group(1) if m else None
+
+
+GATHER_NUDGE = ("[Switchboard: the owner moved every agent of your type to account {account}, so your session was relaunched "
+                "there. Nothing in the conversation was lost, but the relaunch ended anything you had running in the "
+                "background (waits, monitors, background shells). Restart whatever it stopped and carry on with your "
+                "work; if you had nothing in progress, no reply is needed.]")
+
+
 class Hub:
     def __init__(self, store=None):
         self.s = store or Store()
@@ -62,6 +237,9 @@ class Hub:
         shared.outside = self.s.outside
         self.r = Runner(self.s)
         self.t = Terminals(self.s)
+        self.t.hub = self
+        from . import antigravity
+        antigravity.NO_XHIGH.update(self.s.setting("agy_no_xhigh", []) or [])  # models the API refused XHigh for
         self.source_cache = {}
         self._model_checked = {}  # agent id -> (transcript, size) last read for its model
         self.stop_flag = threading.Event()
@@ -69,6 +247,7 @@ class Hub:
         self.ensure_project_dirs()
         self.focus = self.s.setting("owner_focus")
         self.t.on_waiting = self.waiting_changed
+        self.t.on_page = lambda aid, text, idem: self.notify(aid, text, kind="stuck", idem=idem)
         self.handoff = handoff.Handoff(self)
         self.insights = insights.Insights(self)
         self.traces = trace.Traces()
@@ -146,7 +325,10 @@ class Hub:
             seed = json.load(open(SEED))
         except (OSError, ValueError):
             seed = []
+        dead = set(kill.killed(self))
         for p in seed:
+            if p["id"] in dead:  # the owner killed it: the seed file does not bring it back
+                continue
             if not self.s.project(p["id"]):
                 self.s.upsert_project(p)
             else:  # keep owner edits to text fields; refresh sources/match from the seed file
@@ -269,14 +451,27 @@ class Hub:
                 self.s.set_agent(a["id"], gone=1, state="stopped")
 
     def follow_cleared(self, live):
-        """/clear (or /resume) inside a Claude terminal starts another session in the same process: follow it, so
-        the agent's chat, usage and next launch use the new session instead of the old one."""
+        """/clear (or /resume) inside a Claude or Antigravity terminal starts another session in the same process:
+        follow it, so the agent's chat, usage and next launch use the new session instead of the old one."""
+        from . import antigravity
         by_pid = {s["pid"]: s.get("sessionId") for s in live if s.get("pid") and s.get("sessionId")}
+        taken = {r["session_id"] for r in self.s.q("SELECT session_id FROM agents WHERE session_id IS NOT NULL")}
+        accts = None
         for a in self.s.agents():
-            if a["mode"] != "terminal" or a["provider"] != "claude":
+            if a["mode"] != "terminal" or a["provider"] not in ("claude", "antigravity"):
                 continue
-            pid = self.t.status(a)["pid"]
-            sid = by_pid.get(pid)
+            if a["provider"] == "claude":
+                pid = self.t.status(a)["pid"]
+                sid = by_pid.get(pid)
+            else:
+                t = self.t.term(a["id"])
+                if not t or not t.alive or not a.get("cwd"):
+                    continue
+                if accts is None:
+                    accts = {x["name"]: x.get("config_dir") for x in discovery.accounts() if x["kind"] == "antigravity"}
+                sid = antigravity.follow_session(a["cwd"], a.get("session_id"), t.text(),
+                                                 since=t.state.get("started_at") or 0, taken=taken,
+                                                 d=accts.get(a.get("account")))
             if not sid or sid == a["session_id"]:
                 continue
             other = self.s.one("SELECT id FROM agents WHERE session_id=? AND id<>?", (sid, a["id"]))
@@ -287,6 +482,7 @@ class Hub:
             row = memory.session_ended(self, a, a["session_id"], "cleared or switched in the terminal")
             autoclear.followed(self.s, a, a["session_id"], row)
             self.s.set_agent(a["id"], session_id=sid, context_tokens=0)
+            taken.add(sid)
             self.s.event(a["id"], "system", f"now on session {sid} (cleared or switched in the terminal)")
 
     # ---------- past sessions ----------
@@ -556,7 +752,7 @@ class Hub:
 
     def project_agents(self, pid):
         return [a for a in self.s.agents() if a["project"] == pid and a.get("role") != "desk"
-                and discovery.transcript_format(a["provider"])]
+                and discovery.transcript_format(a["provider"]) and not a.get("ghost")]  # a ghost shares nothing
 
     def project_context(self, pid, viewer=None, notes=12):
         pid = self.context_scope(viewer, pid, read=True)
@@ -725,7 +921,7 @@ class Hub:
             self.sync_observed = lambda: None
         for fn, every in ((self.refresh_usage, 30), (self.delivery, 1.5), (self.sync_observed, 8), (self.probe_sources, 60),
                           (self.terminal_tick, 1.0), (self.refresh_replies, 5), (accounts.poll, 120),
-                          (self.handoff.tick, 3), (lambda: helpers.tick(self), 5),
+                          (self.handoff.tick, 3), (self.gather_tick, 3), (self.quota_tick, 60), (lambda: helpers.tick(self), 5),
                           (self.index_sessions, 120), (self.fleet_tick, hosts.PROBE_S),
                           (lambda: memory.tick(self), 5), (lambda: memory.idle_sweep(self), memory.IDLE_EVERY_S),
                           (lambda: retention.sweep(self), retention.EVERY_S), (lambda: fleet.work_nudge(self), 600),
@@ -750,14 +946,16 @@ class Hub:
         # no lead set: the most recently used agent of the project's highest model class answers for it, so a
         # message addressed to the project always lands (an unpaused agent before a paused one)
         mine = [a for a in self.s.agents() if a["project"] == pid and not a.get("gone") and a["provider"] != "shell"
-                and a.get("role") not in ("desk", "helper") and a.get("mode") != "observed"]
+                and a.get("role") not in ("desk", "helper") and a.get("mode") != "observed" and not a.get("ghost")]
         if not mine:
             return None
+        held = nodes.reserved(self, pid)  # an agent the owner holds in reserve answers only when nobody else is there
+        mine = [a for a in mine if a["id"] not in held] or mine
         cls = lambda a: helpers.rank(a.get("model")) or (3 if a["provider"] != "claude" else 0)
         return max(mine, key=lambda a: (not a.get("paused"), cls(a), a.get("last_activity") or "",
                                         a.get("created_at") or ""))["id"]
 
-    def agent_view(self, a, leads=None):
+    def agent_view(self, a, leads=None, marks=None):
         qr = self.s.one("SELECT COUNT(*) n, MIN(created_at) since, (SELECT error FROM messages WHERE to_agent=? AND "
                         "state='queued' ORDER BY created_at LIMIT 1) why FROM messages WHERE to_agent=? AND "
                         "state='queued'", (a["id"], a["id"]))
@@ -769,14 +967,17 @@ class Hub:
         term = self.t.term(a["id"]) if st["running"] else None
         asking = term.dialog() if term and a["provider"] != "shell" else None
         leads = leads if leads is not None else {a["project"]: self.lead_of(a["project"])}
+        marks = marks if marks is not None else {a["project"]: nodes.marks(self, a["project"], lead=leads.get(a["project"]))}
         return {"id": a["id"], "project": a["project"], "title": a["title"], "provider": a["provider"],
                 "account": a["account"], "model": a["model"], "is_fable": is_fable(a["model"]),
                 "session_id": a["session_id"], "cwd": a["cwd"], "mode": a["mode"],
-                "lead": leads.get(a["project"]) == a["id"], "role": a.get("role"), "state": st["state"], "running": st["running"],
+                "lead": leads.get(a["project"]) == a["id"], "role": a.get("role"), "ghost": bool(a.get("ghost")),
+                "marks": (marks.get(a["project"]) or {}).get(a["id"]) or {},  # lead/architect/illustrator: on or auto
+                "state": st["state"], "running": st["running"],
                 "pid": st["pid"], "started_at": st["started_at"], "last_activity": a["last_activity"],
                 "last_text": a["last_text"] or "", "launch_block": block, "queued": q, "paused": bool(a.get("paused")),
-                "queued_since": qr["since"], "asking": asking,
-                "queue_reason": why[len("waiting: "):] if why.startswith("waiting: ") else why or None,
+                "attest": claims.required(self.s, a),
+                "queued_since": qr["since"], "asking": asking, "queue_reason": why[len("waiting: "):] if why.startswith("waiting: ") else why or None,
                 "switching": self.t.switching.get(a["id"]),
                 "context_tokens": a.get("context_tokens"), "context_window": a.get("context_window"),
                 "recap": memory.recap(self.s, a)}  # the conversation that ended before this one, until dismissed
@@ -808,14 +1009,15 @@ class Hub:
                 "last_activity": iso_from_epoch(last) if last else None,
                 "stale": bool(last) and time.time() - last > STALE_S and not p["archived"],
                 "agent_ids": [a["id"] for a in agents], "open_decisions": open_dec, "lead": self.lead_of(p["id"]),
-                **(lambda st: {"nodes": st["seats"], "node_extras": [x["agent"] for x in st["extras"]]})(nodes.seats(self, p["id"])),
+                **(lambda st: {"nodes": st["seats"], "node_extras": [x["agent"] for x in st["extras"] if not x["illustrator"]]})(nodes.seats(self, p["id"])),
                 "cwd": self.project_dir(p),
                 "sources": p.get("sources") or []}
 
     def overview(self):
         raw = self.s.agents()
         leads = {p["id"]: self.lead_of(p["id"]) for p in self.s.projects()}
-        agents = [self.agent_view(a, leads) for a in raw]
+        marks = {pid: nodes.marks(self, pid, lead=lead) for pid, lead in leads.items()}
+        agents = [self.agent_view(a, leads, marks) for a in raw]
         projects = []
         for p in self.s.projects():
             mine = [a for a in agents if a["project"] == p["id"]]
@@ -855,12 +1057,16 @@ class Hub:
         return self.msg_view(self.s.message(mid))
 
     def msg_view(self, m):
-        return {"id": m["id"], "to": m["to_agent"], "from": m["from_agent"], "body": m["body"], "state": m["state"],
+        read_at = m.get("read_at")
+        view = {"id": m["id"], "to": m["to_agent"], "from": m["from_agent"], "body": m["body"], "state": m["state"],
                 "attempts": m["attempts"], "created_at": m["created_at"], "delivered_at": m["delivered_at"],
-                "finished_at": m["finished_at"], "reply": m["reply"], "error": m["error"], "hop": m["hop"],
-                "mode": m.get("mode") or "queue",
+                "read_at": read_at, "finished_at": m["finished_at"], "reply": m["reply"], "error": m["error"],
+                "hop": m["hop"], "mode": m.get("mode") or "queue",
                 "attachments": [{"id": u, "url": f"/api/uploads/{u}", "media_type": upload_path(u)[1]}
                                 for u in json.loads(m.get("attachments") or "[]")]}
+        if m["state"] == "delivered" and read_at:
+            view["status_note"] = f"read at {read_at[11:16]}, reply when its turn ends"
+        return view
 
     def project_detail(self, pid):
         if pid == "unsorted" and not self.s.project("unsorted"):
@@ -891,7 +1097,10 @@ class Hub:
             raise ValueError("to and a body or an attachment are required")
         agent = self.s.agent(to)
         sender = self.s.agent(body.get("from")) if body.get("from") not in (None, "owner", "system") else None
-        if sender and not agent and not self.s.project(to) and self.s.outside(sender["project"])["write"]:
+        if sender and agent and agent.get("ghost") and (sender.get("ghost") or not barrier.unlimited(sender["project"])):
+            # to every agent a ghost does not exist (but to the owner's own project, which manages it for the owner)
+            raise LookupError(f"no agent or project called {to}")
+        if sender and (not agent or agent["gone"]) and not self.s.project(to) and self.s.outside(sender["project"])["write"]:
             live = sorted({a["project"] for a in self.s.agents() if _talkable(a)})
             raise LookupError(f"no agent or project called {to}. Projects you can write to (their lead answers): "
                               + ", ".join(live))
@@ -909,7 +1118,7 @@ class Hub:
                         f"{agent['project']}. You hold its Lead seat: answer it yourself or pass it to the agent of "
                         f"your project who knows (`sb context` lists them), and reply with `sb send {sender['id']} "
                         f"\"...\"`.]\n{text}")
-        if not agent and self.s.project(to):
+        if (not agent or agent["gone"]) and self.s.project(to):
             lead = self.lead_of(to)
             if not lead:
                 raise ValueError(f"project {to} has no agent that can take a message")
@@ -923,6 +1132,10 @@ class Hub:
             raise LookupError(f"unknown agent {to}")
         if agent["provider"] == "shell":
             raise ValueError(f"{to} is a plain shell; messages go to agents")
+        if sender and text:  # "are you sure?": the jobs and files a claim names are looked at (switchboard/claims.py)
+            text = claims.on_send(self, sender, text)
+        if text and body.get("from") != "system" and not text.startswith("/") and claims.required(self.s, agent):
+            text += "\n" + claims.FOOTER  # the attest box: every request it gets says a receipt is expected
         self.check_cross_project(body.get("from"), agent)
         nodes.brief_if_new(self, agent)  # a seat that never ran is briefed ahead of its first message
         hop = int(body.get("hop") or 0)
@@ -959,6 +1172,7 @@ class Hub:
         kinds = {x["name"]: x["kind"] for x in discovery.accounts()}
         if kinds.get(account) != a["provider"]:
             raise ValueError(f"{account} is not a {a['provider']} account")
+        self.gather_drop(aid)  # a switch by hand outranks a waiting "move agents to this account"
         if a["mode"] == "terminal":
             self.t.switch_account(aid, account, confirm)
         elif a["mode"] == "managed":
@@ -969,12 +1183,76 @@ class Hub:
             self.s.event(aid, "system", f"account {account} applies when this tab moves to the switchboard")
         return self.agent_view(self.s.agent(aid))
 
+    def gather(self, account):
+        """Owner: every agent of this account's type moves to it, and it becomes the default for new ones. A stopped
+        agent is set at once; a running one relaunches the same conversation when it is idle (gather_tick, one per
+        tick), so nothing is cut off in the middle of a turn. Returns what happened to each."""
+        kind = next((x["kind"] for x in discovery.accounts() if x["name"] == account), None)
+        if kind not in discovery.AGENT_CLIS:
+            raise LookupError(f"account {account}")
+        self.s.set_setting("default_account", {**self.default_accounts(), kind: account})
+        wait = dict(self.s.setting("gathering", {}) or {})
+        out = {"account": account, "moved": [], "waiting": []}
+        for a in self.s.agents():
+            if a["provider"] != kind or a["account"] == account:
+                wait.pop(a["id"], None)
+            elif a["mode"] == "terminal" and self.t.running(a["id"]):
+                wait[a["id"]] = account
+                out["waiting"].append(a["id"])
+            else:
+                wait.pop(a["id"], None)
+                self.switch_account(a["id"], account)
+                out["moved"].append(a["id"])
+        self.s.set_setting("gathering", wait)
+        return out
+
+    def gather_drop(self, aid):
+        wait = self.s.setting("gathering", {}) or {}
+        if aid in wait:
+            wait.pop(aid)
+            self.s.set_setting("gathering", wait)
+
+    def gather_tick(self):
+        """Move one waiting agent that is idle now; the rest wait for the next tick (relaunches are not stacked)."""
+        wait = self.s.setting("gathering", {}) or {}
+        for aid, account in list(wait.items()):
+            a = self.s.agent(aid)
+            if not a or a["account"] == account or a["mode"] != "terminal":
+                self.gather_drop(aid)
+                continue
+            if aid in self.t.switching or (self.t.running(aid) and (self.t.busy(aid) or self.t.status(a)["state"] != "idle")):
+                continue
+            self.gather_drop(aid)
+            self.s.event(aid, "system", f"moving to {account} with the other agents (owner)")
+            was_running = self.t.running(aid)
+            self.t.switch_account(aid, account)
+            if was_running:  # the relaunch ends its waits and background shells: without this it sits idle
+                self.s.enqueue(aid, GATHER_NUDGE.format(account=account), frm="owner", idem=f"gather:{aid}:{int(time.time())}")
+            return
+
+    def quota_tick(self):
+        """Page the owner when Antigravity logs that its quota ran out (at most once per half hour): nothing else
+        tells him, and its agents just sit there."""
+        from . import antigravity
+        for x in discovery.accounts():
+            if x["kind"] != "antigravity":
+                continue
+            hit = antigravity.quota_hit(x.get("config_dir"))
+            if hit and time.time() - hit["at"] < 1800:
+                ags = [a["id"] for a in self.s.agents() if a["account"] == x["name"] and a["provider"] == "antigravity"]
+                self.notify(None, f"antigravity: quota ran out at {time.strftime('%H:%M', time.localtime(hit['at']))}, "
+                            f"resets {time.strftime('%a %H:%M', time.localtime(hit['resets']))} ({len(ags)} agents on it)",
+                            kind="quota", idem=f"agy-quota:{x['name']}:{int(hit['at']) // 1800}", project="switchboard",
+                            source="antigravity")
+
     def create_agent(self, b):
         provider = b.get("provider")
         if not provider and b.get("account"):
             provider = next((a["kind"] for a in discovery.accounts() if a["name"] == b["account"]), None)
         if provider not in PROVIDERS:
             raise ValueError("provider must be one of " + ", ".join(PROVIDERS))
+        if b.get("ghost") and provider not in ghost.PROVIDERS:
+            raise ValueError("a ghost agent is a Claude, Codex or Antigravity agent")
         acct = None if provider == "shell" else (b.get("account") or self.default_accounts().get(provider))
         if provider != "shell" and acct not in {a["name"] for a in discovery.accounts() if a["kind"] == provider}:
             raise ValueError(f"no {provider} account named {acct}; add one on the Setup page" if acct else
@@ -1006,6 +1284,7 @@ class Hub:
                               "mode": "terminal", "session_id": None if provider == "shell" else (sid or (str(uuid.uuid4()) if provider in ("claude", "api") else None)),
                               "cwd": cwd, "permission_mode": b.get("permission_mode") or None,
                               "effort": b.get("effort") or None, "state": "idle", "project_pinned": 1,
+                              "ghost": 1 if b.get("ghost") else 0,
                               "last_activity": now()})
         if b.get("prompt"):
             self.s.enqueue(aid, b["prompt"], frm=b.get("from") or "owner", idem=b.get("idem"))
@@ -1049,13 +1328,21 @@ class Hub:
         return {"ok": True, "running": CODE_AT_START, "disk": code_fingerprint()}
 
     # ---------- notifications (the page's inbox) ----------
-    def notify(self, agent, text, kind="notify", level="need", idem=None, project=None):
-        """Something for the owner. level 'need' = they have to act; 'info' = FYI (expires after an hour)."""
+    def notify(self, agent, text, kind="notify", level="need", idem=None, project=None, source=None, paths=()):
+        """Something for the owner. level 'need' = they have to act; 'info' = FYI (expires after an hour).
+        A notice no agent filed (a timer, a script) still gets a project: the one named, else the one the owner
+        adopted its source into, else the one whose folder holds its unit file or working directory."""
         text = (text or "").strip()
         if not text:
             raise ValueError("text is required")
         a = self.s.agent(agent) if agent else None
+        if project and project != "unsorted" and not self.s.project(project):  # only a project the caller named
+            raise ValueError(f"no project {project}")
         project = project or (a or {}).get("project")
+        if not a:
+            source = notice_source(source, text)
+        if not project or project == "unsorted":
+            project = self.adopted_project(source, paths)
         level = "info" if level == "info" else "need"
         with self.s.tx():
             if idem:
@@ -1072,9 +1359,49 @@ class Hub:
                 if existing:
                     return existing
             nid = new_id("n")
-            self.s.x("INSERT OR IGNORE INTO notifications(id,idem,agent,project,kind,level,text,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                     (nid, idem or nid, agent, project, kind, level, text, now()))
+            self.s.x("INSERT OR IGNORE INTO notifications(id,idem,agent,project,kind,level,text,created_at,source) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (nid, idem or nid, agent, project, kind, level, text, now(), None if a else source))
             return self.s.one("SELECT * FROM notifications WHERE idem=?", (idem or nid,))
+
+    def adopted_project(self, source, paths=()):
+        """The project a notice with no agent behind it belongs to, or None: the owner's standing choice for its
+        source, else the project whose folder holds one of the paths (its unit file, its working directory)."""
+        if source:
+            rule = self.s.one("SELECT project FROM adoptions WHERE source=?", (source,))
+            if rule and self.s.project(rule["project"]):
+                return rule["project"]
+        for path in paths or ():
+            pid = self.project_for(os.path.realpath(os.path.expanduser(str(path)))) if path else "unsorted"
+            if pid != "unsorted":
+                return pid
+        return None
+
+    def adopt(self, iid, project):
+        """The owner files an inbox item that has no project under one. Its source is remembered: every other open
+        item from that source moves too, and whatever it files later lands in that project."""
+        if not project or project == "unsorted" or not self.s.project(project):
+            raise ValueError(f"no project {project}")
+        if self.s.decision(iid):
+            self.s.x("UPDATE decisions SET project=? WHERE id=?", (project, iid))
+            self.s.x("UPDATE notifications SET project=? WHERE idem=?", (project, f"decision:{iid}"))
+            return {"id": iid, "project": project, "source": None, "moved": 1}
+        n = self.s.one("SELECT * FROM notifications WHERE id=?", (iid,))
+        if not n:
+            raise LookupError(iid)
+        a = self.s.agent(n["agent"]) if n["agent"] else None
+        source = None if a else notice_source(n["source"], n["text"])
+        moved = 1
+        with self.s.tx():
+            self.s.x("UPDATE notifications SET project=?, source=COALESCE(source, ?) WHERE id=?", (project, source, iid))
+            if source:
+                self.s.x("INSERT INTO adoptions(source,project,created_at) VALUES(?,?,?) "
+                         "ON CONFLICT(source) DO UPDATE SET project=excluded.project", (source, project, now()))
+                for r in self.s.q("SELECT id, agent, source, text FROM notifications WHERE acked_at IS NULL AND id!=? "
+                                  "AND (project IS NULL OR project='unsorted')", (iid,)):
+                    if not (r["agent"] and self.s.agent(r["agent"])) and notice_source(r["source"], r["text"]) == source:
+                        self.s.x("UPDATE notifications SET project=?, source=? WHERE id=?", (project, source, r["id"]))
+                        moved += 1
+        return {"id": iid, "project": project, "source": source, "moved": moved}
 
     def notifications(self):
         self.s.x("UPDATE notifications SET acked_at=? WHERE acked_at IS NULL AND level='info' AND created_at<?",
@@ -1330,7 +1657,7 @@ def make_handler(hub):
             viewer = me["id"]
             if barrier.unlimited(me["project"]):  # the owner's own project acts on any project's
                 return
-            read = self.command == "GET" and path.endswith("/context")  # the one thing a read grant opens
+            read = self.command == "GET" and path.endswith(("/context", "/memory", "/wiki", "/nodes"))  # what a read grant opens
             match = re.match(r"/api/agents/([\w.-]+)", path)
             if match:
                 hub.context_scope(viewer, aid=match.group(1), read=read)
@@ -1350,6 +1677,8 @@ def make_handler(hub):
                 job = hub.s.one("SELECT project FROM jobs WHERE id=?", (match.group(1),))
                 if job and job["project"] != me["project"]:
                     raise PermissionError(f"{match.group(1)} belongs to another project; agents act on their own project's jobs only")
+            if re.fullmatch(r"/api/inbox/[\w.-]+/adopt", path):
+                raise PermissionError("only the owner files an inbox item under a project")
             match = re.fullmatch(r"/api/inbox/([\w.-]+)/done", path)
             if match:
                 if hub.s.decision(match.group(1)):
@@ -1391,9 +1720,18 @@ def make_handler(hub):
                     me = hub.s.agent(self.viewer)
                     if not me or me["gone"]:
                         raise PermissionError("unknown or removed agent")
-                    if not barrier.agent_may(self.command, path, me["project"]):
+                    if me.get("ghost"):  # sealed: its own short route list, whatever its project
+                        if not ghost.may(self.command, path, me):
+                            raise PermissionError(ghost.REFUSAL)
+                    elif not barrier.agent_may(self.command, path, me["project"]):
                         raise PermissionError(barrier.refusal(path))
-                    self._scope(path, me)
+                    named = re.match(r"/api/agents/([\w.-]+)", path)
+                    if named and named.group(1) != me["id"] and (hub.s.agent(named.group(1)) or {}).get("ghost") \
+                            and (me.get("ghost") or not barrier.unlimited(me["project"])):
+                        raise LookupError(named.group(1))  # to every agent a ghost does not exist (but to the
+                        # owner's own project: it starts, stops and removes one when the owner asks)
+                    if not me.get("ghost"):
+                        self._scope(path, me)
                 elif self.command != "GET" and not self.owner_at_keys and not barrier.agent_may(self.command, path):
                     raise PermissionError(barrier.refusal(path))
                 res = fn()
@@ -1449,9 +1787,15 @@ def make_handler(hub):
                 if path == "/api/overview":
                     view = hub.overview()
                     if me:
-                        view["projects"] = [p for p in view["projects"] if p["id"] == me["project"]]
-                        view["agents"] = [a for a in view["agents"] if a["project"] == me["project"]]
-                        view["decisions"] = [d for d in view["decisions"] if d.get("project") == me["project"]]
+                        out = hub.s.outside(me["project"])
+                        if not (barrier.unlimited(me["project"]) or out["read"] or out["write"]):
+                            allow = {me["project"]} | set((hub.s.project(me["project"]) or {}).get("reads") or [])
+                            view["projects"] = [p for p in view["projects"] if p["id"] in allow]
+                        view["agents"] = [a for a in view["agents"] if a["project"] == me["project"] and (
+                            not a.get("ghost") or a["id"] == me["id"] or barrier.unlimited(me["project"]))]
+                        hide = ghost.ids(hub.s) - {me["id"]}
+                        view["decisions"] = [d for d in view["decisions"] if d.get("project") == me["project"]
+                                             and d.get("agent") not in hide]
                         view["work"] = [w for w in view["work"] if w.get("project") == me["project"]]
                         ids = {a["id"] for a in view["agents"]}
                         view["accounts"] = [{**x, "agents": [i for i in x.get("agents", []) if i in ids]}
@@ -1471,7 +1815,15 @@ def make_handler(hub):
                 if m:
                     return 200, fleet.work_item(hub, m.group(1))
                 if path == "/api/inbox":  # the owner's inbox: open decisions and needs, per project
-                    return 200, inbox.items(hub, qs.get("project") or None)
+                    got = inbox.items(hub, qs.get("project") or None)
+                    if me:  # what a ghost asked the owner is the owner's to see, not the project's agents'
+                        hide = ghost.ids(hub.s) - {me["id"]}
+                        for k, v in list(got.items()) if isinstance(got, dict) else []:
+                            if isinstance(v, list):
+                                got[k] = [x for x in v if not (isinstance(x, dict) and x.get("agent") in hide)]
+                        if isinstance(got, list):
+                            got = [x for x in got if x.get("agent") not in hide]
+                    return 200, got
                 if path == "/api/fleet":  # the inventory: every host, its capacity, jobs, untracked work (docs/FLEET.md)
                     view = hosts.fleet_view(hub)
                     idle = leasedecay.view(hub)  # an idle lease shows how long and what standing it has left
@@ -1512,12 +1864,29 @@ def make_handler(hub):
                     if qs.get("q"):
                         return 200, hub.context_search(m.group(1), qs["q"], qs.get("from"), qs.get("limit", 20))
                     return 200, hub.project_context(m.group(1), qs.get("from"), qs.get("notes", 12))
+                if path == "/api/whoami":  # the caller's own launch note again (sb whoami): who it is, what it may reach
+                    me = hub.s.agent(qs.get("from") or "")
+                    if not me or me.get("gone"):
+                        return 200, {"agent": None, "project": None, "note": "You are not an agent on the Switchboard "
+                                     "(the owner's own terminal, or a process the hub does not know)."}
+                    return 200, {"agent": me["id"], "project": me.get("project"), "provider": me["provider"],
+                                 "model": me.get("model"), "note": shared.launch_note(me)}
                 if path == "/api/context":  # an agent's own project: sb context without --project
                     if qs.get("q"):
                         return 200, hub.context_search(None, qs["q"], qs.get("from"), qs.get("limit", 20))
                     return 200, hub.project_context(None, qs.get("from"), qs.get("notes", 12))
+                if path == "/api/trust":  # owner: per agent, the claims the hub checked and how many did not hold
+                    return 200, claims.ledger(hub.s, float(qs.get("hours") or 168))
+                if path == "/api/agents/attest":  # which agents have the attest box ticked
+                    return 200, {"agents": [a["id"] for a in hub.s.agents() if not a.get("gone") and claims.required(hub.s, a)]}
                 if path == "/api/wiki":  # every project in one table, for routing a question (switchboard/nodes.py)
-                    return 200, nodes.index(hub)
+                    res = nodes.index(hub)
+                    if me and not barrier.unlimited(me["project"]):
+                        out = hub.s.outside(me["project"])
+                        if not (out["read"] or out["write"]):
+                            allow = {me["project"]} | set((hub.s.project(me["project"]) or {}).get("reads") or [])
+                            res["projects"] = [p for p in res["projects"] if p["project"] in allow]
+                    return 200, res
                 m = re.fullmatch(r"/api/projects/([\w.-]+)/(wiki|nodes|brief)", path)
                 if m and m.group(2) == "wiki":  # the project's live wiki; ?format=md for the page
                     w = nodes.wiki(hub, m.group(1), qs.get("from"))
@@ -1554,6 +1923,13 @@ def make_handler(hub):
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/moments", path)
                 if m:  # owner only: the points an agent can be rewound to
                     return 200, rewind.moments(hub, m.group(1))
+                m = re.fullmatch(r"/api/agents/([\w.-]+)/records", path)
+                if m:  # owner only: every entry of one of its conversations, to pick one to edit
+                    return 200, rewind.records(hub, m.group(1), qs.get("session") or None, qs.get("before"),
+                                               qs.get("limit", 60))
+                m = re.fullmatch(r"/api/agents/([\w.-]+)/record", path)
+                if m:  # owner only: one record of a transcript, ready to edit
+                    return 200, rewind.record(hub, m.group(1), qs.get("session") or None, qs.get("at", -1))
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/trace", path)
                 if m:  # owner only: one agent's context over its session (the Context view)
                     return 200, hub.agent_trace(m.group(1))
@@ -1626,7 +2002,9 @@ def make_handler(hub):
                 if m:
                     return 200, jobs.show(hub, m.group(1), int(qs.get("log", 40)))
                 if path == "/api/agents":
-                    return 200, {"agents": [hub.agent_view(a) for a in hub.s.agents() if not me or a["project"] == me["project"]]}
+                    return 200, {"agents": [hub.agent_view(a) for a in hub.s.agents() if not me or (
+                        a["project"] == me["project"] and (not a.get("ghost") or a["id"] == me["id"]
+                                                           or barrier.unlimited(me["project"])))]}
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/queue", path)
                 if m:
                     return 200, hub.pending_messages(m.group(1))
@@ -1739,7 +2117,9 @@ def make_handler(hub):
                 if path == "/api/notifications":
                     if self.viewer:
                         b["agent"] = self.viewer
-                    return 200, hub.notify(b.get("agent"), b.get("text"), "notify", b.get("level") or "need", b.get("idem"))
+                    return 200, hub.notify(b.get("agent"), b.get("text"), "notify", b.get("level") or "need", b.get("idem"),
+                                           project=b.get("project") or None, source=b.get("unit") or None,
+                                           paths=[x for x in (b.get("paths") or []) if isinstance(x, str)][:4])
                 if path == "/api/notifications/ack-all":
                     hub.ack()
                     return 200, hub.notifications()
@@ -1768,6 +2148,12 @@ def make_handler(hub):
                 m = re.fullmatch(r"/api/memory/(\d+)/delete", path)  # owner only: an outline, and memory lines it alone backs
                 if m:
                     return 200, rewind.delete_outline(hub, m.group(1))
+                m = re.fullmatch(r"/api/memory/(\d+)", path)  # owner only: correct an outline by hand
+                if m:
+                    return 200, rewind.edit_outline(hub, m.group(1), b)
+                m = re.fullmatch(r"/api/agents/([\w.-]+)/edit", path)
+                if m:  # owner only (not in barrier.AGENT_ROUTES): change one record of the agent's transcript
+                    return 200, rewind.edit(hub, m.group(1), b)
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/rewind/copies/delete", path)
                 if m:
                     return 200, rewind.delete_copies(m.group(1))
@@ -1791,12 +2177,30 @@ def make_handler(hub):
                     if not a.get("api_key") and a.get("key_env"):
                         a["api_key"] = config.env_key(a["key_env"])
                     return 200, config.test_api(a)
+                if path == "/api/attest":  # an agent states a claim and its evidence; the hub checks it (sb attest)
+                    me = hub.s.agent(b.get("from") or "")
+                    if not me or me.get("gone"):
+                        raise ValueError("sb attest is run by an agent, inside its terminal")
+                    return 200, claims.attest(hub, me, b)
+                if path == "/api/trust/require":  # owner: tick or untick an agent's attest box
+                    a = hub.s.agent(b.get("agent") or "")
+                    if not a or a.get("gone"):
+                        raise LookupError(b.get("agent"))
+                    return 200, claims.set_required(hub.s, a, bool(b.get("on")))
+                if path == "/api/nodes/default":  # owner: the account type every seat starts on
+                    return 200, nodes.set_default_provider(hub, b.get("provider"))
                 m = re.fullmatch(r"/api/projects/([\w.-]+)/nodes/standardize", path)  # owner: names, pins, a Lead Opus
                 if m:
                     return 200, nodes.standardize(hub, m.group(1), self.viewer or "owner")
                 m = re.fullmatch(r"/api/projects/([\w.-]+)/nodes/fold", path)  # owner: retire the agents outside the seats
                 if m:
                     return 200, nodes.fold(hub, m.group(1), self.viewer or "owner")
+                m = re.fullmatch(r"/api/projects/([\w.-]+)/marks", path)  # owner: pin lead/architect/illustrator
+                if m:
+                    return 200, nodes.set_mark(hub, m.group(1), b.get("role"), b.get("agent"), b.get("on", True))
+                m = re.fullmatch(r"/api/projects/([\w.-]+)/nodes/reserve", path)  # owner: keep an agent outside the seats
+                if m:
+                    return 200, nodes.set_reserve(hub, m.group(1), b.get("agent"), b.get("on", True))
                 m = re.fullmatch(r"/api/projects/([\w.-]+)/nodes/(\w+)", path)  # owner: a seat's model, provider, agent
                 if m:
                     return 200, nodes.set_seat(hub, m.group(1), m.group(2), b)
@@ -1812,20 +2216,54 @@ def make_handler(hub):
                                 raise ValueError(f"{name} is not a {prov} account")
                             cur[prov] = name
                         hub.s.set_setting("default_account", cur)
-                    if "handoff" in b:  # {enabled, at, reserve}: automatic account moves
+                    if "handoff" in b:  # {enabled, at, reserve, parked}: automatic account moves
                         cfg = {**handoff.settings(hub.s), **{k: v for k, v in (b["handoff"] or {}).items()
                                                             if k in handoff.DEFAULTS}}
-                        if not (50 <= int(cfg["at"]) <= 100) or not isinstance(cfg["reserve"], list):
-                            raise ValueError("handoff.at is 50..100 and handoff.reserve a list of accounts")
+                        if not (50 <= int(cfg["at"]) <= 100) or not isinstance(cfg["reserve"], list) or not isinstance(cfg["parked"], list):
+                            raise ValueError("handoff.at is 50..100; handoff.reserve and handoff.parked are lists of accounts")
                         hub.s.set_setting("handoff", cfg)
                     if "memory" in b:  # {enabled, model, daily_cap, idle_hours, versions}: project memory
                         memory.set_settings(hub.s, b["memory"])
                     if "retention" in b:  # days and row counts, see switchboard/retention.py
                         retention.set_settings(hub.s, b["retention"])
+                    if "claims" in b:  # claim verification / attest defaults (switchboard/claims.py)
+                        cfg = {**claims.settings(hub.s), **{k: v for k, v in (b["claims"] or {}).items()
+                                                            if k in claims.DEFAULTS}}
+                        hub.s.set_setting("claims", cfg)
+                    if "delivery" in b:  # mid-turn push delivery settings (switchboard/terminals.py)
+                        cfg = {**terminals.delivery_settings(hub.s),
+                               **{k: v for k, v in (b["delivery"] or {}).items() if k in terminals.DELIVERY_DEFAULTS}}
+                        if not isinstance(cfg["push_only"], list) or not isinstance(cfg["push_off"], list):
+                            raise ValueError("delivery.push_only and delivery.push_off must be lists of agent ids")
+                        cfg["push"] = bool(cfg["push"])
+                        hub.s.set_setting("delivery", cfg)
                     return 200, {"default_account": hub.default_accounts(), "handoff": handoff.settings(hub.s),
-                                 "memory": memory.settings(hub.s), "retention": retention.settings(hub.s)}
+                                 "memory": memory.settings(hub.s), "retention": retention.settings(hub.s),
+                                 "claims": claims.settings(hub.s), "delivery": terminals.delivery_settings(hub.s)}
                 if path == "/api/retention/run":  # owner only: not in barrier.AGENT_ROUTES
                     return 200, retention.sweep(hub)
+                if path == "/api/open":  # owner at this machine only: open a web URL, folder or local file
+                    if not self.owner_at_keys or self.viewer == "phone":
+                        return 403, {"error": "desktop open is only available to the owner on the machine the hub runs on"}
+                    aid = b.get("agent")
+                    a = hub.s.agent(aid) if aid else None
+                    proj_cwds = []
+                    if a and a.get("project"):
+                        p = hub.s.project(a["project"])
+                        if p:
+                            match = p.get("match") or {}
+                            if isinstance(match, str):
+                                try:
+                                    match = json.loads(match) or {}
+                                except ValueError:
+                                    match = {}
+                            cwds = match.get("cwd") or []
+                            if isinstance(cwds, str):
+                                cwds = [cwds]
+                            proj_cwds.extend(d for d in cwds if isinstance(d, str) and d)
+                        proj_cwds.append(os.path.join(config.workspace(), a["project"]))
+                    return 200, open_desktop(b.get("target"), agent_cwd=(a or {}).get("cwd") or b.get("cwd"),
+                                             project_cwd=proj_cwds or None)
                 m = re.fullmatch(r"/api/projects/([\w.-]+)/memory", path)  # owner only: correct it or take a rewrite back
                 if m:
                     return 200, memory.set_text(hub, m.group(1), b.get("text"), b.get("restore"))
@@ -1844,6 +2282,9 @@ def make_handler(hub):
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/relaunch", path)
                 if m:
                     return 200, hub.relaunch(m.group(1), b)
+                m = re.fullmatch(r"/api/accounts/([\w.-]+)/gather", path)  # owner: every agent of its type onto it
+                if m:
+                    return 200, hub.gather(m.group(1))
                 m = re.fullmatch(r"/api/agents/([\w.-]+)/(start|stop|account)", path)
                 if m:
                     aid, act = m.groups()
@@ -1864,6 +2305,7 @@ def make_handler(hub):
                     if not b.get("id"):
                         b["id"] = discovery.slug(b.get("name"))
                     new = not hub.s.project(b["id"])
+                    kill.revive(hub, b["id"])
                     p = hub.s.upsert_project(b)
                     if new:  # a new project gets its own folder under the workspace
                         hub.ensure_project_dir(p["id"])
@@ -1887,6 +2329,9 @@ def make_handler(hub):
                 m = re.fullmatch(r"/api/decisions/([\w.-]+)/answer", path)
                 if m:
                     return 200, hub.answer(m.group(1), (b.get("answer") or "").strip())
+                m = re.fullmatch(r"/api/inbox/([\w.-]+)/adopt", path)  # file an item with no project under one
+                if m:
+                    return 200, hub.adopt(m.group(1), (b.get("project") or "").strip())
                 m = re.fullmatch(r"/api/inbox/([\w.-]+)/done", path)  # cross one inbox item off (answer, ack or dismiss)
                 if m:
                     return 200, inbox.done(hub, m.group(1), (b.get("answer") or "").strip() or None, b.get("from") or "owner",
@@ -1913,10 +2358,15 @@ def make_handler(hub):
                 m = re.fullmatch(r"/api/work/(\d+)", path)
                 if m:
                     return 200, fleet.work_delete(hub, m.group(1))
+                m = re.fullmatch(r"/api/projects/([\w.-]+)", path)  # owner only: not in barrier.AGENT_ROUTES
+                if m:
+                    return 200, kill.kill_project(hub, m.group(1))
                 m = re.fullmatch(r"/api/agents/([\w.-]+)", path)
                 if not m or not hub.s.agent(m.group(1)):
                     raise LookupError(path)
                 aid = m.group(1)
+                if hub.s.agent(aid).get("ghost"):  # nothing of it stays but its edits to files
+                    return 200, ghost.close(hub, aid)
                 if hub.t.running(aid):
                     hub.t.exit_cli(aid, interrupt=True)
                 memory.session_ended(hub, hub.s.agent(aid), hub.s.agent(aid)["session_id"], "agent removed")

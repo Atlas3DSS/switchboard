@@ -15,6 +15,78 @@ CODEX_SESSIONS = os.path.expanduser("~/.codex/sessions")
 API_SESSIONS = os.path.join(STATE, "api-sessions")  # the built-in agent's transcripts (agent.py)
 EXTRA_PROJECTS = []  # tests: more transcript roots (fake CLIs)
 DEFAULT_CLAUDE_DIR = os.path.realpath(os.path.expanduser("~/.claude"))
+_REAL_PROJECTS = CLAUDE_PROJECTS
+
+# Claude Code on another company's endpoint: a Claude agent whose model is listed here talks to that
+# Anthropic-format API (/v1/messages) instead of Anthropic. It also gets a home of its own (CLAUDE_CONFIG_DIR): its
+# transcripts, history, settings and memory live there, shared with no Claude account. The key is read from the
+# hub's environment, else from ~/.hermes/.env. Entry: {"model-name": {"url": ..., "key": "ENV_VAR", "home": "~/dir"}}.
+CLAUDE_ENDPOINTS = {}
+
+
+def endpoint(agent):
+    """The endpoint entry a Claude agent's model is served by; None for a model Anthropic serves."""
+    return CLAUDE_ENDPOINTS.get(agent.get("model")) if agent.get("provider") == "claude" else None
+
+
+def endpoint_projects():
+    """Transcript roots of the endpoint homes (none while a test has moved the transcript root elsewhere)."""
+    if CLAUDE_PROJECTS != _REAL_PROJECTS:
+        return []
+    return [os.path.join(e["home"], "projects") for e in CLAUDE_ENDPOINTS.values()]
+
+
+def endpoint_key(name):
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        for line in open(os.path.expanduser("~/.hermes/.env"), encoding="utf-8"):
+            k, _, v = line.strip().partition("=")
+            if k == name:
+                return v.strip("'\"")
+    except OSError:
+        pass
+    return ""
+
+
+def endpoint_home(agent, folder=None):
+    """Make the endpoint agent's own home ready and return it: private folder, first-run screens answered, and the
+    folder the owner put the agent in trusted (the CLI would otherwise open on those questions and hold its queue)."""
+    home = endpoint(agent)["home"]
+    os.makedirs(os.path.join(home, "projects"), mode=0o700, exist_ok=True)
+    if os.stat(home).st_mode & 0o077:
+        os.chmod(home, 0o700)  # the owner's alone
+    path = os.path.join(home, ".claude.json")
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    before = json.dumps(cfg, sort_keys=True)
+    cfg.setdefault("hasCompletedOnboarding", True)
+    cfg.setdefault("theme", "dark")
+    if folder:
+        cfg.setdefault("projects", {}).setdefault(folder, {})["hasTrustDialogAccepted"] = True
+    if json.dumps(cfg, sort_keys=True) != before:
+        tmp = path + ".sb-tmp"
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, path)
+    return home
+
+
+def endpoint_env(agent, folder=None):
+    """Environment that points a Claude agent's CLI at its model's own endpoint and home; {} for Anthropic's models."""
+    e = endpoint(agent)
+    if not e:
+        return {}
+    # the token replaces any login for these calls; the small/background model must be one the endpoint has; nothing
+    # besides the model calls leaves the machine (no telemetry, error reports or update checks to Anthropic)
+    return {"ANTHROPIC_BASE_URL": e["url"], "ANTHROPIC_AUTH_TOKEN": endpoint_key(e["key"]),
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": agent["model"], "ANTHROPIC_SMALL_FAST_MODEL": agent["model"],
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "CLAUDE_CONFIG_DIR": endpoint_home(agent, folder)}
+
+
 AGENT_CLIS = ("claude", "codex", "gemini", "hermes", "antigravity")  # interactive agent CLIs Switchboard runs as terminals
 
 
@@ -149,7 +221,7 @@ def claude_transcript(session_id):
     p = _path_cache.get(("c", session_id))
     if p and os.path.exists(p):
         return p
-    hits = [h for root in [CLAUDE_PROJECTS] + EXTRA_PROJECTS
+    hits = [h for root in [CLAUDE_PROJECTS] + endpoint_projects() + EXTRA_PROJECTS
             for h in glob.glob(os.path.join(root, "*", f"{session_id}.jsonl"))]
     if hits:
         hits.sort(key=os.path.getmtime)
@@ -172,7 +244,7 @@ def codex_rollout(thread_id):
 def claude_project_roots():
     """Every Claude transcript root (the default one, each account's, test roots), each real directory once."""
     roots = [CLAUDE_PROJECTS] + [os.path.join(a["config_dir"], "projects") for a in accounts()
-                                 if a["kind"] == "claude" and a["config_dir"]] + EXTRA_PROJECTS
+                                 if a["kind"] == "claude" and a["config_dir"]] + endpoint_projects() + EXTRA_PROJECTS
     seen, out = set(), []
     for r in roots:
         real = os.path.realpath(r)
@@ -391,17 +463,16 @@ def last_model(path, provider):
     return None
 
 
-def transcript_has_user_text(path, provider, needle, since_epoch):
-    """True if a user turn containing `needle` was written to the transcript after since_epoch."""
-    if provider == "hermes":
-        from . import hermes
-        return hermes.has_user_text(path, needle, since_epoch)
-    if provider == "antigravity":
-        from . import antigravity
-        return antigravity.has_user_text(path, needle, since_epoch)
+def _scan_claude_or_codex(path, provider, needle, since_epoch, match_kind="read"):
+    """Scan a Claude or Codex transcript newest-first for a matching record after since_epoch.
+    match_kind='read': user entry or Claude queued_command attachment.
+    match_kind='accepted': Claude queue-operation/enqueue record or any 'read' record.
+    Returns the record timestamp (or True if the record had no timestamp), or None."""
     from .store import epoch
     from .transcript import _reverse_lines
     needle = " ".join(needle.split())[:80]
+    if not needle:
+        return None
     probe = needle[:40]
     escaped = json.dumps(probe)[1:-1]  # as the jsonl line spells it: a quote or backslash in the text is escaped there
     for line in _reverse_lines(path, 64 << 20):  # newest first; entries can be huge, so no fixed tail window
@@ -416,13 +487,53 @@ def transcript_has_user_text(path, provider, needle, since_epoch):
             continue
         ts = e.get("timestamp") or ""
         if provider != "codex":  # Claude and built-in agent transcripts share a format
-            if e.get("type") != "user":
+            typ = e.get("type")
+            if typ == "user":
+                t = _text((e.get("message") or {}).get("content"))
+            elif typ == "attachment":
+                att = e.get("attachment") or {}
+                if att.get("type") != "queued_command":
+                    continue
+                t = _text(att.get("prompt"))
+                ts = ts or att.get("timestamp") or ""
+            elif match_kind == "accepted" and typ == "queue-operation" and e.get("operation") == "enqueue":
+                t = _text(e.get("content"))
+            else:
                 continue
-            t = _text((e.get("message") or {}).get("content"))
         else:
             p = e.get("payload") or {}
             t = p.get("message") if p.get("type") == "user_message" else _text(p.get("content"))
         if needle in " ".join((t or "").split()):
             if not ts or epoch(ts) >= since_epoch - 5:
-                return True
-    return False
+                # Claude stamps queued_command with the enqueue time, not when it was read: return True so caller records now()
+                if provider == "claude" and e.get("type") == "attachment":
+                    return True
+                return ts or True
+    return None
+
+
+def transcript_read_at(path, provider, needle, since_epoch):
+    """Timestamp string (or True if unstamped) when `needle` was read into the transcript after since_epoch, or None."""
+    if not path:
+        return None
+    if provider == "hermes":
+        from . import hermes
+        return True if hermes.has_user_text(path, needle, since_epoch) else None
+    if provider == "antigravity":
+        from . import antigravity
+        return antigravity.read_at(path, needle, since_epoch)
+    return _scan_claude_or_codex(path, provider, needle, since_epoch, "read")
+
+
+def transcript_accepted(path, provider, needle, since_epoch):
+    """True if the CLI has accepted `needle` into its input queue or transcript after since_epoch."""
+    if not path:
+        return False
+    if provider in ("hermes", "antigravity"):
+        return bool(transcript_read_at(path, provider, needle, since_epoch))
+    return bool(_scan_claude_or_codex(path, provider, needle, since_epoch, "accepted"))
+
+
+def transcript_has_user_text(path, provider, needle, since_epoch):
+    """True if a user turn (or Claude mid-turn queued_command) containing `needle` was read after since_epoch."""
+    return bool(transcript_read_at(path, provider, needle, since_epoch))

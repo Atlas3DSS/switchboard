@@ -117,10 +117,29 @@ class DetectAndPickTests(PlansMixin, unittest.TestCase):
         use["one"] = acct(("weekly", 50), ("fable", 97))
         self.assertIsNone(handoff.why_move(s, opus, use, CFG))  # Fable weekly does not limit Opus
         self.assertEqual(handoff.why_move(s, fable, use, {**CFG, "reserve": []}), ("one at 97%", "spare"))
+        self.assertIsNone(handoff.why_move(s, fable, use, {**CFG, "reserve": [], "parked": ["spare"]}))  # parked: never picked
         use["two"] = acct(("weekly", 10), stale=True)
         use["one"] = acct(("weekly", 99))
         self.assertEqual(handoff.why_move(s, opus, use, CFG)[1], "spare")  # two's stale reading is not trusted
         self.assertIsNone(handoff.why_move(s, opus, use, {**CFG, "enabled": False}))
+
+
+class AntigravityQuotaTests(unittest.TestCase):
+    def test_quota_hit_is_read_from_the_cli_log(self):
+        from switchboard import antigravity
+        d = tempfile.mkdtemp(dir=TMP)
+        os.makedirs(os.path.join(d, "log"))
+        now = time.time()
+        stamp = time.strftime("%m%d %H:%M:%S", time.localtime(now - 600))
+        with open(os.path.join(d, "log", "cli-x.log"), "w") as f:
+            f.write("I0101 00:00:00.000001 1 a.go:1] fine\n"
+                    f"E{stamp}.000001 7 errorreport.go:307] generating: RESOURCE_EXHAUSTED (code 429): Individual quota "
+                    "reached. Resets in 2h0m30s.\n")
+        hit = antigravity.quota_hit(d, now=now)
+        self.assertAlmostEqual(hit["at"], now - 600, delta=2)
+        self.assertAlmostEqual(hit["resets"], now - 600 + 7230, delta=2)
+        self.assertIsNone(antigravity.quota_hit(tempfile.mkdtemp(dir=TMP), now=now))
+        self.assertEqual(handoff.used({"limits": [{"key": "quota", "used": None}]}, "m"), 0)
 
 
 class MoveTests(PlansMixin, unittest.TestCase):
@@ -139,6 +158,24 @@ class MoveTests(PlansMixin, unittest.TestCase):
         if self.h.t.running(self.aid):
             self.h.t.exit_cli(self.aid)
         super().tearDown()
+
+    def test_gather_moves_every_agent_to_one_account(self):
+        self.h.s.add_agent({"id": self.aid + "b", "project": "p", "title": "b", "provider": "claude", "account": "spare",
+                            "model": "claude-opus-5-5", "mode": "terminal", "session_id": None, "cwd": TMP,
+                            "state": "stopped"})
+        r = self.h.gather("two")
+        self.assertEqual(sorted(r["moved"]), [self.aid, self.aid + "b"])  # neither is running: set at once
+        self.assertEqual({self.h.s.agent(i)["account"] for i in r["moved"]}, {"two"})
+        self.assertEqual(self.h.default_accounts()["claude"], "two")
+        self.h.s.set_setting("gathering", {self.aid: "one"})  # one left waiting moves on a tick once it is not busy
+        self.h.gather_tick()
+        self.assertEqual(self.h.s.agent(self.aid)["account"], "one")
+        self.assertEqual(self.h.s.setting("gathering"), {})
+        self.assertRaises(LookupError, self.h.gather, "nobody")
+        self.h.t.launch(self.h.s.agent(self.aid))  # a running one is told to carry on after its relaunch
+        self.assertEqual(self.h.gather("two")["waiting"], [self.aid])
+        self.h.gather_tick()
+        self.assertTrue(self.h.s.one("SELECT 1 FROM messages WHERE to_agent=? AND body LIKE ?", (self.aid, "%moved every agent%")))
 
     def transcript(self):
         return os.path.join(os.environ["FAKE_PROJECTS"], "fake", self.h.s.agent(self.aid)["session_id"] + ".jsonl")

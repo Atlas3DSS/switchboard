@@ -162,7 +162,7 @@ const S = { ov: null, agents: new Map(), projects: new Map(), accounts: [], desk
 window.__sbTerms = {};
 
 /* model suggestions for the CLIs; API accounts suggest the models their endpoint listed during setup */
-const MODEL_HINTS = { claude: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], codex: [], gemini: [], hermes: [], antigravity: [] };
+const MODEL_HINTS = { claude: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'], codex: [], gemini: [], hermes: [], antigravity: ['gemini-pro-orchestrator-neon', 'gemini-4-neon-high', 'gemini-pro-orchestrator', 'gemini-4-carbon-high', 'gemini-4-hydrogen-high', 'gemini-3.8-flash-medium'] };
 const KIND_LABEL = { claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI', hermes: 'Hermes Agent', antigravity: 'Antigravity', api: 'built-in agent', shell: 'shell' };
 const AGENT_CLIS = ['claude', 'codex', 'gemini', 'hermes', 'antigravity'];
 /* why an agent's queue is not moving, and for how long (paused, a choice open, a turn running, ...) */
@@ -171,7 +171,8 @@ const KIND_NAME = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', hermes: 
 const LIMIT_LABEL = { session: 'Session (5h)', weekly: 'Weekly', fable: 'Fable weekly', '5h': 'Session (5h)', wk: 'Weekly', Fable: 'Fable weekly' };
 const STATE_WORD = { busy: 'working', idle: 'idle', starting: 'starting', stopped: 'stopped' };
 
-const agentName = (a) => (a && (a.title || a.id)) || '';
+const agentName = (a) => (a && ((a.title || a.id) + (a.ghost ? ' · ghost' : ''))) || '';
+const isFable = (a) => (a.is_fable != null ? !!a.is_fable : /fable/i.test(a.model || ''));
 const agentHref = (a) => `#/p/${enc(a.project || '')}/${enc(a.id)}`;
 const projName = (pid) => { const p = S.projects.get(pid); return (p && p.name) || pid || ''; };
 function projectAgents(pid) {
@@ -261,33 +262,209 @@ function agentLink() {
 function poolPanel() {
   const name = h('strong', { class: 'pool-name' });
   const kind = h('span', { class: 'pool-kind' });
-  const note = h('span', { class: 'pool-email' });
+  const email = h('span', { class: 'pool-email' });
+  const note = h('span', { class: 'pool-note' });
+  const limBox = h('div', { class: 'lims' });
+  const lims = keyedList(limBox, (l) => l.key, limitRow);
+  const cu = h('div', { class: 'pool-cu' });           // Colab compute units (Antigravity account only)
+  const cuAt = h('div', { class: 'pool-cu-at' });     // when that balance last moved
   const agBox = h('div', { class: 'pool-ags' });
   const ags = keyedList(agBox, (id) => id, agentLink);
   const none = h('span', { class: 'muted small', text: 'no agents' });
-  const el = h('section', { class: 'pool' }, h('div', { class: 'pool-h' }, name, kind, note), h('div', { class: 'pool-ag' }, agBox, none));
+  const gather = h('button', { class: 'btn small ghost pool-gather', type: 'button', text: 'Move agents here' });
+  let cur = null;
+  guarded(gather, async () => {
+    const others = [...S.agents.values()].filter((a) => a.provider === cur.kind && a.account !== cur.name);
+    if (!confirm(`Move all ${others.length} ${KIND_NAME[cur.kind] || cur.kind} agents on other accounts to ${cur.name}, and start new ones on it? Each keeps its conversation; one that is working moves when it is next idle.`)) return;
+    const r = await api('POST', `/accounts/${enc(cur.name)}/gather`, {});
+    toast(`${cur.name}: ${r.moved.length} moved` + (r.waiting.length ? `, ${r.waiting.length} moving as they go idle` : ''));
+  });
+  const el = h('section', { class: 'pool' }, h('div', { class: 'pool-h' }, name, kind, email, note, gather), limBox, cu, cuAt, h('div', { class: 'pool-ag' }, agBox, none));
   return {
     el,
     update(acc) {
+      cur = acc;
+      gather.hidden = ![...S.agents.values()].some((a) => a.provider === acc.kind && a.account !== acc.name);
+      setAttr(gather, 'title', `Every ${KIND_NAME[acc.kind] || acc.kind} agent moves to ${acc.name}, which also becomes the account new agents start on`);
       setText(name, acc.name); setText(kind, KIND_LABEL[acc.kind] || acc.kind);
-      const n = [{ key: 'API key', none: 'no key' }[acc.auth] || 'login', acc.model].filter(Boolean).join(' · ');
-      setText(note, n); setAttr(note, 'title', acc.label || n);
+      const how = [{ key: 'API key', none: 'no key' }[acc.auth] || 'login', acc.model].filter(Boolean).join(' · ');
+      setText(email, how); setAttr(email, 'title', acc.label || how);
+      lims.sync((acc.limits || []).map(normLimit));
+      const c = acc.colab;
+      cu.hidden = !c;
+      cuAt.hidden = !(c && c.changed_at);
+      if (c && c.changed_at) {
+        const d = new Date(c.changed_at);
+        const day = d.toDateString() === new Date().toDateString() ? '' : d.toLocaleDateString(undefined, { weekday: 'short' }) + ' ';
+        setText(cuAt, `balance last changed ${day}${d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })} (${ago(c.changed_at)})`);
+        setAttr(cuAt, 'title', 'Google moves the balance about every five minutes while a session runs');
+      }
+      if (c) {
+        const run = c.runway_h == null ? '' : c.runway_h >= 48 ? ` · ${(c.runway_h / 24).toFixed(1)} days left` : ` · ${c.runway_h} h left`;
+        const fmt = (x) => Number(x).toLocaleString(undefined, { maximumFractionDigits: 1 });
+        setText(cu, `Colab: ${fmt(c.balance)} CU` + (c.rate > 0 ? ` · burning ${fmt(c.rate)}/h on ${c.assignments} session${c.assignments === 1 ? '' : 's'}${run}` : ' · nothing running'));
+        setAttr(cu, 'title', ((c.sessions || []).map((x) => `${x.name} (${x.hardware})`).join('\n') || 'no active sessions') + `\nread ${ago(c.read_at)}`);
+      }
+      const n = acc.error ? 'read failed' : acc.stale ? 'stale' : '';
+      setText(note, n);
+      setAttr(note, 'title', (acc.error || '') + (acc.read_at ? ` (last read ${ago(acc.read_at)})` : ''));
+      setCls(el, 'pool' + (acc.error || acc.stale ? ' stale' : ''));
       const ids = accountAgentIds(acc);
       ags.sync(ids); none.hidden = ids.length > 0;
     },
   };
 }
 
+function isLocalHost() {
+  return location.hostname === '127.0.0.1' || location.hostname === 'localhost' || location.hostname === '[::1]';
+}
+
+/* Open a web URL or local file/folder path without xterm's broken "dangerous link" confirm + empty window.open().
+   On localhost, routes through POST /api/open so http(s) loads in the desktop browser,
+   directories open in the file manager, and files/partial paths resolve against the agent's cwd and open cleanly. */
+async function openLink(raw, aid) {
+  const target = String(raw || '').trim();
+  if (!target) return;
+  const isWeb = /^https?:\/\//i.test(target);
+  if (isWeb && !isLocalHost()) {
+    window.open(target, '_blank', 'noopener');
+    return;
+  }
+  if (!isWeb && !isLocalHost()) {
+    toast('Local paths can only be opened on the machine the hub runs on', 'err');
+    return;
+  }
+  try {
+    const r = await api('POST', '/open', { target, agent: aid || null });
+    if (r && r.kind === 'dir') toast('Opened folder: ' + r.path);
+    else if (r && r.kind === 'file') toast('Opened: ' + r.path);
+    else if (r && r.kind === 'url') toast('Opened in browser');
+  } catch (err) {
+    toast('Could not open: ' + err.message, 'err');
+  }
+}
+
+/* Wrapped-line-aware xterm link provider: detects full http(s) URLs, file:// URIs, absolute/home paths,
+   and relative/partial paths (resolved server-side against the agent's cwd). */
+const TERM_URL_RE = /https?:\/\/[^\s<>"'`\])]+/g;
+const TERM_PATH_RE = /(?:file:\/\/[^\s<>"'`\])]+|~\/[A-Za-z0-9._/@%+\-]+(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)?|(?:\/[A-Za-z0-9._@%+\-]+){2,}\/?(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)?|(?:\.\.?\/)?(?:[A-Za-z0-9._@+\-]+\/)+[A-Za-z0-9._@+\-]+\/?(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)?|\b[A-Za-z0-9_.\-]+\.(?:py|js|mjs|cjs|ts|tsx|jsx|md|json|jsonl|ya?ml|toml|sh|css|html?|xml|svg|sql|csv|txt|pdf|png|jpe?g|webp|avif|gif|mp4|mkv|mov|webm|mp3|wav|zip|tar|gz|7z|rar|patch|diff|cpp|cc|c|h|hpp|rs|go|service|env|ini|cfg|conf|log|stl|lys|lyt|kys|blend|obj|fbx|glb|gltf|ipynb|tex|xlsx|docx|pptx)\b(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)?)/gi;
+
+function trimLinkEnd(s) {
+  let out = s.replace(/[.,;:!?'"`]+$/, '');
+  while (out.endsWith(')') && (out.split('(').length < out.split(')').length)) out = out.slice(0, -1);
+  while (out.endsWith(']') && (out.split('[').length < out.split(']').length)) out = out.slice(0, -1);
+  return out;
+}
+
+function isPlausibleLocalPath(s) {
+  if (/^file:\/\//i.test(s) || s.startsWith('~/') || s.startsWith('./') || s.startsWith('../')) return true;
+  if (s.startsWith('/')) {
+    // Reject obvious URL paths or tiny fractions like /a/b unless multi-segment or known root/extension
+    return /[A-Za-z]/.test(s) && (s.length >= 5 || /\.[A-Za-z0-9]{1,8}(?:$|:|#)/.test(s));
+  }
+  if (s.includes('/')) {
+    // Reject dates/fractions (11/24, 15/32, 2026/11/24) and short A/B pairs (w/o, N/A, on/off, pass/fail)
+    if (!/[A-Za-z]/.test(s)) return false;
+    if (/^[A-Za-z0-9]{1,4}\/[A-Za-z0-9]{1,4}$/.test(s) && !s.includes('.')) return false;
+    if (/^(?:and|or|yes|no|on|off|true|false|pass|fail|read|write|input|output|before|after|dev|test|train|idle|busy|good|bad)\//i.test(s) && !s.includes('.')) return false;
+    return true;
+  }
+  // Bare filename with known extension: require at least one letter in basename
+  return /[A-Za-z]/.test(s.split('.')[0]);
+}
+
+function registerTerminalLinks(term, getAid) {
+  term.registerLinkProvider({
+    provideLinks(bufferLineNumber, callback) {
+      const buf = term.buffer.active;
+      let startIdx = bufferLineNumber - 1;
+      while (startIdx > 0 && buf.getLine(startIdx)?.isWrapped) startIdx--;
+      const rows = [];
+      let idx = startIdx;
+      while (idx < buf.length) {
+        const line = buf.getLine(idx);
+        if (!line) break;
+        const hasNext = idx + 1 < buf.length && !!buf.getLine(idx + 1)?.isWrapped;
+        rows.push({ y: idx + 1, text: line.translateToString(!hasNext) });
+        if (!hasNext) break;
+        idx++;
+      }
+      if (!rows.length) { callback(undefined); return; }
+      const full = rows.map((r) => r.text).join('');
+      const offsets = [];
+      let acc = 0;
+      for (const r of rows) { offsets.push({ y: r.y, start: acc, end: acc + r.text.length }); acc += r.text.length; }
+      const posOf = (off) => {
+        for (const o of offsets) {
+          if (off < o.end) return { x: off - o.start + 1, y: o.y };
+        }
+        const last = offsets[offsets.length - 1];
+        return { x: Math.max(1, last.end - last.start), y: last.y };
+      };
+      const matches = [];
+      const taken = [];
+      const overlaps = (a, b) => taken.some(([s, e]) => a < e && b > s);
+      TERM_URL_RE.lastIndex = 0;
+      let m;
+      while ((m = TERM_URL_RE.exec(full))) {
+        const text = trimLinkEnd(m[0]);
+        if (!text) continue;
+        const a = m.index, b = a + text.length;
+        taken.push([a, b]);
+        matches.push({ a, b, text });
+      }
+      TERM_PATH_RE.lastIndex = 0;
+      while ((m = TERM_PATH_RE.exec(full))) {
+        const text = trimLinkEnd(m[0]);
+        if (!text) continue;
+        const a = m.index, b = a + text.length;
+        if (overlaps(a, b)) continue;
+        if (a > 0 && /[A-Za-z0-9_@:/]/.test(full[a - 1]) && !text.startsWith('file://')) continue;
+        if (!isPlausibleLocalPath(text)) continue;
+        taken.push([a, b]);
+        matches.push({ a, b, text });
+      }
+      const links = [];
+      for (const hit of matches) {
+        const st = posOf(hit.a);
+        const en = posOf(hit.b - 1);
+        if (en.y < bufferLineNumber || st.y > bufferLineNumber) continue;
+        links.push({
+          range: { start: st, end: en },
+          text: hit.text,
+          activate: () => openLink(hit.text, getAid()),
+        });
+      }
+      callback(links.length ? links : undefined);
+    },
+  });
+}
+
 /* ---------- Switchboard chat (the desk agent: the only chat window) ---------- */
 const OPEN_RE = /\[\[open:([\w.-]+)(?:\/([\w.-]+))?\]\]/g;
-function inlineMd(text) {
+function inlineMd(text, aid = null) {
   const out = [];
-  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`)/g;
+  const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\((?:(?:https?|file):\/\/|\/|~\/|\.\.?\/|(?:[A-Za-z0-9._@+\-]+\/)+|[A-Za-z0-9_.\-]+\.[A-Za-z0-9]{1,8}(?:[:#]|(?=\))))[^)\s]*\)|(?:https?|file):\/\/[^\s<>"'`\])]+)/gi;
   let last = 0, m;
   while ((m = re.exec(text))) {
     if (m.index > last) out.push(text.slice(last, m.index));
     const t = m[0];
-    out.push(t[0] === '`' ? h('code', { text: t.slice(1, -1) }) : h('strong', { text: t.slice(2, -2) }));
+    if (t[0] === '`') {
+      out.push(h('code', { text: t.slice(1, -1) }));
+    } else if (t.startsWith('**')) {
+      out.push(h('strong', { text: t.slice(2, -2) }));
+    } else if (t[0] === '[') {
+      const lm = t.match(/^\[([^\]\n]+)\]\(([^)\s]+)\)$/);
+      const a = h('a', { href: lm[2], text: lm[1], class: 'md-link' });
+      a.addEventListener('click', (ev) => { ev.preventDefault(); openLink(lm[2], aid); });
+      out.push(a);
+    } else {
+      const url = trimLinkEnd(t);
+      const a = h('a', { href: url, text: url, class: 'md-link' });
+      a.addEventListener('click', (ev) => { ev.preventDefault(); openLink(url, aid); });
+      out.push(a);
+      if (url.length < t.length) out.push(t.slice(url.length));
+    }
     last = m.index + t.length;
   }
   if (last < text.length) out.push(text.slice(last));
@@ -297,29 +474,56 @@ function openTarget(project, agent) {
   if (!project) return;
   location.hash = agent ? `#/p/${enc(project)}/${enc(agent)}` : `#/p/${enc(project)}`;
 }
-/* text -> element: light markdown (bold, code, lists, fenced code) + [[open:…]] tokens as buttons */
-function renderChatText(text) {
+/* text -> element: markdown (headings, bold, code, lists, tables, blockquotes, fenced code, links) + [[open:…]] tokens */
+function renderChatText(text, aid = null) {
   const opens = [];
   text = String(text || '').replace(OPEN_RE, (_, p, a) => { opens.push({ p, a }); return ''; }).replace(/[ \t]+$/gm, '').trim();
   const box = h('div', { class: 'cm-text' });
   const lines = text.split('\n');
-  let list = null, para = null;
+  let list = null, para = null, quote = null;
+  const splitRow = (s) => s.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
   for (let i = 0; i < lines.length; i++) {
     const ln = lines[i];
     if (/^```/.test(ln)) {
       const code = [];
       for (i++; i < lines.length && !/^```/.test(lines[i]); i++) code.push(lines[i]);
-      box.append(h('pre', { text: code.join('\n') })); list = para = null; continue;
+      box.append(h('pre', { text: code.join('\n') })); list = para = quote = null; continue;
     }
+    if (/^\s*---+\s*$/.test(ln)) {
+      box.append(h('hr')); list = para = quote = null; continue;
+    }
+    const hd = ln.match(/^(#{1,4})\s+(.*)$/);
+    if (hd) {
+      box.append(h('div', { class: `md-h md-h${hd[1].length}` }, inlineMd(hd[2], aid)));
+      list = para = quote = null; continue;
+    }
+    if (ln.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
+      const thead = h('thead', null, h('tr', null, splitRow(ln).map((c) => h('th', null, inlineMd(c, aid)))));
+      const tbody = h('tbody');
+      for (i += 2; i < lines.length && lines[i].includes('|') && lines[i].trim(); i++) {
+        tbody.append(h('tr', null, splitRow(lines[i]).map((c) => h('td', null, inlineMd(c, aid)))));
+      }
+      i--;
+      box.append(h('table', { class: 'md-tbl' }, thead, tbody));
+      list = para = quote = null; continue;
+    }
+    const bq = ln.match(/^>\s?(.*)$/);
+    if (bq) {
+      if (!quote) { quote = h('blockquote', { class: 'md-q' }); box.append(quote); }
+      else quote.append(h('br'));
+      quote.append(...inlineMd(bq[1], aid));
+      list = para = null; continue;
+    }
+    quote = null;
     const li = ln.match(/^\s*(?:[-*•]|\d+[.)])\s+(.*)$/);
     if (li) {
       if (!list) { list = h(/^\s*\d/.test(ln) ? 'ol' : 'ul'); box.append(list); }
-      list.append(h('li', null, inlineMd(li[1]))); para = null; continue;
+      list.append(h('li', null, inlineMd(li[1], aid))); para = null; continue;
     }
     list = null;
     if (!ln.trim()) { para = null; continue; }
-    if (para) para.append(h('br'), ...inlineMd(ln));
-    else { para = h('p', null, inlineMd(ln)); box.append(para); }
+    if (para) para.append(h('br'), ...inlineMd(ln, aid));
+    else { para = h('p', null, inlineMd(ln, aid)); box.append(para); }
   }
   if (opens.length) {
     const row = h('div', { class: 'cm-opens' });
@@ -423,6 +627,8 @@ function makeSessionFinder() {
   return api_;
 }
 
+// Claude Code pointed at another endpoint: value 'claude:<model>' -> title; discovery.py CLAUDE_ENDPOINTS routes the model
+
 /* ---------- new agent form (card and project view) ---------- */
 function newAgentForm(getPid, onDone) {
   const fAccount = h('select', { 'aria-label': 'Account' });
@@ -430,12 +636,16 @@ function newAgentForm(getPid, onDone) {
   const fCwd = h('input', { type: 'text', placeholder: 'the project\'s folder', autocomplete: 'off', spellcheck: 'false' });
   const fTitle = h('input', { type: 'text', placeholder: 'short title', autocomplete: 'off' });
   const fSid = h('input', { type: 'text', placeholder: 'optional: session / thread id to resume', autocomplete: 'off', spellcheck: 'false' });
+  /* ghost: sealed off inside the project (switchboard/ghost.py); erased when removed, only its file edits stay */
+  const fGhost = h('input', { type: 'checkbox' });
+  const ghostLab = h('label', { class: 'wide ghost-opt', title: 'Sealed off inside the project: it knows only the task you give it. It cannot read or write the project\'s memory, notes, work queue or other agents, and no agent of any project can see it. When you remove it, its conversation and every record of it is erased; only its edits to files stay.' },
+    fGhost, h('span', { text: 'Ghost: sealed to its own task, erased when removed (only its file edits stay)' }));
   const ok = h('button', { class: 'btn primary', type: 'submit', text: 'Add agent' });
   const cancel = h('button', { class: 'btn ghost', type: 'button', text: 'Cancel' });
   const lab = (t, n, cls) => h('label', { class: cls || '' }, h('span', { text: t }), n);
   const el = h('form', { class: 'newagent', hidden: true },
     lab('Account', fAccount, 'wide'), lab('Model', fModel), lab('Title', fTitle),
-    lab('Working directory', fCwd, 'wide'), lab('Resume session', fSid, 'wide'),
+    lab('Working directory', fCwd, 'wide'), lab('Resume session', fSid, 'wide'), ghostLab,
     h('div', { class: 'wide row-end' }, h('span', { class: 'muted small', text: 'Not launched until you open it.' }), cancel, ok));
   el.addEventListener('click', (e) => e.stopPropagation());
   function refresh() {
@@ -445,6 +655,8 @@ function newAgentForm(getPid, onDone) {
     const acc = S.accounts.find((a) => a.name === fAccount.value);
     fModel.setAttribute('list', modelList(acc));
     fModel.placeholder = acc && acc.kind === 'api' && acc.model ? acc.model : 'default model';
+    ghostLab.hidden = !acc || !['claude', 'codex', 'antigravity'].includes(acc.kind);
+    if (ghostLab.hidden) fGhost.checked = false;
   }
   fAccount.addEventListener('change', refresh);
   cancel.addEventListener('click', () => { el.hidden = true; });
@@ -457,11 +669,12 @@ function newAgentForm(getPid, onDone) {
     if (fModel.value.trim()) body.model = fModel.value.trim();
     if (fTitle.value.trim()) body.title = fTitle.value.trim();
     if (fSid.value.trim()) body.session_id = fSid.value.trim();
+    if (fGhost.checked) body.ghost = true;
     ok.disabled = true;
     try {
       const a = await api('POST', '/agents', body);
       toast(`Added ${agentName(a)} — open it to launch`);
-      fTitle.value = ''; fSid.value = ''; el.hidden = true;
+      fTitle.value = ''; fSid.value = ''; fGhost.checked = false; el.hidden = true;
       tick();
       if (onDone) onDone(a);
     } catch (err) { toast(err.message, 'err'); } finally { ok.disabled = false; }
@@ -526,6 +739,66 @@ function openQueue(aid) {
   document.body.append(dialog); dialog.showModal(); refresh();
 }
 
+/* ---------- marks: who is the project's lead, illustrator, architect ---------- */
+const MARKS = [
+  ['lead', 'Lead', 'messages written to this project land on this agent', '<path d="M2 13h12M2.6 10.5 1.6 4.5 5 7.5l3-5 3 5 3.4-3-1 6z"/>'],
+  ['illustrator', 'Illustration', 'this agent makes the project\'s illustrations; it keeps out of the other seats and a fold leaves it', '<path d="M14 2 7.5 8.5M9.5 4.5l2 2M6.5 9c-1.6 0-2.6 1-2.6 2.4 0 1-.8 1.6-2 1.6 1 .9 2 1 3 1 1.9 0 3.1-1.2 3.1-3z"/>'],
+  ['architect', 'Architect', 'the project\'s general architect: design questions and reviews go here', '<circle cx="8" cy="3" r="1.4"/><path d="M7.4 4.3 4.2 14M8.6 4.3 11.8 14M5.4 10.4h5.2"/>'],
+];
+/* toggle=true: three buttons that pin or unpin each mark on the agent; false: only the marks it carries, read-only */
+function markSet(toggle) {
+  const el = h('span', { class: 'mks' });
+  const btns = {};
+  let cur = null;
+  for (const [role, label, , path] of MARKS) {
+    const b = h(toggle ? 'button' : 'span', { class: 'mk off', type: toggle ? 'button' : null });
+    b.innerHTML = `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${path}</svg>`;
+    if (toggle) b.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (!cur) return;
+      const on = (cur.marks || {})[role] !== 'on';
+      try { await api('POST', `/projects/${enc(cur.project)}/marks`, { role, agent: cur.id, on }); toast(`${label} ${on ? 'set to' : 'unpinned from'} ${agentName(cur)}`); }
+      catch (err) { toast(err.message, 'err'); }
+      tick();
+    });
+    btns[role] = b; el.append(b);
+  }
+  return {
+    el,
+    update(a) {
+      cur = a && a.id ? a : null;
+      for (const [role, label, what] of MARKS) {
+        const b = btns[role], m = (cur && cur.marks || {})[role] || 'off';
+        setCls(b, 'mk ' + m);
+        if (!toggle) b.hidden = m === 'off';
+        else setAttr(b, 'aria-pressed', m === 'on' ? 'true' : 'false');
+        setAttr(b, 'title', `${label}: ${what}. ` + (m === 'on' ? 'Pinned by you.' : m === 'auto' ? 'Chosen by Switchboard because nobody is pinned.' : 'Not this agent.')
+          + (toggle ? (m === 'on' ? ' Click to unpin.' : ' Click to pin it here.') : ''));
+      }
+      el.hidden = !cur || (!toggle && !Object.keys(cur.marks || {}).length);
+    },
+  };
+}
+/* rename in place: an input takes the anchor's spot; Enter saves the title (the id other agents write to stays) */
+function renameInline(anchor, a) {
+  if (!a || anchor.previousSibling && anchor.previousSibling.classList && anchor.previousSibling.classList.contains('rn-in')) return;
+  const inp = h('input', { class: 'rn-in', type: 'text', value: a.title || a.id, maxlength: '60', 'aria-label': 'Panel name' });
+  let done = false;
+  const close = async (save) => {
+    if (done) return; done = true;
+    const v = inp.value.trim();
+    inp.remove(); anchor.hidden = false;
+    if (!save || v === (a.title || a.id)) return;
+    try { await api('PATCH', `/agents/${enc(a.id)}`, { title: v }); } catch (err) { toast(err.message, 'err'); }
+    tick();
+  };
+  inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') { e.preventDefault(); close(true); } else if (e.key === 'Escape') close(false); });
+  for (const ev of ['click', 'mousedown', 'dblclick']) inp.addEventListener(ev, (e) => { e.stopPropagation(); if (ev === 'click') e.preventDefault(); });
+  inp.addEventListener('dragstart', (e) => { e.preventDefault(); e.stopPropagation(); });
+  inp.addEventListener('blur', () => close(true));
+  anchor.hidden = true; anchor.before(inp); inp.focus(); inp.select();
+}
+
 /* ---------- overview: project cards ---------- */
 function agentRow() {
   const dot = stateDot();
@@ -539,14 +812,15 @@ function agentRow() {
   q.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); openQueue(aid); });
   q.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); openQueue(aid); } });
   const blk = h('span', { class: 'badge warn', text: 'blocked' });
-  const el = h('a', { class: 'arow' }, dot, title, id, h('span', { class: 'spacer' }), q, blk, acct, mt, st);
+  const mks = markSet(false);
+  const el = h('a', { class: 'arow' }, dot, title, mks.el, id, h('span', { class: 'spacer' }), q, blk, acct, mt, st);
   el.addEventListener('click', (e) => e.stopPropagation());
   return {
     el,
     update(a) {
       aid = a.id;
       setAttr(el, 'href', agentHref(a));
-      setDot(dot, a);
+      setDot(dot, a); mks.update(a);
       setText(title, agentName(a)); setText(id, a.title && a.title !== a.id ? a.id : ''); setAttr(title, 'title', a.last_text ? a.last_text.slice(-300) : '');
       setText(acct, a.account); setAttr(acct, 'title', 'Account');
       setModelTag(mt, a);
@@ -570,7 +844,7 @@ function projectCard(p0) {
   const addBtn = h('button', { class: 'btn ghost small', type: 'button' });  // folds the agents outside the seats
   const nodeBox = h('div', { class: 'pc-nodes' });
   const seatBtn = {};
-  for (const [role, short] of [['lead', 'Lead Opus'], ['architect', 'Architect'], ['tasker', 'Tasker'], ['janitor', 'Janitor']]) {
+  for (const [role, short] of [['lead', 'Lead'], ['architect', 'Architect'], ['tasker', 'Tasker'], ['janitor', 'Janitor']]) {
     const b = h('button', { class: 'pc-node', type: 'button' });
     b.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -1131,38 +1405,63 @@ function makePane(idx, pid, view) {
   ctxBtn.onclick = () => { if (id) openContext(id); };
   const memBtn = h('button', { class: 'pbtn', type: 'button', text: 'Memory', title: 'Memory files this agent wrote, and outlines of its conversations', hidden: true });
   memBtn.onclick = () => { const a = id && S.agents.get(id); if (a) openMemFiles(a.project, id); };
-  const rewBtn = h('button', { class: 'pbtn', type: 'button', text: 'Rewind', title: 'Put this agent back to the moment before one of its messages (cuts the session; a copy is kept)', hidden: true });
+  const rewBtn = h('button', { class: 'pbtn', type: 'button', text: 'Transcript', title: 'Rewind this agent to the moment before one of its messages, or edit any entry of its transcript', hidden: true });
   rewBtn.onclick = () => { if (id) openRewind(id); };
+  // the attest box: this agent must back any "done" with sb attest, and every request it gets says so (claims.py)
+  const attBox = h('input', { type: 'checkbox' });
+  const attLbl = h('label', { class: 'pn-attest', hidden: true, title: 'Attest: this agent must run sb attest (the hub checks its evidence and asks "are you sure?") before it reports work as done. Every request it gets says so, and a report with no receipt is sent back.' }, attBox, h('span', { text: 'attest' }));
+  attBox.onchange = async () => {
+    if (!id) return;
+    try { await api('POST', '/trust/require', { agent: id, on: attBox.checked }); } catch (e) { attBox.checked = !attBox.checked; }
+    tick();
+  };
   const note = h('span', { class: 'pn-note' });
   const meta = h('span', { class: 'pn-meta' });
   const num = h('span', { class: 'pn-num', text: String(idx + 1) });
-  const hdr = h('div', { class: 'pn-h' }, num, dot, picker.el, st, conn, queueBtn, note, h('span', { class: 'spacer' }), meta, ctxBtn, memBtn, rewBtn);
+  const mks = markSet(true);
+  const renBtn = h('button', { class: 'pbtn rn-btn', type: 'button', text: '✎', title: 'Rename this panel (no relaunch; the id other agents write to stays the same)', hidden: true });
+  renBtn.onclick = () => renameInline(picker.el, cur);
+  const hdr = h('div', { class: 'pn-h' }, num, dot, picker.el, renBtn, mks.el, st, conn, queueBtn, note, h('span', { class: 'spacer' }), meta, attLbl, ctxBtn, memBtn, rewBtn);
   const rcHead = h('span', { class: 'rc-head' });
   const rcBody = h('div', { class: 'rc-body', hidden: true });
   const rcMore = h('button', { class: 'pbtn', type: 'button', text: 'Details' });
   const rcOk = h('button', { class: 'pbtn', type: 'button', text: 'Got it', title: 'Hide this until the next conversation ends' });
   const recap = h('div', { class: 'recap', hidden: true }, h('div', { class: 'rc-line' }, rcHead, h('span', { class: 'spacer' }), rcMore, rcOk), rcBody);
   let rcShown = 0;
-  rcMore.onclick = () => { rcBody.hidden = !rcBody.hidden; scheduleFit(); };
+  function syncRcMore() { setText(rcMore, rcBody.hidden ? 'Details' : 'Collapse'); }
+  rcMore.onclick = () => { rcBody.hidden = !rcBody.hidden; syncRcMore(); scheduleFit(); };
   rcOk.onclick = async () => {
-    const n = rcShown; recap.hidden = true; scheduleFit();
+    const n = rcShown; recap.hidden = true; rcBody.hidden = true; scheduleFit();
     try { await api('POST', `/agents/${enc(id)}/recap/seen`, { n }); tick(); } catch (e) { toast(e.message, 'err'); }
   };
   function paintRecap(r) {
-    if (!r) { if (!recap.hidden) { recap.hidden = true; scheduleFit(); } rcShown = 0; return; }
-    if (rcShown === r.n && rcHead.dataset.state === r.state) return;
-    rcShown = r.n; rcHead.dataset.state = r.state;
+    if (!r) { if (!recap.hidden) { recap.hidden = true; rcBody.hidden = true; scheduleFit(); } rcShown = 0; return; }
+    const tail = r.last_tail || r.last_said || '';
+    const sig = `${r.state}|${tail.length}|${(r.summary || '').length}`;
+    if (rcShown === r.n && rcHead.dataset.sig === sig) return;
+    const isNew = rcShown !== r.n;
+    rcShown = r.n; rcHead.dataset.sig = sig;
     const busy = r.state === 'pending' || r.state === 'working';
-    setText(rcHead, `Before this conversation (${r.why || 'ended'}, ${ago(r.at)}): ` + (busy ? 'summary being written…' : (r.summary || r.last_ask || r.first_ask || 'nothing recorded')));
+    const lead = r.auto ? `Auto-cleared (${ago(r.at)})` : `Before this conversation (${r.why || 'ended'}, ${ago(r.at)})`;
+    const headMsg = busy ? (tail ? 'last reply below (outline being written…)' : 'summary being written…')
+      : (r.summary || (tail ? 'last reply below' : (r.last_ask || r.first_ask || 'nothing recorded')));
+    setText(rcHead, `${lead}: ${headMsg}`);
     rcBody.replaceChildren();
+    if (tail) {
+      rcBody.append(h('div', { class: 'rc-sec rc-tail' },
+        h('div', { class: 'rc-lbl', text: r.n > 0 ? `LAST REPLY (#${r.n})` : 'LAST REPLY' }),
+        renderChatText(tail, id)));
+    }
     for (const s of r.sections || []) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: s.h }), h('ul', {}, s.points.map((t) => h('li', { text: t })))));
-    if (!(r.sections || []).length) {
+    if (!(r.sections || []).length && !tail) {
       if (r.first_ask) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: 'FIRST ASKED ' }), r.first_ask));
       if (r.last_ask) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: 'LAST ASKED ' }), r.last_ask));
     }
-    if (r.last_said) rcBody.append(h('div', { class: 'rc-sec' }, h('b', { text: 'LAST REPLY ' }), r.last_said));
-    rcBody.append(h('div', { class: 'rc-sec muted small', text: `sb memory ${r.n} has the outline with its sources` + (r.note ? ` · ${r.note}` : '') }));
+    if (r.n > 0) rcBody.append(h('div', { class: 'rc-sec muted small', text: `sb memory ${r.n} has the outline with its sources` + (r.note ? ` · ${r.note}` : '') }));
     rcMore.hidden = !rcBody.childNodes.length;
+    if (isNew) rcBody.hidden = !(r.auto && tail);
+    recap.classList.toggle('has-tail', Boolean(tail));
+    syncRcMore();
     recap.hidden = false; scheduleFit();
   }
   const box = h('div', { class: 'term' });
@@ -1228,9 +1527,14 @@ function makePane(idx, pid, view) {
     term = new Terminal({
       fontFamily: '"JetBrains Mono", "DejaVu Sans Mono", monospace', fontSize: 13, lineHeight: 1.0,
       cursorBlink: true, scrollback: 10000, theme: TERM_THEME, macOptionIsMeta: true, allowProposedApi: false,
+      linkHandler: {
+        allowNonHttpProtocols: true,
+        activate(_ev, text) { openLink(text, id); },
+      },
     });
     fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
+    registerTerminalLinks(term, () => id);
     term.open(box);
     term.onData((d) => sendJ({ t: 'i', d }));
     /* Clipboard like a desktop terminal: Ctrl+C copies while text is selected (otherwise it still interrupts the
@@ -1243,6 +1547,20 @@ function makePane(idx, pid, view) {
         return false;
       }
       if ((e.ctrlKey && e.code === 'KeyV') || (e.shiftKey && !e.ctrlKey && e.code === 'Insert')) return false;
+      return true;
+    });
+    /* OSC 52: a CLI that draws its own selection (Claude's fullscreen view) copies by sending the text to the
+       terminal as base64. xterm drops that unless handled, so the copy silently went nowhere. Write-only: a
+       read request ("?") is never answered, so a program in the terminal cannot read the clipboard. */
+    term.parser.registerOscHandler(52, (data) => {
+      const b64 = data.slice(data.indexOf(';') + 1);
+      // the hub replays scrollback on every open: a copy from earlier must not land on the clipboard again
+      if (term._sbReplay || !b64 || b64 === '?') return true;
+      let text;
+      try { text = new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))); } catch (err) { return true; }
+      if (!text) return true;
+      (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject(new Error('no clipboard')))
+        .then(() => toast('Copied'), () => toast('Copy blocked here; hold Shift, select and press Ctrl+C', 'err'));
       return true;
     });
     box.addEventListener('paste', onPaste, true);
@@ -1267,6 +1585,7 @@ function makePane(idx, pid, view) {
       if (sock !== ws) return;
       opened = true; retry = 0; refused = 0; setConn('live');
       term.reset();                       // the hub replays scrollback on every open
+      term._sbReplay = true;              // until the status line that follows the replay (OSC 52 handler)
       fitNow(true);
     };
     sock.onmessage = (ev) => {
@@ -1274,6 +1593,7 @@ function makePane(idx, pid, view) {
       if (typeof ev.data !== 'string') { term.write(new Uint8Array(ev.data)); return; }
       let m;
       try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (term._sbReplay) term.write('', () => { term._sbReplay = false; });  // after the replay has been parsed
       onStatus(m);
     };
     sock.onclose = async () => {
@@ -1322,8 +1642,11 @@ function makePane(idx, pid, view) {
     const bits = [];
     if (a.launch_block) bits.push('blocked: ' + a.launch_block);
     queueBtn.hidden = !a.queued;
+    renBtn.hidden = !id; mks.update(id && AGENT_CLIS.includes(a.provider) ? a : null);
     ctxBtn.hidden = !id || !['claude', 'codex'].includes(a.provider);
-    memBtn.hidden = rewBtn.hidden = !id || a.provider !== 'claude';
+    memBtn.hidden = rewBtn.hidden = !id || !AGENT_CLIS.includes(a.provider);
+    attLbl.hidden = !id || !AGENT_CLIS.includes(a.provider);
+    if (document.activeElement !== attBox) attBox.checked = !!a.attest;
     setText(queueBtn, `${a.queued || 0} pending · View messages`);
     if (a.queued) bits.push(queueWhy(a));
     if (a.switching && a.switching.note) bits.push(a.switching.note);
@@ -1527,8 +1850,10 @@ function tabEl() {
   const acct = h('span', { class: 'acct' });
   const mt = modelTag();
   const rm = h('button', { class: 'tab-x', type: 'button', text: '✕', title: 'Remove from Switchboard (stops its CLI; session files stay on disk)' });
-  const el = h('a', { class: 'tab', role: 'tab', draggable: 'true', title: 'Drag to reorder' }, dot, name, acct, mt, rm);
+  const mks = markSet(false);
+  const el = h('a', { class: 'tab', role: 'tab', draggable: 'true', title: 'Drag to reorder; double-click the name to rename' }, dot, name, mks.el, acct, mt, rm);
   let cur = null;
+  name.addEventListener('dblclick', (e) => { e.preventDefault(); e.stopPropagation(); renameInline(name, cur); });
   /* drag to reorder: the drop position is saved on the hub per project, so every device shows the same order */
   el.addEventListener('dragstart', (e) => {
     if (!cur) return;
@@ -1558,13 +1883,14 @@ function tabEl() {
   });
   rm.addEventListener('click', async (e) => {
     e.preventDefault(); e.stopPropagation();
-    if (!cur || !confirm(`Remove ${agentName(cur)} from Switchboard? Its CLI is stopped first; the session files stay on disk.`)) return;
+    if (!cur || !confirm(cur.ghost ? `Remove ghost ${agentName(cur)}? Its CLI is stopped, then its conversation and every record of it is erased for good. Only its edits to files stay.`
+      : `Remove ${agentName(cur)} from Switchboard? Its CLI is stopped first; the session files stay on disk.`)) return;
     try { await api('DELETE', `/agents/${enc(cur.id)}`); } catch (err) { alert('Remove failed: ' + (err.message || err)); }
     tick();
   });
   return {
     el,
-    update(a) { cur = a; el.dataset.agent = a.id; setAttr(el, 'href', agentHref(a)); setDot(dot, a); setText(name, agentName(a)); setText(acct, a.account); setModelTag(mt, a); },
+    update(a) { cur = a; el.dataset.agent = a.id; setAttr(el, 'href', agentHref(a)); setDot(dot, a); setText(name, agentName(a)); mks.update(a); setText(acct, a.account); setModelTag(mt, a); },
   };
 }
 
@@ -1589,8 +1915,19 @@ function projectView(pid, initialAgent) {
   const summonBtn = h('button', { class: 'pbtn', type: 'button', text: 'Summon', title: 'Side agent beside the focused agent: a much bigger /btw that leaves it undisturbed' });
   const shareBtn = h('button', { class: 'pbtn', type: 'button', text: 'Shared', title: "What this project's agents are doing, and their shared notes" });
   const teamBtn = h('button', { class: 'pbtn', type: 'button', text: 'Team', title: 'Messages, notes and decisions between this project\'s agents and you, on a timeline', onclick: () => openTeam(pid) });
-  const memFilesBtn = h('button', { class: 'pbtn', type: 'button', text: 'Memory', title: 'Every memory file this project\'s agents wrote, by agent, and its conversation outlines', onclick: () => openMemFiles(pid, null) });
+  const memFilesBtn = h('button', { class: 'pbtn', type: 'button', text: 'Memory', title: 'This project\'s running memory, its conversation outlines and transcripts, and every memory file its agents wrote: read and edit them', onclick: () => openMemFiles(pid, null) });
   const insBtn = h('a', { class: 'pbtn', href: '#/insights/' + enc(pid), text: 'Insights', title: 'Token use, cost, tools and activity for this project' });
+  /* kill the project entirely (DELETE /api/projects/<id>, owner only; switchboard/kill.py) */
+  const killBtn = h('button', { class: 'pbtn kill-p', type: 'button', text: 'Kill project', title: 'Remove this project entirely: its agents, their conversations and everything Switchboard recorded about it. Files in its folder stay.' });
+  guarded(killBtn, async () => {
+    const p = S.projects.get(pid);
+    const n = projectAgents(pid).length;
+    if (!confirm(`Kill ${p ? p.name || pid : pid} entirely?\n\n${n} agent${n === 1 ? '' : 's'} exit now and are removed, with their conversations, messages, notes, work items and memory files. Its running jobs are stopped. The conversations are deleted from disk; no copy is kept.\n\nOnly the files in the project's folder stay. This cannot be undone.`)) return;
+    const r = await api('DELETE', `/projects/${enc(pid)}`);
+    toast(`Killed ${pid}: ${r.agents} agents, ${r.sessions} sessions` + (r.left_running.length ? ` · still running: ${r.left_running.join(', ')}` : '') + ((r.memory_shared || []).length ? ` · memory folder kept, another project's agent uses it: ${r.memory_shared.join(', ')}` : ''));
+    location.hash = '#/'; tick();
+  });
+  killBtn.hidden = pid === 'switchboard' || pid === 'unsorted';
   /* files outside the project's folder: two owner toggles (POST /api/projects/<id>/outside, sb outside) */
   const outRead = h('button', { class: 'pbtn out-t', type: 'button', text: 'Read out', 'aria-pressed': 'false' });
   const outWrite = h('button', { class: 'pbtn out-t', type: 'button', text: 'Write out', 'aria-pressed': 'false' });
@@ -1652,7 +1989,7 @@ function projectView(pid, initialAgent) {
   const side = h('aside', { class: 'side' }, shareSec, limSec, srcSec);
   const el = h('div', { class: 'pv' },
     h('div', { class: 'pv-head' }, h('a', { class: 'back', href: '#/', text: '← Projects', title: 'Back to all projects' }), name, goal,
-      h('span', { class: 'spacer' }), seg, addBtn, summonBtn, shellBtn, outRead, outWrite, teamBtn, insBtn, memFilesBtn, shareBtn, limBtn, srcBtn),
+      h('span', { class: 'spacer' }), seg, addBtn, summonBtn, shellBtn, outRead, outWrite, teamBtn, insBtn, memFilesBtn, shareBtn, limBtn, srcBtn, killBtn),
     form.el, summonForm,
     h('div', { class: 'pv-bar' }, tabsBox, h('span', { class: 'spacer' }), ctl.el),
     h('div', { class: 'pv-body' }, h('div', { class: 'stage-wrap' }, stage), side));
@@ -1945,8 +2282,19 @@ function inboxRow() {
   const dismiss = h('button', { class: 'pbtn ib-dismiss', type: 'button' });
   const ignore = h('button', { class: 'pbtn ib-ignore', type: 'button', text: 'Ignore', title: 'Just remove it from the inbox: the agent is told nothing and keeps doing what it was doing' });
   const form = h('form', { class: 'ib-form' }, txt, send, dismiss, ignore);
-  const el = h('div', { class: 'ib-item' }, h('div', { class: 'ib-h' }, kind, who, age), text, opts, form);
+  const adoptSel = h('select', { class: 'ib-adopt-sel', 'aria-label': 'File under a project' });
+  const adopt = h('label', { class: 'ib-adopt', title: 'Files this under the project. Whatever sent it is remembered: its other notices move too, and later ones land there.' }, 'File under', adoptSel);
+  const el = h('div', { class: 'ib-item' }, h('div', { class: 'ib-h' }, kind, who, age), text, opts, form, adopt);
   let cur = null, onDone = null;
+  adoptSel.addEventListener('change', async () => {
+    const pid = adoptSel.value;
+    if (!pid || !cur) return;
+    try {
+      const r = await api('POST', `/inbox/${enc(cur.id)}/adopt`, { project: pid });
+      toast(`Filed under ${projName(pid)}` + (r.source ? `; ${r.source} lands there from now on` : ''));
+      if (onDone) onDone();
+    } catch (err) { toast(err.message, 'err'); adoptSel.value = ''; }
+  });
   async function cross(answer, quiet) {
     const r = await api('POST', `/inbox/${enc(cur.id)}/done`, { answer: answer || undefined, from: 'owner', quiet: !!quiet });
     toast(r.state === 'answered' ? `Answered ${cur.agent || ''}: ${answer}` : r.state === 'acked' ? 'Acknowledged' : r.state === 'dismissed' ? 'Dismissed' : r.state === 'ignored' ? 'Ignored (the agent was not told)' : `Already ${r.state}`);
@@ -1970,7 +2318,9 @@ function inboxRow() {
       cur = it; onDone = done;
       const dec = it.kind === 'decision', live = !!it.choices;  // live: a dialog open in the agent's terminal
       setText(kind, dec ? 'question' : live ? 'in its terminal' : 'needs you'); setCls(kind, 'ib-kind ' + (dec ? 'dec' : 'need'));
-      setText(who, it.agent || 'someone'); setAttr(who, 'title', it.id);
+      setText(who, it.source || it.agent || 'someone'); setAttr(who, 'title', it.id);
+      adopt.hidden = it.project !== 'unsorted';
+      if (!adopt.hidden) projectOptions(adoptSel, 'a project…');
       setText(age, it.age_s != null ? fmtDur(it.age_s) + ' ago' : ago(it.created_at)); setAttr(age, 'title', absTime(it.created_at));
       setText(text, it.text || '');
       optBtns.sync(it.options || []);

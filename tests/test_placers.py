@@ -26,7 +26,7 @@ os.environ.setdefault("SB_WORKSPACE", os.path.join(TMP, "ws"))
 os.environ.setdefault("SB_CLAUDE_BIN", os.path.join(HERE, "fake_cli.py"))
 os.environ.setdefault("SB_CODEX_BIN", os.path.join(HERE, "fake_cli.py"))
 
-assert "/.config/" not in os.environ["SB_HOSTS"], "tests must never touch the real hosts file"  # 2026-11-01: one run overwrote it
+assert "/.config/" not in os.environ["SB_HOSTS"], "tests must never touch the real hosts file"
 from switchboard import hosts, jobs, placers  # noqa: E402
 from switchboard.hub import Hub  # noqa: E402
 from switchboard.store import Store  # noqa: E402
@@ -214,7 +214,7 @@ class WorkboardTests(unittest.TestCase):
                    f"('{jid}','{jid}',NULL,'sb-job-{jid}.service','/tmp','[\"true\"]',1,64,2048,1,'queued','{created}')")
 
     def _race(self, nested):
-        """Run launch_queued with a second launcher arriving during the first submit (the live double submit, 2026-11-06)."""
+        """Run launch_queued with a second launcher arriving during the first submit (a live double submit)."""
         os.environ["FAKE_WB_DENY"] = "1"  # acquire refused: every job stays queued, as behind a busy card
         real, calls, h = placers.wb_submit, [], hosts.load_config()["hosts"][0]
         def submit(host, cfg, job, pin):

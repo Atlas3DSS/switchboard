@@ -141,7 +141,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .pool-kind { font-size: 11.5px; color: var(--muted); }
 .pool-email { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
 .pool-note { font-size: 11.5px; color: var(--muted); font-style: italic; }
+.pool-gather { flex: none; align-self: center; white-space: nowrap; }
 .pool.stale .lims { opacity: .6; }
+.pool-cu { margin-top: 5px; font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pool-cu-at { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .lims { margin-top: 5px; display: grid; gap: 3px; }
 .lim { display: grid; grid-template-columns: 1fr 44px; align-items: center; gap: 10px; font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .lim-t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -195,6 +198,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 }
 .newagent label { display: grid; gap: 2px; font-size: 11.5px; color: var(--muted); min-width: 0; }
 .newagent .wide { grid-column: 1 / -1; }
+.newagent label.ghost-opt { display: flex; align-items: center; gap: 6px; }
+.newagent label.ghost-opt[hidden] { display: none; }
 .row-end { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .row-end .muted { margin-right: auto; }
 
@@ -608,6 +613,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .ib-opts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .ib-opt { border-color: var(--accent); }
 .ib-form { display: flex; gap: 6px; align-items: center; }
+.ib-adopt { display: flex; gap: 6px; align-items: center; margin-top: 6px; font-size: 12px; opacity: .85; }
+.ib-adopt select { font-size: 12px; padding: 2px 6px; }
 .ib-form input { flex: 1 1 auto; font-size: 12.5px; padding: 3px 8px; }
 .ib-dismiss { color: var(--muted); margin-left: auto; }
 @media (max-width: 640px) {
@@ -829,6 +836,12 @@ a.vz-tcard:hover, .vz-tcard.on { border-color: var(--accent); }
   .rw-row { grid-template-columns: minmax(0, 1fr); }
 }
 .mf-edit { width: 100%; min-height: 50vh; box-sizing: border-box; background: var(--field); color: var(--ink); border: 1px solid var(--line); border-radius: 7px; padding: 10px 12px; font-family: var(--mono); font-size: 12px; resize: vertical; }
+.rw-ed { margin: 2px 0 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); display: flex; flex-direction: column; gap: 8px; }
+.rw-part { display: flex; flex-direction: column; gap: 3px; }
+.rw-ed .mf-edit.rw-ta { min-height: 110px; }
+.rw-ed .mf-edit.rw-ta-raw { min-height: 40vh; }
+.rw-role { font-weight: 650; color: var(--ink); }
+.rw-e-tool .rw-text { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .rw-keep { display: flex; align-items: center; gap: 6px; color: var(--muted); }
 
 /* project nodes: the same seats on every project card */
@@ -842,10 +855,40 @@ a.vz-tcard:hover, .vz-tcard.on { border-color: var(--accent); }
 .wiki-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 .wiki-pop pre { margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap; font-size: 12.5px; }
 
-/* what happened before the clear: a strip above the terminal, from the outline the small model already wrote */
+/* what happened before the clear: a strip above the terminal, from the outline and last reply captured at clear */
 .recap { border-bottom: 1px solid var(--line); background: var(--card); font-size: 12.5px; padding: 4px 8px; max-height: 40%; overflow: auto; }
+.recap.has-tail { max-height: 55%; }
 .rc-line { display: flex; align-items: baseline; gap: 6px; }
 .rc-head { min-width: 0; }
 .rc-body { padding: 4px 0 2px; }
-.rc-sec { margin-top: 3px; }
+.rc-sec { margin-top: 4px; }
 .rc-sec ul { margin: 2px 0 0; padding-left: 18px; }
+.rc-tail { padding: 6px 8px; margin-bottom: 6px; border: 1px solid var(--line); border-radius: 6px; background: rgba(0,0,0,.18); }
+.rc-lbl { font-size: 10.5px; font-weight: 700; letter-spacing: .04em; color: var(--muted); margin-bottom: 4px; }
+.rc-tail .cm-text { font-size: 12.5px; line-height: 1.45; }
+.rc-tail .cm-text p { margin: 0 0 6px; }
+.rc-tail .cm-text p:last-child { margin-bottom: 0; }
+.cm-text .md-h { font-weight: 700; margin: 6px 0 3px; }
+.cm-text .md-h1 { font-size: 14px; }
+.cm-text .md-h2 { font-size: 13.5px; }
+.cm-text .md-h3, .cm-text .md-h4 { font-size: 12.5px; }
+.cm-text .md-q { margin: 4px 0; padding: 2px 8px; border-left: 2px solid var(--line); color: var(--muted); }
+.cm-text hr { border: 0; border-top: 1px solid var(--line); margin: 6px 0; }
+.cm-text .md-tbl { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+.cm-text .md-tbl th, .cm-text .md-tbl td { border: 1px solid var(--line); padding: 3px 6px; text-align: left; }
+.cm-text .md-tbl th { background: rgba(255,255,255,.04); }
+
+.pn-attest { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: #9aa4a8; margin-right: 6px; cursor: pointer; white-space: nowrap; }
+.pn-attest input { margin: 0; accent-color: #d8a657; }
+
+/* marks: lead, illustration, architect. off is faint, auto (Switchboard's own choice) is outlined, on is the owner's pin */
+.mks { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+.mk { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 18px; padding: 0; border-radius: 5px; border: 1px solid transparent; background: none; color: #7f898d; line-height: 0; }
+button.mk { cursor: pointer; }
+button.mk:hover { border-color: #86c232; opacity: 1; }
+.mk.off { opacity: .35; }
+.mk.auto { color: #c9d1d4; border: 1px dashed #5b6569; }
+.mk.on { background: #86c232; border-color: #86c232; color: #222629; }
+.arow .mk.auto { color: var(--ink); }
+.rn-btn { padding: 0 5px !important; }
+.rn-in { font: inherit; font-size: 12.5px; font-weight: 600; width: 180px; padding: 1px 5px; border-radius: 5px; color: #f3f5f4; background: #161819; border: 1px solid #86c232; outline: none; }

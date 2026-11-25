@@ -19,6 +19,7 @@ from .store import iso_from_epoch
 
 USAGE = os.path.expanduser(os.environ.get("SB_USAGE") or "~/.cache/switchboard/usage.json")
 STALE_S = 2 * 3600
+QUOTA_FRESH_S = 20 * 60
 
 
 LABELS = {"5h": ("session", "Session (5h)"), "wk": ("weekly", "Weekly"), "Fable": ("fable", "Fable weekly")}
@@ -44,9 +45,41 @@ def usage():
         order = {"session": 0, "weekly": 1, "fable": 2}
         limits.sort(key=lambda l: order.get(l["key"], 9))
         read_at = e.get("read_at") or e.get("fetched")
+        if a["kind"] == "antigravity":  # what agy reports is left, and the last time its quota ran out
+            from . import antigravity
+            hit = antigravity.quota_hit(a.get("config_dir"))
+            # what is left, as agy itself reports it (`agy -p "/usage"`): the Gemini group is this account's own
+            # session and weekly limit. The subscription has a second pair for Claude and GPT models run through
+            # agy; no agent here uses them, so that pair is shown only once something has been used from it.
+            subs, sub_at = antigravity.subscription_usage(a.get("config_dir"))
+            for l in subs or []:
+                own = "gemini" in l["group"].lower()
+                if not own and l["left"] >= 100:
+                    continue
+                name = {"session": "Session (5h)", "weekly": "Weekly"}.get(l["window"], l["window"])
+                limits.append({"key": l["window"] if own else "other_" + l["window"],
+                               "label": name if own else f"{l['group']}: {name}",
+                               "used": 100 - l["left"], "resets": l["resets"]})
+            limits.sort(key=lambda l: {"session": 0, "weekly": 1}.get(l["key"], 9))
+            if subs:
+                read_at = sub_at
+            if hit and hit["resets"] > now:
+                out_now = now - hit["at"] < QUOTA_FRESH_S  # agents retry: a hit this recent means it is still out
+                if out_now or not subs:  # with a live reading, an old failure says nothing the limits do not
+                    limits.append({"key": "quota", "label": "Quota ran out "
+                                   + time.strftime("%a %H:%M", time.localtime(hit["at"]))
+                                   + ("" if out_now else " (no failure since)"),
+                                   "used": 100 if out_now else None, "resets": iso_from_epoch(hit["resets"])})
+                    read_at = now
         out[a["name"]] = {"tier": e.get("tier"), "limits": limits,
                           "read_at": iso_from_epoch(read_at) if read_at else None,
                           "stale": bool(read_at) and now - read_at > STALE_S, "error": e.get("error")}
+        if a["kind"] == "antigravity":  # Colab compute units are bought on the same Google account (colab.py)
+            from . import colab
+            cu = colab.reading()
+            if cu:
+                out[a["name"]]["colab"] = dict(cu, read_at=iso_from_epoch(cu["read_at"]),
+                                               changed_at=iso_from_epoch(cu["changed_at"]) if cu.get("changed_at") else None)
     return out
 
 

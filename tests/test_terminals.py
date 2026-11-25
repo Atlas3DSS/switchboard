@@ -163,7 +163,7 @@ class AccountToggleTests(unittest.TestCase):
 
     def test_symlinked_dirs_are_added_so_edits_never_prompt(self):
         # ~/.claude-two/projects -> ~/.claude/projects: a memory write resolves outside the cwd and prompts;
-        # a cwd reached through a symlink does the same for every edit. Both go on --add-dir (owner, 2026-11-04).
+        # a cwd reached through a symlink does the same for every edit. Both go on --add-dir.
         real = os.path.join(TMP, "real-proj")
         link = os.path.join(TMP, "link-proj")
         os.makedirs(real, exist_ok=True)
@@ -622,8 +622,15 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(helpers.smaller_model(h2.s.agent("par")), "claude-haiku-5-5")
         with self.assertRaises(ValueError):
             helpers.smaller_model({**h.s.agent("par"), "model": "claude-haiku-5-5"})
-        with self.assertRaises(ValueError):
-            helpers.smaller_model({"provider": "codex", "model": "gpt-6-astra"})
+        self.assertEqual(helpers.smaller_model({"provider": "codex", "model": "gpt-6-astra"}), "gpt-6.1-terra")
+        self.assertEqual(helpers.smaller_model({"provider": "antigravity", "model": "gemini-4-carbon-high"}),
+                         "gemini-3.8-flash-medium")
+        with self.assertRaises(ValueError):  # already the small one
+            helpers.smaller_model({"provider": "codex", "model": "gpt-6.1-terra"})
+        with self.assertRaises(PermissionError):
+            helpers.smaller_model({"provider": "antigravity", "model": "gemini-3.8-flash-high"}, "gemini-4-neon-high")
+        with self.assertRaises(ValueError):  # a CLI with no known sizes
+            helpers.smaller_model({"provider": "hermes", "model": "x"})
         sonnet = {"provider": "claude", "model": "claude-sonnet-5-5"}
         self.assertEqual(helpers.smaller_model(sonnet, "claude-haiku-5-5"), "claude-haiku-5-5")
         for bigger in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"):
@@ -1238,6 +1245,33 @@ class RouterTests(unittest.TestCase):
             h.send({"to": "desk", "body": "hello"})
 
 
+
+class ClaudeOnAnotherEndpoint(unittest.TestCase):
+    def test_listed_model_gets_its_endpoint_and_a_home_of_its_own(self):
+        from unittest import mock
+        home = tempfile.mkdtemp()
+        entry = {"url": "https://api.example-endpoint.test", "key": "ENDPOINT_API_KEY", "home": home}
+        base = {"id": "a1", "provider": "claude", "name": "abl", "cwd": "/tmp", "project": "p", "session_id": None,
+                "account": "one"}
+        with mock.patch.dict(discovery.CLAUDE_ENDPOINTS, {"other-model": entry}), \
+                mock.patch.dict(os.environ, {"ENDPOINT_API_KEY": "k-test"}):
+            agent = {**base, "model": "other-model"}
+            env = discovery.endpoint_env(agent, "/tmp/work")
+            self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.example-endpoint.test")
+            self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "k-test")
+            self.assertEqual(env["ANTHROPIC_SMALL_FAST_MODEL"], "other-model")
+            self.assertEqual(env["CLAUDE_CONFIG_DIR"], home)  # not the account's folder
+            cfg = json.load(open(os.path.join(home, ".claude.json")))
+            self.assertTrue(cfg["hasCompletedOnboarding"])
+            self.assertTrue(cfg["projects"]["/tmp/work"]["hasTrustDialogAccepted"])
+            self.assertFalse(os.path.islink(os.path.join(home, "projects")))
+            self.assertEqual(terminals.agent_config_dir(agent), home)
+            self.assertTrue(terminals.memory_dir(agent).startswith(os.path.realpath(home) + os.sep))
+            self.assertEqual(terminals.launch_env(agent)["CLAUDE_CONFIG_DIR"], home)
+            self.assertEqual(discovery.endpoint_env({**base, "model": "claude-opus-5-5"}), {})
+            self.assertEqual(discovery.endpoint_env({**base, "provider": "hermes", "model": "other-model"}), {})
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -1485,3 +1519,4 @@ class SwitchGuardTests(unittest.TestCase):
         self.assertEqual(self.s.agent(self.aid)["account"], "one")
         ev = [r["text"] for r in self.s.q("SELECT text FROM events WHERE agent=?", (self.aid,))]
         self.assertTrue(any("runs on account one, not two" in x for x in ev), ev)
+

@@ -125,6 +125,39 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(nodes.place(self.h, "tasker", "claude", "claude-opus-5-5",
                                          {"one": lim(99), "two": lim(97), "oai": lim(100)}), (None, None, None))
 
+    def test_one_setting_moves_every_seat_without_its_own_choice_to_another_account_type(self):
+        self.assertIsNone(nodes.seats(self.h, "alpha")["default_provider"])
+        nodes.set_seat(self.h, "alpha", "architect", {"provider": "codex", "model": "gpt-6-astra"})
+        nodes.set_default_provider(self.h, "antigravity")
+        st = nodes.seats(self.h, "alpha")
+        self.assertEqual([(s["role"], s["provider"], s["model"]) for s in st["seats"]],
+                         [("lead", "antigravity", "gemini-pro-orchestrator-neon"), ("architect", "codex", "gpt-6-astra"),
+                          ("tasker", "antigravity", "gemini-4-hydrogen-high"),
+                          ("janitor", "antigravity", "gemini-3.8-flash-medium")])
+        self.assertEqual(st["default_provider"], "antigravity")
+        accts = [{"name": "one", "kind": "claude"}, {"name": "g", "kind": "antigravity"}]
+        with mock.patch.object(nodes.discovery, "accounts", return_value=accts):  # a seat that starts lands there
+            self.assertEqual(nodes.place(self.h, "lead", *nodes.seat_default(self.h, "lead"), {}),
+                             ("antigravity", "gemini-pro-orchestrator-neon", "g"))
+        with self.assertRaises(ValueError):
+            nodes.set_default_provider(self.h, "llama")
+        nodes.set_default_provider(self.h, "")
+        self.assertEqual(self.seat("lead")["model"], "claude-opus-5-5")
+
+    def test_an_agent_held_in_reserve_fills_no_seat(self):
+        self.agent("spare", "claude-opus-5-5-high", 1, provider="antigravity")
+        self.assertEqual(self.seat("lead")["agent"], "spare")  # an Opus agent takes the empty lead seat by itself
+        st = nodes.set_reserve(self.h, "alpha", "spare")
+        self.assertIsNone(self.seat("lead")["agent"])
+        self.assertEqual([(x["agent"], x["reserve"]) for x in st["extras"]], [("spare", True)])
+        self.assertEqual(self.h.lead_of("alpha"), "spare")  # alone on the project, it still answers for it
+        self.agent("worker", "claude-haiku-5-5", 2)
+        self.assertEqual(self.h.lead_of("alpha"), "worker")  # with anyone else there, a message never lands on it
+        nodes.set_reserve(self.h, "alpha", "spare", False)
+        self.assertEqual(self.seat("lead")["agent"], "spare")
+        with self.assertRaises(ValueError):
+            nodes.set_reserve(self.h, "alpha", "nobody")
+
     def test_pickup_inherits_a_recent_session_clears_an_old_one_and_starts_an_empty_seat(self):
         self.agent("boss", "claude-opus-5-5", 1)
         self.agent("worker", "claude-haiku-5-5", 50)
@@ -196,6 +229,43 @@ class NodeTests(unittest.TestCase):
         bodies = [m["body"] for m in sorted(self.h.s.messages("alpha-lead"), key=lambda m: m["created_at"])]
         self.assertEqual(len(bodies), 2)
         self.assertTrue(any("You are the Lead Opus of project Alpha" in b for b in bodies))
+
+
+
+class MarkTests(unittest.TestCase):
+    """The owner's pins from an agent's pane: lead, illustrator, architect."""
+    setUp, agent, seat = NodeTests.setUp, NodeTests.agent, NodeTests.seat
+
+    def test_pinning_the_lead_moves_where_a_message_to_the_project_lands(self):
+        self.agent("front", "claude-opus-5-5", 1)
+        self.agent("neon", "gemini-pro-orchestrator-neon", 5, provider="antigravity")
+        self.assertEqual(self.h.lead_of("alpha"), "front")
+        self.assertEqual(nodes.marks(self.h, "alpha")["front"]["lead"], "auto")
+        r = nodes.set_mark(self.h, "alpha", "lead", "neon")
+        self.assertEqual((r["lead"], r["marks"]["neon"]["lead"], self.seat("lead")["agent"]), ("neon", "on", "neon"))
+        self.assertNotIn("lead", r["marks"].get("front", {}))
+        self.assertEqual(self.h.agent_view(self.h.s.agent("neon"))["marks"], {"lead": "on"})
+        r = nodes.set_mark(self.h, "alpha", "lead", "neon", on=False)  # unpinned: the hub chooses again
+        self.assertEqual((r["lead"], r["marks"]["front"]["lead"]), ("front", "auto"))
+
+    def test_lead_and_architect_can_be_one_agent_and_the_illustrator_keeps_out_of_the_seats(self):
+        self.agent("front", "claude-opus-5-5", 1)
+        self.agent("brain", "claude-fable-5-2", 1)
+        self.agent("pen", "claude-haiku-5-5", 1)
+        nodes.set_mark(self.h, "alpha", "lead", "front")
+        r = nodes.set_mark(self.h, "alpha", "architect", "front")
+        self.assertEqual(r["marks"]["front"], {"lead": "on", "architect": "on"})  # one agent may be both
+        self.assertEqual((self.seat("lead")["agent"], self.seat("architect")["agent"]), ("front", "front"))
+        self.assertEqual(self.seat("tasker")["agent"], "pen")
+        r = nodes.set_mark(self.h, "alpha", "illustrator", "pen")
+        self.assertEqual(r["marks"]["pen"], {"illustrator": "on"})
+        self.assertIsNone(self.seat("tasker")["agent"])
+        self.assertNotIn("pen", [x["agent"] for x in nodes.fold(self.h, "alpha")["folded"]])
+        self.assertFalse(self.h.s.agent("pen").get("gone"))
+        with self.assertRaises(ValueError):
+            nodes.set_mark(self.h, "alpha", "boss", "pen")
+        with self.assertRaises(ValueError):
+            nodes.set_mark(self.h, "alpha", "lead", "nobody")
 
 
 if __name__ == "__main__":

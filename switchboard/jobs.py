@@ -11,6 +11,7 @@ without a result) | refused (HALT was raised when it tried to start). Adopted jo
 only watches; they finish when their unit leaves.
 """
 import json
+import math
 import os
 import re
 import shlex
@@ -146,6 +147,34 @@ def mem_hold_mib(declared, peak, started_at, now=None):
     return min(declared, max(int(peak * MEM_HEADROOM), peak + MEM_HEADROOM_MIB))
 
 
+CPU_SETTLE_S = 20 * 60          # a job holds its declared threads for its first 20 minutes
+CPU_HEADROOM = 1.25
+GPU_SETTLE_S = 20 * 60
+GPU_HEADROOM, GPU_HEADROOM_MIB = 1.25, 2048
+
+
+def thread_hold(declared, cpu_s, started_at, now=None):
+    """Threads the hub books for a running job so an over-estimate is clawed back without
+    touching the process. Until CPU_SETTLE_S: its
+    declaration. After that: its average use since start (the unit's CPUUsageNSec / run time) x1.25, rounded up, at
+    least 1, never above the declaration. Nothing is changed on the unit: its AllowedCPUs/limits stay, so it can still
+    use what it declared; live load is still counted in place(), and fleet-priority freezes lower tiers on contention."""
+    if cpu_s is None or not started_at or not declared:
+        return declared
+    ran = (time.time() if now is None else now) - epoch(started_at)
+    if ran < CPU_SETTLE_S:
+        return declared
+    return min(declared, max(1, math.ceil(cpu_s / ran * CPU_HEADROOM)))
+
+
+def gpu_hold_mib(held, realized, settled):
+    """VRAM booked on a card once every job holding it has run GPU_SETTLE_S: what is really there x1.25 (at least
+    +2 GiB), never above the declarations. Before that, or with no reading, the declarations."""
+    if not settled or realized is None:
+        return held
+    return min(held, max(int(realized * GPU_HEADROOM), realized + GPU_HEADROOM_MIB))
+
+
 def reserved(hub, host, doc=None):
     """What running (and launching) jobs on a host hold: declared totals, and the part not yet visible in the
     probe (declared minus the unit's measured memory, declared minus the card's measured VRAM).
@@ -165,31 +194,57 @@ def reserved(hub, host, doc=None):
     attributed = {}
     peaks = {u["unit"]: u.get("mem_peak_mib") for u in ((doc or {}).get("units") or []) + ((doc or {}).get("jobs") or [])
              if u.get("unit")}
+    cpu_s = {u["unit"]: u.get("cpu_s") for u in ((doc or {}).get("units") or []) + ((doc or {}).get("jobs") or [])
+             if u.get("unit")}
+    unsettled = set()
     for r in hub.s.q("SELECT threads, mem_mib, mem_cur_mib, gpu_mib, gpu_uuid, pid, unit, started_at FROM jobs WHERE host=? "
                      "AND state IN ('running','stopping') AND adopted=0", (host,)):
-        res["threads"] += r["threads"] or 0
+        res["threads"] += thread_hold(r["threads"] or 0, cpu_s.get(r["unit"]), r["started_at"])
         res["mem_mib"] += r["mem_mib"] or 0
         res["mem_unrealized_mib"] += max(0, mem_hold_mib(r["mem_mib"] or 0, peaks.get(r["unit"]), r["started_at"])
                                          - (r["mem_cur_mib"] or 0))
         if r["gpu_uuid"] and r["gpu_mib"]:
             res["gpu"][r["gpu_uuid"]] = res["gpu"].get(r["gpu_uuid"], 0) + r["gpu_mib"]
+            if not r["started_at"] or time.time() - epoch(r["started_at"]) < GPU_SETTLE_S:
+                unsettled.add(r["gpu_uuid"])
             seen = vram_by_pid.get((r["gpu_uuid"], r["pid"]), 0) if r["pid"] else 0
             attributed[r["gpu_uuid"]] = attributed.get(r["gpu_uuid"], 0) + seen
     for uuid, held in res["gpu"].items():
         realized = attributed.get(uuid) or min(held, used_by_card.get(uuid, 0))
-        res["gpu_unrealized"][uuid] = max(0, held - realized)
+        res["gpu_unrealized"][uuid] = max(0, gpu_hold_mib(held, realized, uuid not in unsettled) - realized)
     return res
 
 
-def disjoint_cpus(hub, host, nthreads, advised, want):
+def pinned_cpus(doc, but=None):
+    """The CPUs something is really running on, from the host's last probe (probe.pins): every sb job's processes,
+    and anything else pinned that has used a twentieth of a CPU or more since it started. `but`: a unit to leave
+    out (the job asking)."""
+    taken = set()
+    for p in (doc or {}).get("pins") or []:
+        unit = p.get("unit") or ""
+        if unit == but or not (unit.startswith("sb-job-") or (p.get("cpu") or 0) >= 5):
+            continue
+        taken.update(p.get("cpus") or [])
+    for group in ((doc or {}).get("cpu") or {}).get("siblings") or []:  # the other thread of a core in use is not free
+        if taken.intersection(group):
+            taken.update(group)
+    return taken
+
+
+def disjoint_cpus(hub, host, nthreads, advised, want, doc=None):
     """The CPU set a job is pinned to: cpu-run's advice when none of it is held by another running sb job on the
     host, else the lowest free CPUs. cpu-run's dry run is an advisory snapshot that sees live load, not the hub's
     pins, so every 2-thread job it advised landed on CPUs 0,1 (the shared-affinity trap). When the
     host has too few free CPUs the advice stands: the inventory already found the threads."""
     taken = set()
-    for r in hub.s.q("SELECT cpus FROM jobs WHERE host=? AND state IN ('running','stopping') AND cpus IS NOT NULL",
+    seen = {p.get("unit") for p in (doc or {}).get("pins") or []}
+    for r in hub.s.q("SELECT cpus, unit FROM jobs WHERE host=? AND state IN ('running','stopping') AND cpus IS NOT NULL",
                      (host,)):
-        taken.update(json.loads(r["cpus"]) or [])
+        if r["unit"] not in seen:  # a job the probe has seen is counted where it really is, not where it was told
+            taken.update(json.loads(r["cpus"]) or [])
+    # ... and whatever is really on a CPU, tracked or not: a GPU job records no CPUs and a command may pin itself
+    # somewhere other than its label
+    taken |= pinned_cpus(doc)
     if advised and not taken.intersection(advised):
         return advised
     free = [c for c in range(nthreads or 0) if c not in taken]
@@ -217,6 +272,15 @@ def budget_check(hub, cfg, job):
 
 
 TINY_HOURS = 1.0  # a 1-thread CPU job this short never waits on load (jobs.cuts_in)
+
+
+OTHER_TIER = 99
+
+
+def tier(cfg, project):
+    """A project's rank: its place in hosts.json jobs.priority_projects; 0 is first. Everything else ranks after the list."""
+    order = cfg.get("jobs", {}).get("priority_projects") or []
+    return order.index(project) if project in order else OTHER_TIER
 
 
 def cuts_in(cfg, job):
@@ -279,8 +343,18 @@ def _place(hub, cfg, job, rows, board, cut):
             reasons.append(f"{h['name']}: {free_threads} threads free, need {job['threads']}")
             continue
         if free_mem < job["mem_mib"]:
-            reasons.append(f"{h['name']}: {int(free_mem)} MiB free, need {job['mem_mib']}")
-            continue
+            short = f"{h['name']}: RAM {int(free_mem)} MiB free, need {job['mem_mib']}"
+            # the first-tier project is never blocked by a lack of RAM: it
+            # places anyway; its launch asks fleet-priority on that host to stop lower tiers until the RAM is there
+            if not job["gpu_mib"] and tier(cfg, job.get("project")) == 0 and \
+                    (cap["ram_available_gib"] or 0) * 1024 >= job["mem_mib"] * 0.25:
+                job["ram_warn"] = "warning (fleet-priority frees RAM): " + short
+                return h, None, None
+            if not job["gpu_mib"]:
+                reasons.append(short)
+                continue
+            # for a GPU job RAM is a warning, never a blocker; a free card is not held for RAM
+            job["ram_warn"] = "warning: " + short
         if not job["gpu_mib"]:
             return h, None, None
         pin = job.get("gpu_pin")
@@ -314,10 +388,17 @@ def _place(hub, cfg, job, rows, board, cut):
 
 def _launch_script(cfg, h, doc, job, gpu):
     weight = cfg["jobs"]["slice_cpu_weight"] if h["desktop"] else 100
+    rank = tier(cfg, job.get("project"))
+    # priority work must not run below every desktop service; per-tier niceness and unit weight
+    nice, unit_weight = {0: (0, 1000), 1: (4, 400), 2: (7, 200)}.get(rank, (10, weight))
     total = ((doc.get("memory") or {}).get("total_mib")) or 0
     high = max(1024, int(total - h["reserve"]["ram_gib"] * 1024)) if total else None
     slice_text = f"[Unit]\nDescription={SLICE_DESCRIPTION}\n[Slice]\nCPUWeight={weight}\n" + (
         f"MemoryHigh={high}M\n" if high else "")
+    slice_name = "switchboard-jobs.slice"
+    if rank == 0:  # the first-tier project's own slice: it competes with app.slice as an equal, not at the jobs weight
+        slice_name = "switchboard-priority.slice"
+        slice_text = f"[Unit]\nDescription={SLICE_DESCRIPTION} (first-tier project)\n[Slice]\nCPUWeight=1000\n"
     desc = f"sb job {job['name']} ({job['project'] or '-'}/{job['agent']})"
     env = ["-E", f"SB_JOB_ID={job['id']}", "-E", f"SB_AGENT={job['agent']}", "-E", f"SB_PROJECT={job['project'] or ''}",
            "-E", f"SB_HOST={h['name']}", "-E", "SB=" + os.path.join(SB_BIN, "sb"), "-E", "__SB_PATH__"]
@@ -326,13 +407,16 @@ def _launch_script(cfg, h, doc, job, gpu):
     if job.get("board_id"):
         env += ["-E", f"SB_WORKBOARD_JOB={job['board_id']}"]
     cpus = json.loads(job.get("cpus") or "null")
+    argv = json.loads(job["argv"])
     if cpus:
         env += ["-p", "AllowedCPUs=" + ",".join(str(c) for c in cpus)]
-    run = ["systemd-run", "--user", "--unit", job["unit"].removesuffix(".service"), "--slice", "switchboard-jobs.slice",
+        if not doc.get("cpuset"):  # this host does not enforce AllowedCPUs for user units: pin the command itself
+            argv = ["taskset", "-c", ",".join(str(c) for c in cpus)] + argv
+    run = ["systemd-run", "--user", "--unit", job["unit"].removesuffix(".service"), "--slice", slice_name,
            "--remain-after-exit", "--working-directory", job["cwd"], "-p", f"Description={desc}",
-           "-p", f"CPUWeight={weight}", "-p", f"MemoryMax={job['mem_mib']}M",
-           "-p", f"RuntimeMaxSec={int(job['hours'] * 3600)}", "-p", "KillMode=control-group", "-p", "Nice=10",
-           "-p", 'ConditionPathExists=!$S/HALT'] + env + ["--"] + json.loads(job["argv"])
+           "-p", f"CPUWeight={unit_weight}", "-p", f"MemoryMax={job['mem_mib']}M",
+           "-p", f"RuntimeMaxSec={int(job['hours'] * 3600)}", "-p", "KillMode=control-group", "-p", f"Nice={nice}",
+           "-p", 'ConditionPathExists=!$S/HALT'] + env + ["--"] + argv
     live = {'ConditionPathExists=!$S/HALT': '"ConditionPathExists=!$S/HALT"', "__SB_PATH__": '"PATH=$P"'}
     cmd = " ".join(live.get(a) or shlex.quote(a) for a in run)
     return "\n".join([
@@ -344,9 +428,18 @@ def _launch_script(cfg, h, doc, job, gpu):
         '[ "$P" = ' + shlex.quote(SB_BIN + ":") + ' ] && P="$P/usr/local/bin:/usr/bin:/bin"',
         f"SLICE={shlex.quote(slice_text)}",
         'mkdir -p "$D"',
-        'if [ ! -e "$D/switchboard-jobs.slice" ] || [ "$(cat "$D/switchboard-jobs.slice")" != "$SLICE" ]; then',
-        '  printf %s "$SLICE" > "$D/switchboard-jobs.slice" && systemctl --user daemon-reload && echo "slice written"',
+        f"SN={shlex.quote(slice_name)}",
+        'if [ ! -e "$D/$SN" ] || [ "$(cat "$D/$SN")" != "$SLICE" ]; then',
+        '  printf %s "$SLICE" > "$D/$SN" && systemctl --user daemon-reload && echo "slice written"',
         "fi",
+    ] + ([
+        # ask fleet-priority (an optional per-host daemon that reads this folder) on this host to free the job's RAM from lower tiers for its first
+        # 20 minutes (after that the job holds what it took, and MemAvailable no longer shows the need)
+        'F="$HOME/.local/state/fleet-priority/demand"; mkdir -p "$F" && printf %s ' + shlex.quote(json.dumps({
+            "tier": "first", "ram_gib": round(job["mem_mib"] / 1024, 1), "why": f"sb job {job['name']}"}))
+        + f' | python3 -c "import json,sys,time; d=json.load(sys.stdin); d[\'until\']=time.time()+{min(int(job["hours"] * 3600), CPU_SETTLE_S)};'
+        + f' print(json.dumps(d))" > "$F/sb-{job["id"]}.json" || true',
+    ] if rank == 0 else []) + [
         # systemd-run resolves a relative command (./script.sh) against its own cwd, not --working-directory
         f"cd {shlex.quote(job['cwd'])} || {{ echo launch failed: no directory {shlex.quote(job['cwd'])}; exit 1; }}",
         f"{cmd} 2>&1 && echo launched",
@@ -356,15 +449,16 @@ def _launch_script(cfg, h, doc, job, gpu):
 
 def _launch_one(hub, cfg, job, rows, avail, hostmap, launched):
     """Place one queued job and launch it, or leave it queued with the reason."""
-    job["cpus"], job["placer"], job["board_only"] = None, None, None
+    job["cpus"], job["placer"], job["board_only"], job["ram_warn"] = None, None, None, None
     if not job["gpu_mib"] and avail["cpu_run"]:
         advice, note = placers.cpu_advise(cfg, job, hostmap)
         if advice:
             pinned = dict(job, host_pref=advice["host"])
             h, gpu, why = place(hub, cfg, pinned, rows)
             if h:
-                cap = hosts.capacity(h, json.loads(rows[h["name"]]["doc"]))
-                cpus = disjoint_cpus(hub, h["name"], cap["threads"], advice["cpus"], job["threads"])
+                hdoc = json.loads(rows[h["name"]]["doc"])
+                cap = hosts.capacity(h, hdoc)
+                cpus = disjoint_cpus(hub, h["name"], cap["threads"], advice["cpus"], job["threads"], hdoc)
                 job["cpus"], job["placer"] = json.dumps(cpus), "cpu-run"
             else:  # cpu-run and the inventory disagree: the inventory wins, without the pin
                 h, gpu, why = place(hub, cfg, job, rows)
@@ -411,7 +505,7 @@ def _launch_one(hub, cfg, job, rows, avail, hostmap, launched):
             job["placer"] = "gpu-workboard"
     doc = json.loads(rows[h["name"]]["doc"])
     _set(hub, job["id"], host=h["name"], gpu_uuid=gpu["uuid"] if gpu else None, state="running",
-         started_at=now(), last_seen=now(), reason=None, cpus=job["cpus"],
+         started_at=now(), last_seen=now(), reason=job.get("ram_warn"), cpus=job["cpus"],
          placer=job["placer"] or "hub")  # held from now so a parallel launch does not double-book
     rc, out, err = hosts.run_on(h, _launch_script(cfg, h, doc, job, gpu), timeout=60)
     props = dict(l.split("=", 1) for l in out.splitlines() if "=" in l and not l.startswith("Running as unit"))
@@ -447,7 +541,8 @@ def launch_queued(hub, cfg=None, only=None):
     avail = placers.available(cfg)
     hostmap = placers.cpu_run_hostmap(cfg)
     queue = [dict(r) for r in hub.s.q(q, (only,) if only else ())]
-    queue.sort(key=lambda r: (cuts_in(cfg, r) is None, r["created_at"]))  # cut-ins first, then oldest first
+    # priority projects in their order, then tiny jobs, then oldest first
+    queue.sort(key=lambda r: (tier(cfg, r.get("project")), cuts_in(cfg, r) is None, r["created_at"]))
     for snapshot in [r["id"] for r in queue]:
         with _launching_lock:  # the tick and sb run both land here; one job has one launcher at a time
             if snapshot in _launching:
@@ -675,7 +770,23 @@ def list_jobs(hub, include_all=False, project=None, host=None, agent=None, limit
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY (state IN ('queued','running','stopping')) DESC, created_at DESC LIMIT ?"
     args.append(limit)
-    return {"jobs": [view(dict(r)) for r in hub.s.q(q, tuple(args))]}
+    return {"jobs": _seen(hub, [view(dict(r)) for r in hub.s.q(q, tuple(args))])}
+
+
+def _seen(hub, views):
+    """Add to each running job the CPUs its processes are really on (the host's last probe), which is not always
+    where it was told to run: a command can pin itself elsewhere."""
+    docs = {}
+    for v in views:
+        if v.get("state") != "running" or not v.get("host") or not v.get("unit"):
+            continue
+        if v["host"] not in docs:
+            r = hub.s.one("SELECT doc FROM hosts WHERE name=?", (v["host"],))
+            docs[v["host"]] = json.loads(r["doc"]) if r and r["doc"] else {}
+        pin = next((p for p in docs[v["host"]].get("pins") or [] if p.get("unit") == v["unit"]), None)
+        v["cpus_seen"] = pin["cpus"] if pin else None
+        v["cpus_enforced"] = bool(docs[v["host"]].get("cpuset")) if v.get("cpus") else None
+    return views
 
 
 def show(hub, jid, log_lines=40):

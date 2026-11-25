@@ -20,14 +20,14 @@ from urllib.parse import urlparse
 
 _ID = r"[\w.-]+"
 _ROUTES = {
-    "GET": rf"""/api/overview /api/fleet /api/work /api/work/\d+ /api/inbox /api/jobs /api/jobs/[\w-]+ /api/helpers
+    "GET": rf"""/api/overview /api/whoami /api/fleet /api/work /api/work/\d+ /api/inbox /api/jobs /api/jobs/[\w-]+ /api/helpers
         /api/context /api/projects/{_ID} /api/projects/{_ID}/context /api/memory
-        /api/memory/\d+ /api/projects/{_ID}/memory /api/agents
+        /api/memory/\d+ /api/projects/{_ID}/memory /api/wiki /api/projects/{_ID}/(?:wiki|nodes) /api/agents
         /api/agents/{_ID} /api/agents/{_ID}/(?:context|chat|image|events|queue) /api/messages /api/messages/{_ID}
         /api/uploads/{_ID}""",
     "POST": rf"""/api/uploads /api/messages /api/messages/{_ID}/(?:cancel|retry) /api/work /api/fleet/probe /api/jobs
         /api/jobs/adopt /api/jobs/[\w-]+/stop /api/agents /api/dispatch /api/notifications /api/notes /api/summon
-        /api/helpers /api/decisions /api/inbox/{_ID}/done /api/reply
+        /api/helpers /api/attest /api/decisions /api/inbox/{_ID}/done /api/reply
         /api/agents/{_ID}/(?:interrupt|clear|compact|relaunch|start|stop|account)""",
     "PATCH": rf"/api/work/\d+ /api/projects/{_ID} /api/agents/{_ID}",
     "DELETE": rf"/api/work/\d+ /api/agents/{_ID}",

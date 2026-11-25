@@ -257,6 +257,29 @@ class RestartTests(unittest.TestCase):
                 hub.restart()
         ex.assert_not_called()
 
+    def test_antigravity_launch_note_and_settings(self):
+        from switchboard import antigravity, shared
+        cwd = tempfile.mkdtemp()
+        a = {"id": "gem1", "project": "alpha", "provider": "antigravity", "cwd": cwd,
+             "session_id": None, "model": "gemini-4-neon-high"}
+        note = shared.launch_note(a)
+        self.assertIn("You are agent 'gem1' on project 'alpha'", note)
+        self.assertNotIn("auto-memory", note)
+        self.assertLess(len(note), 2200)
+        with mock.patch.object(antigravity, "trust", return_value=False), \
+                mock.patch.object(antigravity, "model_arg", return_value="Gemini 4 Neon (High)"):
+            argv = terminals.launch_argv(a)
+        self.assertIn("--settings", argv)
+        cfg = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(cfg["artifactReviewPolicy"], "always-proceed")
+        self.assertFalse(cfg["showTips"])
+        self.assertNotIn("allowNonWorkspaceAccess", cfg)
+        a_sw = {**a, "project": "switchboard"}
+        with mock.patch.object(antigravity, "trust", return_value=False), \
+                mock.patch.object(antigravity, "model_arg", return_value="Gemini 4 Neon (High)"):
+            argv_sw = terminals.launch_argv(a_sw)
+        self.assertTrue(json.loads(argv_sw[argv_sw.index("--settings") + 1])["allowNonWorkspaceAccess"])
+
 
 if __name__ == "__main__":
     unittest.main()

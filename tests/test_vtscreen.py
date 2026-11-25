@@ -150,6 +150,19 @@ class TestModes(unittest.TestCase):
         s = scr("\x1b(0lqk\x1b(B lqk")
         self.assertEqual(s.lines()[0], "┌─┐ lqk")
 
+    def test_tab_forward_and_backward_csi(self):
+        # CSI I (CHT) and CSI Z (CBT), emitted by agy's renderer; missing CBT caused row drift & ghost footers
+        s = scr("01234567890123456789012345\x1b[3ZX", cols=40)
+        self.assertEqual(s.cursor, (0, 9))
+        self.assertEqual(s.lines()[0][8], "X")
+        s = scr("\x1b[2IY", cols=40)
+        self.assertEqual(s.cursor, (0, 17))
+        self.assertEqual(s.lines()[0][16], "Y")
+        # CBT at column 0 clamps cleanly and clears wrap
+        s = scr("abcdefghij\x1b[Z!", cols=10)
+        self.assertEqual(s.cursor, (0, 9))
+        self.assertEqual(s.lines()[0], "abcdefgh!j")
+
 
 class TestDim(unittest.TestCase):
     def test_dim_tracking(self):

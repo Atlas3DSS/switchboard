@@ -637,7 +637,7 @@ function vzModal(label) {
 
 function openMemFiles(pid, aid) {
   const m = vzModal('Memory files');
-  let data = null, sel = null, outlineCache = {}, editing = false, askDel = false;
+  let data = null, mem = null, vers = null, sel = null, outlineCache = {}, editing = false, askDel = false;
   const pick = (x) => { sel = x; editing = askDel = false; render(); };
   async function act(path, body, msg, keepSel) {
     try { await api('POST', path, body); toast(msg); if (!keepSel) sel = null; editing = askDel = false; outlineCache = {}; await load(); }
@@ -650,8 +650,33 @@ function openMemFiles(pid, aid) {
       : h('button', { class: 'btn ghost small', type: 'button', text: label, onclick: () => { askDel = true; editing = false; render(); } });
   }
   async function load() {
-    try { data = await api('GET', `/projects/${enc(pid)}/memfiles${aid ? '?agent=' + enc(aid) : ''}`); render(); }
-    catch (e) { m.body.replaceChildren(h('p', { class: 'pad err', text: e.message })); }
+    try {
+      [data, mem] = await Promise.all([api('GET', `/projects/${enc(pid)}/memfiles${aid ? '?agent=' + enc(aid) : ''}`), api('GET', `/projects/${enc(pid)}/memory?n=1`)]);
+      render();
+    } catch (e) { m.body.replaceChildren(h('p', { class: 'pad err', text: e.message })); }
+  }
+  /* the project's running memory (sb memory): read, correct by hand, or go back to an earlier version */
+  function memDetail() {
+    const ta = editing ? h('textarea', { class: 'mf-edit', spellcheck: 'false' }) : null;
+    if (ta) ta.value = mem.memory;
+    const put = async (body, msg) => { try { await api('POST', `/projects/${enc(pid)}/memory`, body); toast(msg); editing = false; vers = null; await load(); } catch (e) { toast(e.message, 'err'); } };
+    const tools = editing ? h('span', { class: 'rw-confirm' },
+      h('button', { class: 'btn small', type: 'button', text: 'Save', onclick: () => put({ text: ta.value }, 'project memory saved') }),
+      h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel', onclick: () => { editing = false; render(); } }))
+      : h('span', { class: 'rw-confirm' },
+        h('button', { class: 'btn ghost small', type: 'button', text: 'Edit', onclick: () => { editing = true; render(); } }),
+        h('button', { class: 'btn ghost small', type: 'button', text: vers ? 'Hide versions' : 'Earlier versions', onclick: async () => {
+          if (vers) { vers = null; render(); return; }
+          try { vers = (await api('GET', `/projects/${enc(pid)}/memory/versions`)).versions; render(); } catch (e) { toast(e.message, 'err'); } } }));
+    return h('div', { class: 'mf-detail' },
+      h('div', { class: 'mf-dh' }, h('b', { text: 'Project memory' }), h('span', { class: 'vz-pill', text: 'sb memory' }), h('span', { class: 'vz-grow' }), tools),
+      h('p', { class: 'mf-desc', text: 'Where the project stands, rewritten when a conversation ends. Every agent of the project reads it with sb memory; [#n] cites the outline of conversation n.' }),
+      h('div', { class: 'muted small', text: mem.updated_at ? `updated ${ago(mem.updated_at)} (${absTime(mem.updated_at)}) · ${mem.total} ended conversation${mem.total === 1 ? '' : 's'} on record` : 'nothing written yet' }),
+      ta || h('pre', { class: 'mf-text', text: mem.memory || '(empty)' }),
+      vers ? h('div', {}, vers.length ? vers.map((v) => h('details', { class: 'small' },
+        h('summary', {}, `version ${v.id} · replaced ${absTime(v.replaced_at || v.created_at)}${v.replaced_by ? ' by ' + v.replaced_by : ''} `,
+          h('button', { class: 'btn ghost small', type: 'button', text: 'Go back to this', onclick: (e) => { e.preventDefault(); put({ restore: v.id }, `project memory put back to version ${v.id}`); } })),
+        h('pre', { class: 'mf-text', text: v.text || '(empty)' }))) : h('p', { class: 'muted small', text: 'No earlier versions.' })) : null);
   }
   const who = (b) => b.map((x) => `${x.agent}${x.n > 1 ? ' ×' + x.n : ''}`).join(', ');
   function fileDetail(f) {
@@ -681,14 +706,25 @@ function openMemFiles(pid, aid) {
       try {
         const e = outlineCache[o.id] || (outlineCache[o.id] = await api('GET', `/memory/${o.id}`));
         const secs = (e.outline && e.outline.sections) || [];
+        const ta = editing ? h('textarea', { class: 'mf-edit', spellcheck: 'false' }) : null;
+        if (ta) ta.value = JSON.stringify({ summary: e.summary || '', outline: e.outline || { sections: [] } }, null, 1);
+        const save = () => { let v; try { v = JSON.parse(ta.value); } catch (err) { toast('Not valid JSON: ' + err.message, 'err'); return; }
+          act(`/memory/${e.id}`, { summary: v.summary, outline: v.outline }, `outline #${e.id} saved`, true); };
         box.replaceChildren(
           h('div', { class: 'mf-dh' }, h('b', { text: `Conversation #${e.id}` }), h('span', { class: 'vz-pill', text: e.state }), h('span', { class: 'vz-grow' }),
-            delBar('Delete outline', 'Delete this outline and the project-memory lines only it backs?', () => act(`/memory/${e.id}/delete`, {}, `outline #${e.id} deleted`))),
+            editing ? h('span', { class: 'rw-confirm' }, h('button', { class: 'btn small', type: 'button', text: 'Save', onclick: save }),
+              h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel', onclick: () => { editing = false; render(); } }))
+              : h('span', { class: 'rw-confirm' },
+                askDel ? null : h('button', { class: 'btn ghost small', type: 'button', text: 'Edit', onclick: () => { editing = true; render(); } }),
+                askDel || !e.transcript_on_disk ? null : h('button', { class: 'btn ghost small', type: 'button', text: 'Transcript', title: 'Every entry of this conversation; edit any of them',
+                  onclick: () => openRewind(e.agent, { session: e.session_id }) }),
+                delBar('Delete outline', 'Delete this outline and the project-memory lines only it backs?', () => act(`/memory/${e.id}/delete`, {}, `outline #${e.id} deleted`)))),
           h('div', { class: 'muted small', text: `${e.agent} · ${e.model || ''} · ${absTime(e.created_at)} · ${e.why || ''}` }),
+          ...(ta ? [h('small', { class: 'muted', text: 'The summary and the sections of points; m lists the message numbers a point cites.' }), ta] : [
           e.summary ? h('p', { class: 'mf-desc', text: e.summary }) : null,
           secs.length ? h('div', { class: 'mf-outline' }, secs.map((s) => h('div', {}, h('h4', { text: s.h }),
             h('ul', {}, s.points.map((p) => h('li', { text: `${p.t}  [${p.m.join(', ')}]` })))))) : h('p', { class: 'muted', text: e.note || 'No points yet.' }),
-          h('div', { class: 'muted small', text: `sb memory ${e.id} · sb memory ${e.id} --at <m> for the messages` }));
+          h('div', { class: 'muted small', text: `sb memory ${e.id} · sb memory ${e.id} --at <m> for the messages` })]).filter(Boolean));
       } catch (err) { box.replaceChildren(h('p', { class: 'err', text: err.message })); }
     })();
     return box;
@@ -701,10 +737,12 @@ function openMemFiles(pid, aid) {
       h('button', { class: 'vz-sb', type: 'button', 'aria-pressed': String((a.id || null) === (aid || null)), text: a.id ? a.id + (a.gone ? ' (removed)' : '') : a.title,
         onclick: () => { aid = a.id; sel = null; load(); } })));
     m.tools.replaceChildren(segs);
-    if (!sel) sel = d.files[0] ? { kind: 'f', i: 0 } : d.outlines[0] ? { kind: 'o', i: 0 } : null;
+    if (!sel) sel = aid ? (d.files[0] ? { kind: 'f', i: 0 } : d.outlines[0] ? { kind: 'o', i: 0 } : null) : { kind: 'm', i: 0 };
     const row = (kind, i, main, small, extra) => h('button', { class: 'mf-row', type: 'button', 'aria-pressed': String(!!sel && sel.kind === kind && sel.i === i),
       onclick: () => pick({ kind, i }) }, h('span', { class: 'mf-main', text: main }), extra || null, h('small', { class: 'muted', text: small }));
     const list = h('div', { class: 'mf-list' },
+      aid ? null : h('h3', { text: 'Project memory' }),
+      aid ? null : row('m', 0, 'Running memory (sb memory)', mem.updated_at ? `updated ${ago(mem.updated_at)} · ${mem.memory.length} characters` : 'nothing written yet'),
       h('h3', { text: 'Auto-memory files' }),
       d.files.length ? d.files.map((f, i) => row('f', i, f.name, [f.front.description, f.by.length ? 'by ' + who(f.by) : '', f.mtime ? ago(f.mtime * 1000) : 'deleted'].filter(Boolean).join(' · '),
         f.exists ? null : h('span', { class: 'vz-pill mf-gone', text: 'deleted' })))
@@ -714,7 +752,7 @@ function openMemFiles(pid, aid) {
       d.outlines.length ? d.outlines.map((o, i) => row('o', i, `#${o.id} · ${o.agent}`, `${(o.created_at || '').slice(0, 16).replace('T', ' ')} · ${o.state}${o.summary ? ' · ' + o.summary : ''}`))
         : h('p', { class: 'muted small', text: 'No ended conversations on record.' }));
     const detail = !sel ? h('p', { class: 'muted', text: 'Nothing to show.' })
-      : sel.kind === 'f' ? fileDetail(d.files[sel.i]) : null;
+      : sel.kind === 'm' ? memDetail() : sel.kind === 'f' ? fileDetail(d.files[sel.i]) : null;
     const pane = h('div', { class: 'mf-pane' }, detail);
     if (sel && sel.kind === 'o') outlineDetail(d.outlines[sel.i]).then((x) => pane.replaceChildren(x));
     m.body.replaceChildren(h('div', { class: 'mf-grid' }, list, pane));
@@ -722,14 +760,26 @@ function openMemFiles(pid, aid) {
   load();
 }
 
-/* ---------- rewind an agent to just before one of its messages, as if the rest never happened (owner only) ---------- */
-function openRewind(aid) {
-  const m = vzModal('Rewind agent');
+/* ---------- an agent's transcript (owner only): rewind it to just before one of its messages, as if the rest never
+   happened, or edit any entry of it. `openAt`: {session} opens on that conversation with every entry listed. ---------- */
+function openRewind(aid, openAt) {
+  const m = vzModal('Transcript');
   let data = null, armed = null, busyAsk = false, keepCopy = false;
+  let showAll = !!openAt, ed = null;
+  const all = {};  // session -> {entries, before} (every entry: asks, replies, tool calls)
   async function load() {
-    try { data = await api('GET', `/agents/${enc(aid)}/moments`); render(); }
+    try { data = await api('GET', `/agents/${enc(aid)}/moments`); render(); if (showAll) loadAll(); }
     catch (e) { m.body.replaceChildren(h('p', { class: 'pad err', text: e.message })); }
   }
+  async function more(sid, fresh) {
+    const have = fresh ? null : all[sid];
+    try {
+      const r = await api('GET', `/agents/${enc(aid)}/records?session=${enc(sid)}&limit=80${have && have.before != null ? '&before=' + have.before : ''}`);
+      all[sid] = { entries: r.entries.concat(have ? have.entries : []), before: r.before };
+    } catch (e) { all[sid] = { entries: [], before: null, err: e.message }; }
+    if (m.live()) render();
+  }
+  function loadAll() { for (const s of data.sessions) if (!all[s.session] && (!openAt || openAt.session === s.session || s.current)) more(s.session, true); }
   async function go(sess, mo, confirm) {
     try {
       const r = await api('POST', `/agents/${enc(aid)}/rewind`, { session: sess.session, offset: mo.offset, confirm: !!confirm, keep_copy: keepCopy });
@@ -740,38 +790,116 @@ function openRewind(aid) {
       toast(e.message, 'err');
     }
   }
+  async function startEdit(sid, at) {
+    ed = { s: sid, at, rec: null, vals: [], raw: false, rawVal: '', ask: false };
+    armed = null; render();
+    try {
+      const rec = await api('GET', `/agents/${enc(aid)}/record?session=${enc(sid)}&at=${at}`);
+      if (!ed || ed.s !== sid || ed.at !== at) return;
+      ed.rec = rec; ed.vals = rec.parts.map((p) => p.text); ed.rawVal = rec.raw || ''; ed.raw = !rec.parts.length;
+    } catch (e) { toast(e.message, 'err'); ed = null; }
+    if (m.live()) render();
+  }
+  async function saveEdit(confirm) {
+    const body = { session: ed.s, at: ed.at, sig: ed.rec.sig, confirm: !!confirm };
+    if (ed.raw) body.raw = ed.rawVal;
+    else {
+      body.parts = {};
+      ed.rec.parts.forEach((p, i) => { if (ed.vals[i] !== p.text) body.parts[i] = ed.vals[i]; });
+      if (!Object.keys(body.parts).length) { toast('Nothing changed'); return; }
+    }
+    try {
+      const r = await api('POST', `/agents/${enc(aid)}/edit`, body);
+      if (r.relaunch) { toast('Editing: the CLI exits, the entry is changed, and the agent resumes with it in place'); m.done(); return; }
+      toast('Edited');
+      const sid = ed.s; ed = null;
+      await load(); if (all[sid]) more(sid, true);
+    } catch (e) {
+      if (e.status === 409 && e.data && e.data.needs_confirm) { ed.ask = true; render(); return; }
+      toast(e.message, 'err');
+    }
+  }
+  function editor() {
+    if (!ed.rec) return h('div', { class: 'rw-ed' }, h('p', { class: 'muted small', text: 'Reading the record…' }));
+    const area = (val, set, cls) => { const t = h('textarea', { class: 'mf-edit ' + cls, spellcheck: 'false' }); t.value = val; t.oninput = () => set(t.value); return t; };
+    const rawBox = h('input', { type: 'checkbox' });
+    rawBox.checked = ed.raw; rawBox.disabled = !ed.rec.parts.length;
+    rawBox.onchange = () => { ed.raw = rawBox.checked; render(); };
+    return h('div', { class: 'rw-ed' },
+      ed.raw ? [h('small', { class: 'muted', text: 'The whole record, as JSON. Keep ids and the tool call / tool output pairing intact, or the CLI may refuse to resume.' }),
+        area(ed.rawVal, (v) => { ed.rawVal = v; }, 'rw-ta-raw')]
+        : ed.rec.parts.length ? ed.rec.parts.map((p, i) => h('label', { class: 'rw-part' }, h('small', { class: 'muted', text: p.label }), area(ed.vals[i], (v) => { ed.vals[i] = v; }, 'rw-ta')))
+          : h('p', { class: 'muted small', text: 'This record holds no text to edit.' }),
+      h('div', { class: 'rw-confirm' },
+        ed.rec.raw != null ? h('label', { class: 'small rw-keep' }, rawBox, ' Whole record (raw JSON)') : null,
+        h('span', { class: 'vz-grow' }),
+        ed.ask ? h('small', { text: 'The agent is working. Interrupt it and save the edit?' }) :
+          h('small', { class: 'muted', text: 'If the agent is on this conversation, its CLI exits and resumes with the edit.' }),
+        h('button', { class: 'btn small' + (ed.ask ? ' rw-go' : ''), type: 'button', text: ed.ask ? 'Interrupt and save' : 'Save', onclick: () => saveEdit(ed.ask) }),
+        h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel', onclick: () => { ed = null; render(); } })));
+  }
   function render() {
     const d = data;
-    if (d.unsupported) { m.body.replaceChildren(h('p', { class: 'muted pad', text: d.unsupported })); return; }
-    setText(m.title, `Rewind · ${d.agent.title}`);
-    setText(m.sub, `${projName(d.agent.project)} · pick the moment just before one of its messages`);
-    const warn = h('p', { class: 'rw-warn', text: 'Rewinding erases everything after that moment as if it never happened: the rest of the conversation, any later sessions, ' +
-      'Claude\'s own session state for them, and Switchboard\'s record of it (chat, messages, notes, pages, questions, outlines and the memory lines they alone back). ' +
-      'Only real work stays: files on disk, jobs and the work queue. A working agent is interrupted.' });
+    const keepScroll = m.body.scrollTop;
+    setText(m.title, `Transcript · ${d.agent.title}`);
+    setText(m.sub, `${projName(d.agent.project)} · ${d.rewind ? 'rewind to just before a message, or edit any entry' : 'edit any entry'}`);
+    const cli = KIND_NAME[d.agent.provider] || d.agent.provider;
+    const warn = d.rewind ? h('p', { class: 'rw-warn', text: 'Rewinding erases everything after that moment as if it never happened: the rest of the conversation, any later sessions, ' +
+      `${cli}'s own session state for them, and Switchboard's record of it (chat, messages, notes, pages, questions, outlines and the memory lines they alone back). ` +
+      'Only real work stays: files on disk, jobs and the work queue. A working agent is interrupted.' })
+      : h('p', { class: 'muted small', text: `Rewind works on Claude and Antigravity agents. ${d.edit ? 'Entries of this transcript can be edited.' : 'This transcript cannot be edited here yet.'}` });
     const box = h('input', { type: 'checkbox' });
     box.checked = keepCopy;
     box.onchange = () => { keepCopy = box.checked; };
-    const keep = h('label', { class: 'small rw-keep' }, box, ' Keep a private copy of the transcript first (off: nothing is kept)');
+    const keep = d.rewind ? h('label', { class: 'small rw-keep' }, box, ' Keep a private copy of the transcript before a rewind (off: nothing is kept)') : null;
+    const view = h('div', { class: 'vz-segs' }, [[false, 'Your messages'], [true, 'Every entry']].map(([v, t]) =>
+      h('button', { class: 'vz-sb', type: 'button', 'aria-pressed': String(showAll === v), text: t, onclick: () => { showAll = v; ed = null; armed = null; render(); if (v) loadAll(); } })));
+    m.tools.replaceChildren(d.rewind && d.edit ? view : '');
+    const everything = showAll || !d.rewind;
+    const editBtn = (sid, at) => d.edit ? h('button', { class: 'btn ghost small', type: 'button', text: 'Edit', onclick: () => startEdit(sid, at) }) : null;
+    const editing = (sid, at) => ed && ed.s === sid && ed.at === at;
+    const momentRow = (s, mo) => {
+      const on = armed && armed.s === s.session && armed.o === mo.offset;
+      return [h('div', { class: 'rw-row' + (on ? ' rw-on' : '') },
+        h('span', { class: 'rw-t', text: absTime(mo.ts), title: ago(mo.ts) }),
+        h('span', { class: 'rw-text', text: mo.text }),
+        on ? h('span', { class: 'rw-confirm' },
+          h('small', { text: busyAsk ? 'The agent is working. Interrupt it and rewind?' :
+            `Cut this and ${mo.later} later message${mo.later === 1 ? '' : 's'} (${fmtN(mo.cut_bytes)} bytes)${s.current ? '' : '; the agent moves back to this session'}?` }),
+          h('button', { class: 'btn small rw-go', type: 'button', text: busyAsk ? 'Interrupt and rewind' : 'Rewind here', onclick: () => go(s, mo, busyAsk) }),
+          h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel', onclick: () => { armed = null; busyAsk = false; render(); } }))
+          : h('span', { class: 'rw-confirm' }, editing(s.session, mo.offset) ? null : editBtn(s.session, mo.offset),
+            h('button', { class: 'btn ghost small', type: 'button', text: 'Rewind to before this', onclick: () => { armed = { s: s.session, o: mo.offset }; busyAsk = false; ed = null; render(); } }))),
+      editing(s.session, mo.offset) ? editor() : null];
+    };
+    const entryRows = (s) => {
+      const a = all[s.session];
+      if (!a) return [h('p', { class: 'muted small' }, h('button', { class: 'btn ghost small', type: 'button', text: 'Show every entry of this conversation', onclick: () => more(s.session, true) }))];
+      if (a.err) return [h('p', { class: 'err small', text: a.err })];
+      const rows = [], seen = new Set();
+      for (let i = a.entries.length - 1; i >= 0; i--) {  // newest first, as the messages are
+        const e = a.entries[i], first = !seen.has(e.at);
+        seen.add(e.at);
+        rows.push(h('div', { class: 'rw-row rw-e-' + e.role },
+          h('span', { class: 'rw-t' }, h('b', { class: 'rw-role', text: e.role === 'user' ? 'you' : e.role === 'assistant' ? 'agent' : e.role }), ' ', absTime(e.ts)),
+          h('span', { class: 'rw-text', text: e.text.slice(0, 600) }),
+          h('span', { class: 'rw-confirm' }, editing(s.session, e.at) ? null : editBtn(s.session, e.at))));
+        if (first && editing(s.session, e.at)) rows.push(editor());
+      }
+      if (!rows.length) rows.push(h('p', { class: 'muted small', text: 'Nothing shown in this conversation.' }));
+      if (a.before != null) rows.push(h('p', {}, h('button', { class: 'btn ghost small', type: 'button', text: 'Load older entries', onclick: () => more(s.session) })));
+      return rows;
+    };
     const secs = d.sessions.map((s) => h('div', { class: 'rw-sess' },
       h('h3', {}, `Session ${s.session.slice(0, 8)}`, s.current ? h('span', { class: 'vz-pill', text: 'current' }) : h('span', { class: 'vz-pill', text: 'earlier (cleared)' }),
-        h('small', { class: 'muted', text: ` · ${s.moments.length} messages · ${fmtN(s.size)} bytes · last written ${ago(s.mtime * 1000)}` })),
-      s.moments.map((mo) => {
-        const on = armed && armed.s === s.session && armed.o === mo.offset;
-        return h('div', { class: 'rw-row' + (on ? ' rw-on' : '') },
-          h('span', { class: 'rw-t', text: absTime(mo.ts), title: ago(mo.ts) }),
-          h('span', { class: 'rw-text', text: mo.text }),
-          on ? h('span', { class: 'rw-confirm' },
-            h('small', { text: busyAsk ? 'The agent is working. Interrupt it and rewind?' :
-              `Cut this and ${mo.later} later message${mo.later === 1 ? '' : 's'} (${fmtN(mo.cut_bytes)} bytes)${s.current ? '' : '; the agent moves back to this session'}?` }),
-            h('button', { class: 'btn small rw-go', type: 'button', text: busyAsk ? 'Interrupt and rewind' : 'Rewind here', onclick: () => go(s, mo, busyAsk) }),
-            h('button', { class: 'btn ghost small', type: 'button', text: 'Cancel', onclick: () => { armed = null; busyAsk = false; render(); } }))
-            : h('button', { class: 'btn ghost small', type: 'button', text: 'Rewind to before this', onclick: () => { armed = { s: s.session, o: mo.offset }; busyAsk = false; render(); } }));
-      })));
-    m.body.replaceChildren(warn, keep, ...(secs.length ? secs : [h('p', { class: 'muted', text: 'No conversation on disk to rewind.' })]),
+        h('small', { class: 'muted', text: ` · ${d.rewind ? s.moments.length + ' messages · ' : ''}${fmtN(s.size)} bytes · last written ${ago(s.mtime * 1000)}` })),
+      everything ? entryRows(s) : s.moments.map((mo) => momentRow(s, mo))));
+    m.body.replaceChildren(...[warn, keep, ...(secs.length ? secs : [h('p', { class: 'muted', text: 'No conversation on disk.' })]),
       d.backups.length ? h('details', { class: 'muted small' }, h('summary', { text: `${d.backups.length} earlier copies kept before rewinds` }),
         h('pre', { class: 'mf-path', text: d.backups.join('\n') }),
         h('button', { class: 'btn ghost small', type: 'button', text: 'Delete these copies', onclick: async () => {
-          try { await api('POST', `/agents/${enc(aid)}/rewind/copies/delete`, {}); toast('copies deleted'); load(); } catch (e) { toast(e.message, 'err'); } } })) : null);
+          try { await api('POST', `/agents/${enc(aid)}/rewind/copies/delete`, {}); toast('copies deleted'); load(); } catch (e) { toast(e.message, 'err'); } } })) : null].filter(Boolean));
+    m.body.scrollTop = keepScroll;
   }
   load();
 }

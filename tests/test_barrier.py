@@ -141,6 +141,25 @@ class Barrier(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/agents/rat/context", agent="chem")[0], 409)  # everyone else stays closed
         self.assertEqual(self.call("POST", "/api/messages", {"to": "rat", "body": "x"}, agent="chem")[0], 409)
 
+    def test_outside_read_opens_wiki_nodes_memory_and_project_list(self):
+        # Isolated project stays closed on another project's wiki, nodes, memory, and overview project list
+        self.assertEqual(self.call("GET", "/api/projects/rats/wiki", agent="chem")[0], 409)
+        self.assertEqual(self.call("GET", "/api/projects/rats/nodes", agent="chem")[0], 409)
+        self.assertEqual(self.call("GET", "/api/projects/rats/memory", agent="chem")[0], 409)
+        self.assertEqual([p["id"] for p in self.call("GET", "/api/overview", agent="chem")[1]["projects"]], ["labwork"])
+        self.assertEqual([p["project"] for p in self.call("GET", "/api/wiki", agent="chem")[1]["projects"]], ["labwork"])
+        # Own project's wiki and nodes work even when isolated
+        self.assertEqual(self.call("GET", "/api/projects/labwork/wiki", agent="chem")[0], 200)
+        self.assertEqual(self.call("GET", "/api/projects/labwork/nodes", agent="chem")[0], 200)
+        # With outside_read=True, cross-project wiki, nodes, memory, and project listing open cleanly
+        self.h.s.set_outside("labwork", read=True)
+        self.addCleanup(lambda: self.h.s.set_outside("labwork", read=False))
+        self.assertEqual(self.call("GET", "/api/projects/rats/wiki", agent="chem")[0], 200)
+        self.assertEqual(self.call("GET", "/api/projects/rats/nodes", agent="chem")[0], 200)
+        self.assertEqual(self.call("GET", "/api/projects/rats/memory", agent="chem")[0], 200)
+        self.assertIn("rats", {p["id"] for p in self.call("GET", "/api/overview", agent="chem")[1]["projects"]})
+        self.assertIn("rats", {p["project"] for p in self.call("GET", "/api/wiki", agent="chem")[1]["projects"]})
+
     def test_sb_halt_refused_in_plain_words(self):
         out = self.shell(f'{sys.executable} {ROOT}/bin/sb halt', env={"SB_AGENT": "chem"})
         self.assertIn("only the owner", out)

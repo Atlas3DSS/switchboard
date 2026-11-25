@@ -139,7 +139,7 @@ def _codex_line(line, out):
 
 def transcript_files():
     """[(provider, path)] for every main-thread transcript on disk."""
-    out = [("claude", p) for root in [discovery.CLAUDE_PROJECTS] + discovery.EXTRA_PROJECTS
+    out = [("claude", p) for root in [discovery.CLAUDE_PROJECTS] + discovery.endpoint_projects() + discovery.EXTRA_PROJECTS
            for p in glob.glob(os.path.join(root, "*", "*.jsonl"))]
     out += [("codex", p) for p in glob.glob(os.path.join(discovery.CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))]
     out += [("api", p) for p in glob.glob(os.path.join(discovery.API_SESSIONS, "*", "*.jsonl"))]

@@ -11,6 +11,8 @@ Accounts in `reserve` (none by default; your last-resort account) come last in t
 when no other account has room. A reading older than accounts.STALE_S is not trusted, except for a reserve
 account: nobody spends on it while it idles (and its token lapses, so `plan` cannot re-read it), so its last reading
 with the windows' resets applied is the truth; the move itself wakes the token and the readings.
+Accounts in `parked` are never picked automatically (handoff, seats, memory calls); the owner can still put an
+agent on one by hand.
 """
 import os
 import time
@@ -19,7 +21,7 @@ from . import accounts, discovery, transcript
 from .store import epoch
 from .terminals import is_fable
 
-DEFAULTS = {"enabled": True, "at": 95, "reserve": []}
+DEFAULTS = {"enabled": True, "at": 95, "reserve": [], "parked": []}
 COOLDOWN_S = 120  # an agent that just moved is left alone for this long
 CONTINUE = ("[Switchboard: account {old} ran out ({why}) in the middle of your last step, so this same conversation "
             "now runs on account {new}. Nothing was lost. Pick up exactly where you stopped and carry on with the "
@@ -34,7 +36,7 @@ def settings(store):
 
 def used(acct, model):
     """Highest % used among the limits that apply to this model on one account (from accounts.usage())."""
-    return max((l["used"] for l in (acct or {}).get("limits") or [] if l["key"] != "fable" or is_fable(model)),
+    return max((l["used"] or 0 for l in (acct or {}).get("limits") or [] if l["key"] != "fable" or is_fable(model)),
                default=0)
 
 
@@ -48,7 +50,7 @@ def best_account(store, agent, use, cfg):
     room, last = [], []
     for a in discovery.accounts():
         n = a["name"]
-        if a["kind"] != agent["provider"] or n == agent["account"]:
+        if a["kind"] != agent["provider"] or n == agent["account"] or n in cfg.get("parked", ()):
             continue
         u, res = use.get(n), n in cfg["reserve"]
         if trusted(u, res) and used(u, agent.get("model")) < cfg["at"]:

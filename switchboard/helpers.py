@@ -29,23 +29,41 @@ def rank(model):
     return next((r for name, r in RANK.items() if name in m), None)
 
 
+# Sizes of the other CLIs' models, by a word in the model's name: 1 is the small one a helper runs on. Only what is
+# known is listed; a model with no word here is refused rather than guessed.
+SIZES = {"claude": RANK,
+         "codex": {"terra": 1, "astra": 3},
+         "antigravity": {"flash": 1, "argon": 3, "carbon": 3, "neon": 3, "hydrogen": 3, "orchestrator": 3}}
+SMALL = {"codex": "gpt-6.1-terra", "antigravity": "gemini-3.8-flash-medium"}  # the helper model of each other CLI
+
+
+def size(provider, model):
+    m = (model or "").lower()
+    return next((r for name, r in (SIZES.get(provider) or {}).items() if name in m), None)
+
+
 def smaller_model(parent, asked=None):
     """A strictly smaller model of the parent's own CLI: the one asked for, if it is ranked below the parent's, else
-    the next size down. Unranked models and other CLIs are refused rather than guessed."""
-    if parent["provider"] != "claude":
-        raise ValueError(f"helpers need a known smaller model; {parent['provider']} sizes are not ranked here")
-    mine = rank(parent.get("model"))
+    the next size down. Unranked models and CLIs with no known sizes are refused rather than guessed."""
+    prov = parent["provider"]
+    if prov not in SIZES:
+        raise ValueError(f"helpers need a known smaller model; {prov} sizes are not ranked here")
+    mine = size(prov, parent.get("model"))
     if mine is None:
         raise ValueError(f"the parent's model ({parent.get('model') or 'default'}) has no known size; set it first")
     if asked:
-        r = rank(asked)
+        r = size(prov, asked)
         if r is None:
-            raise ValueError(f"{asked} is not a known Claude size (haiku, sonnet, opus)")
+            raise ValueError(f"{asked} is not a known {prov.capitalize()} size ({', '.join(SIZES[prov])})"
+                             if prov != "claude" else f"{asked} is not a known Claude size (haiku, sonnet, opus)")
         if r >= mine:
             raise PermissionError(f"a helper must be smaller than its parent ({parent.get('model') or 'default'})")
         return asked
-    if mine <= RANK["haiku"]:
-        raise ValueError("a Haiku agent has no smaller Claude model; do the task yourself")
+    if mine <= 1:
+        raise ValueError("a Haiku agent has no smaller Claude model; do the task yourself" if prov == "claude" else
+                         f"{parent.get('model')} is already the small {prov} model; do the task yourself")
+    if prov != "claude":
+        return SMALL[prov]
     return "claude-haiku-5-5" if mine == RANK["sonnet"] else "claude-sonnet-5-5"
 
 

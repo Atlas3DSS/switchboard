@@ -321,7 +321,7 @@ class Screen:
         elif c == "\x08":
             self.x, self.wrap = max(0, self.x - 1), False
         elif c == "\t":
-            self.x = min(self.cols - 1, (self.x // 8 + 1) * 8)
+            self.x, self.wrap = min(self.cols - 1, (self.x // 8 + 1) * 8), False
         elif c in "\x18\x1a":
             self._state = GROUND
         elif c == "\x9b":
@@ -409,7 +409,7 @@ class Screen:
             return (args[k] if k < len(args) else 0) or d
 
         cols, rows, y = self.cols, self.rows, self.y
-        if f in "ABCDEFGHf`d":
+        if f in "ABCDEFGHIZf`d":
             self.wrap = False
             if f == "A" or f == "F":
                 self.y = max(self.top if y >= self.top else 0, y - a())
@@ -421,6 +421,12 @@ class Screen:
                 self.x = max(0, self.x - a())
             elif f in "G`":
                 self.x = min(cols - 1, a() - 1)
+            elif f == "I":
+                for _ in range(a()):
+                    self.x = min(cols - 1, (self.x // 8 + 1) * 8)
+            elif f == "Z":
+                for _ in range(a()):
+                    self.x = max(0, ((self.x - 1) // 8) * 8)
             elif f in "Hf":
                 self.y, self.x = min(rows - 1, a(0) - 1), min(cols - 1, a(1) - 1)
             elif f == "d":

@@ -3,11 +3,14 @@
   memory files   the auto-memory files in a project's memory folders, and which agent wrote or edited each one
                  (read from the agents' transcripts: Write/Edit/MultiEdit calls on a memory folder), plus the
                  Switchboard outlines of the project's conversations; the owner edits or deletes them in the app
-  rewind         put a Claude agent back to the moment just before one of its messages, as if nothing after it
+  rewind         put a Claude or Antigravity agent back to the moment just before one of its messages, as if nothing after it
                  happened (erase()): the CLI exits, the transcript is cut, later sessions and Claude's state for
                  them go, and so does the hub's record of that part. The same session resumes from there. It can go
                  back into an earlier session (one an auto-clear or a /clear left behind). Only real work stays:
                  files on disk, jobs, the work queue. A private copy is kept only when the owner ticks it.
+                 Antigravity resumes from its own database of steps, not the transcript log: antigravity.cut().
+  edit           change any entry of a transcript (records(), record(), edit()): the texts of a record, or for a
+                 jsonl transcript (Claude, Codex) the whole record. The CLI exits first and resumes with it in place.
 """
 import json
 import os
@@ -16,7 +19,7 @@ import shutil
 import threading
 import time
 
-from . import discovery, memory, transcript
+from . import antigravity, discovery, memory, transcript
 from .store import STATE, epoch, iso_from_epoch, now
 from .terminals import NeedsConfirm, memory_dir
 
@@ -24,6 +27,8 @@ REWINDS = os.path.join(STATE, "rewinds")
 TEXT_CAP = 400
 FILE_CAP = 200_000
 WRITERS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+REWINDABLE = ("claude", "antigravity")
+EDITABLE = ("claude", "codex", "antigravity")  # Hermes keeps its sessions in its own database: not yet
 _SID = re.compile(r"session ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 
 
@@ -50,7 +55,11 @@ def _lines(path):
             off += len(line)
 
 
-def _moments_of(path):
+def _moments_of(path, provider="claude"):
+    """[{"offset", "ts", "text", "byte"}] of the owner's messages, oldest first. `offset` names the moment: the byte
+    where the message starts (Claude) or its step (Antigravity); `byte` is where it starts in the transcript file."""
+    if provider == "antigravity":
+        return [{**m, "text": m["text"][:TEXT_CAP]} for m in antigravity.moments(path)]
     out = []
     for off, line in _lines(path):
         if b'"type":"user"' not in line and b'"type": "user"' not in line:
@@ -63,32 +72,78 @@ def _moments_of(path):
             continue
         got = transcript._claude_entries(e)
         if got and got[0][0] == "user":
-            out.append({"offset": off, "ts": e.get("timestamp"), "text": got[0][1][:TEXT_CAP]})
+            out.append({"offset": off, "byte": off, "ts": e.get("timestamp"), "text": got[0][1][:TEXT_CAP]})
     return out
 
 
+def _path(a, sid):
+    return discovery.transcript_path(a["provider"], sid, a.get("account"))
+
+
+def _agy_home(a):
+    return next((x["config_dir"] for x in discovery.accounts()
+                 if x["name"] == a.get("account") and x["kind"] == "antigravity"), None)
+
+
 def moments(hub, aid):
+    """An agent's conversations, current first, and in each the owner's messages it can be rewound to. Every agent
+    with a transcript is listed (its entries can be edited: records()); rewinding needs REWINDS."""
     a = hub.s.agent(aid)
     if not a:
         raise LookupError(aid)
-    if a["provider"] != "claude":
-        return {"unsupported": "rewind works on Claude agents"}
+    can = a["provider"] in REWINDABLE
     out = []
     for sid in sessions(hub, a):
-        path = discovery.transcript_path("claude", sid, a.get("account"))
+        path = _path(a, sid)
         if not path or not os.path.exists(path):
             continue
-        ms = _moments_of(path)
+        ms = _moments_of(path, a["provider"]) if can else []
         size = os.path.getsize(path)
         for i, m in enumerate(ms):
             m["later"] = len(ms) - i - 1  # owner messages cut with it
-            m["cut_bytes"] = size - m["offset"]
+            m["cut_bytes"] = size - m.pop("byte")
         out.append({"session": sid, "current": sid == a.get("session_id"), "size": size,
                     "mtime": os.path.getmtime(path), "moments": ms[::-1]})
     backups = sorted(os.listdir(os.path.join(REWINDS, aid)), reverse=True) if os.path.isdir(
         os.path.join(REWINDS, aid)) else []
-    return {"agent": {"id": aid, "title": a.get("title") or aid, "project": a["project"], "mode": a["mode"]},
+    return {"agent": {"id": aid, "title": a.get("title") or aid, "project": a["project"], "mode": a["mode"],
+                      "provider": a["provider"]},
+            "rewind": can, "edit": a["provider"] in EDITABLE,
             "sessions": out, "backups": [os.path.join(REWINDS, aid, b) for b in backups[:20]]}
+
+
+def _cli_down(hub, a, what, work, confirm):
+    """Run work() with the agent's CLI down: it holds the conversation in memory and would write it back. A running
+    terminal agent exits first and resumes the same conversation after; a busy one needs the owner's confirm.
+    Returns True when the CLI is being relaunched (work() then runs on a thread)."""
+    aid, t = a["id"], hub.t
+    running = a["mode"] == "terminal" and t.running(aid)
+    if running and t.busy(aid) and not confirm:
+        raise NeedsConfirm(f"the agent is working (or has unsent text or background jobs, which this ends); "
+                           f"interrupt it and {what}?")
+    if not running:
+        work()
+        return False
+    t.switching[aid] = {"to": what, "note": f"exiting the CLI to {what}"}
+
+    def run():
+        try:
+            if not t.exit_cli(aid, interrupt=True):
+                t.switching[aid]["note"] = f"the CLI did not exit; {what} abandoned"
+                hub.s.event(aid, "error", f"{what} abandoned: the CLI did not exit; nothing was changed")
+                time.sleep(10)
+                return
+            work()
+            t.switching[aid]["note"] = "relaunching"
+            time.sleep(0.5)
+            t.launch(hub.s.agent(aid), during_switch=True)
+        except Exception as e:
+            hub.s.event(aid, "error", f"{what} failed: {e}")
+        finally:
+            t.switching.pop(aid, None)
+
+    threading.Thread(target=run, daemon=True).start()
+    return True
 
 
 def rewind(hub, aid, b):
@@ -96,28 +151,23 @@ def rewind(hub, aid, b):
     a = hub.s.agent(aid)
     if not a:
         raise LookupError(aid)
-    if a["provider"] != "claude":
-        raise ValueError("rewind works on Claude agents")
+    if a["provider"] not in REWINDABLE:
+        raise ValueError("rewind works on Claude and Antigravity agents")
     if a["mode"] not in ("terminal", "managed"):
         raise ValueError("this agent runs in a tmux pane the switchboard does not own; adopt it first")
     sid, off = b.get("session") or a.get("session_id"), int(b.get("offset", -1))
     if sid not in sessions(hub, a):
         raise ValueError(f"session {sid} is not one of {aid}'s")
-    path = discovery.transcript_path("claude", sid, a.get("account"))
+    path = _path(a, sid)
     if not path or not os.path.exists(path):
         raise LookupError(f"the transcript of session {sid}")
-    hit = next((m for m in _moments_of(path) if m["offset"] == off), None)
+    hit = next((m for m in _moments_of(path, a["provider"]) if m["offset"] == off), None)
     if not hit:
         raise ValueError("that moment is not the start of one of the agent's messages (the transcript changed?)")
-    t = hub.t
-    running = a["mode"] == "terminal" and t.running(aid)
-    if running and t.busy(aid) and not b.get("confirm"):
-        raise NeedsConfirm("the agent is working (or has unsent text or background jobs, which a rewind ends); "
-                           "interrupt it and rewind?")
-
     order = sessions(hub, a)
     later = [x for x in order[:order.index(sid)]  # sessions the agent moved on to after this one
              if not hub.s.one("SELECT 1 n FROM agents WHERE session_id=? AND id<>?", (x, aid))]
+    kept = []
 
     def cut():
         keep = None
@@ -126,34 +176,17 @@ def rewind(hub, aid, b):
             keep = os.path.join(REWINDS, aid, f"{time.strftime('%Y%m%d-%H%M%S')}-{sid}.jsonl")
             shutil.copy2(path, keep)
             os.chmod(keep, 0o600)
-        erase(hub, a, sid, path, off, hit["ts"], later)
+            if a["provider"] == "antigravity":  # what it resumes from, beside the readable log
+                db = antigravity.db_for(sid, _agy_home(a))
+                if os.path.exists(db):
+                    shutil.copy2(db, keep[:-6] + ".db")
+                    os.chmod(keep[:-6] + ".db", 0o600)
+        erase(hub, a, sid, path, off, hit["ts"], later, hit["byte"])
         hub.s.event(aid, "system", f"rewound by the owner to {hit['ts']}" + (f"; a copy is at {keep}" if keep else ""))
-        return keep
+        kept.append(keep)
 
-    if not running:
-        keep = cut()
-        return {"ok": True, "backup": keep, "message": hit["text"], "relaunch": False}
-
-    t.switching[aid] = {"to": "rewind", "note": "exiting the CLI to rewind"}
-
-    def run():
-        try:
-            if not t.exit_cli(aid, interrupt=True):
-                t.switching[aid]["note"] = "the CLI did not exit; rewind abandoned"
-                hub.s.event(aid, "error", "rewind abandoned: the CLI did not exit; nothing was cut")
-                time.sleep(10)
-                return
-            cut()
-            t.switching[aid]["note"] = "relaunching at the rewound moment"
-            time.sleep(0.5)
-            t.launch(hub.s.agent(aid), during_switch=True)
-        except Exception as e:
-            hub.s.event(aid, "error", f"rewind failed: {e}")
-        finally:
-            t.switching.pop(aid, None)
-
-    threading.Thread(target=run, daemon=True).start()
-    return {"ok": True, "message": hit["text"], "relaunch": True}
+    relaunch = _cli_down(hub, a, "rewind", cut, b.get("confirm"))
+    return {"ok": True, "message": hit["text"], "relaunch": relaunch, **({} if relaunch else {"backup": kept[0]})}
 
 
 def _rm(p):
@@ -227,25 +260,39 @@ def scrub_outlines(s, pid, ids):
         s.x("UPDATE memory_versions SET text=? WHERE id=?", (fix_text(v["text"]), v["id"]))
 
 
-def erase(hub, a, sid, path, off, ts, later=()):
+def _forget(a, x):
+    """One whole session's transcript and the CLI's own state for it. Returns the transcript path, if it had one."""
+    p = _path(a, x)
+    if a["provider"] == "antigravity":
+        d = _agy_home(a)
+        db = antigravity.db_for(x, d)
+        for q in (db, db + "-wal", db + "-shm", os.path.join(antigravity.home(d), "brain", x)):
+            _rm(q)
+        return p
+    if p:
+        for q in _session_files(p, x):
+            _rm(q)
+        _rm(p)
+    return p
+
+
+def erase(hub, a, sid, path, off, ts, later=(), byte=None):
     """Everything the agent did from the message at `off` (sent at `ts`) on is taken out, as if it never happened:
-    the rest of that transcript and any session after it, Claude's own state for them, and the hub's record of it
+    the rest of that transcript and any session after it, the CLI's own state for them, and the hub's record of it
     (its events, the messages it got and sent, its notes, pages and questions, the outlines of that part and the
-    memory lines they alone back). Real work stays: files on disk, jobs, the work queue."""
+    memory lines they alone back). Real work stays: files on disk, jobs, the work queue. `off` is a byte offset of
+    a Claude transcript or a step of an Antigravity conversation; `byte` is where that is in the transcript file."""
     s, aid = hub.s, a["id"]
     since = epoch(ts) - 3  # the hub logs a typed message a moment before the CLI writes it
     cutoff = iso_from_epoch(since)
-    for p in _session_files(path, sid, since):
-        _rm(p)
-    os.truncate(path, off)
-    dead_paths = []
-    for x in later:
-        p = discovery.transcript_path("claude", x, a.get("account"))
-        if p:
-            for q in _session_files(p, x):
-                _rm(q)
+    if a["provider"] == "antigravity":
+        antigravity.cut(sid, off, _agy_home(a))
+        off = byte if byte is not None else 0
+    else:
+        for p in _session_files(path, sid, since):
             _rm(p)
-            dead_paths.append(p)
+        os.truncate(path, off)
+    dead_paths = [p for p in (_forget(a, x) for x in later) if p]
     ix = getattr(hub, "_ix", None)
     if ix is not None and dead_paths:
         try:
@@ -280,10 +327,189 @@ def delete_copies(aid):
     return {"ok": True}
 
 
+# ---------- edit any entry of a transcript ----------
+def _own(hub, aid, sid):
+    a = hub.s.agent(aid)
+    if not a:
+        raise LookupError(aid)
+    if a["provider"] not in EDITABLE:
+        raise ValueError("transcripts of Claude, Codex and Antigravity agents can be edited")
+    sid = sid or a.get("session_id")
+    if not sid or sid not in sessions(hub, a):
+        raise ValueError(f"session {sid} is not one of {aid}'s")
+    path = _path(a, sid)
+    if not path or not os.path.exists(path):
+        raise LookupError(f"the transcript of session {sid}")
+    return a, sid, path
+
+
+def records(hub, aid, sid=None, before=None, limit=60):
+    """Every shown entry of one of an agent's conversations (asks, replies, tool calls), oldest first, each with
+    `at`: the record it is in (record() and edit() take it). `before` (as returned) pages back."""
+    a, sid, path = _own(hub, aid, sid)
+    if a["provider"] == "antigravity":
+        out = antigravity.records(path, limit, before)
+    else:
+        got = transcript.read_chat(path, a["provider"], limit, None if before is None else int(before))
+        out = {"entries": [{"at": e["id"] // 8, "role": e["role"], "text": e["text"], "ts": e["ts"]}
+                           for e in got["entries"]], "before": got["before"]}
+    return {"agent": aid, "session": sid, **out}
+
+
+def _line_at(path, at):
+    with open(path, "rb") as f:
+        f.seek(int(at))
+        line = f.readline()
+        if int(at):
+            f.seek(int(at) - 1)
+            if f.read(1) != b"\n":
+                raise ValueError("that is not the start of a record (the transcript changed?)")
+    if not line.endswith(b"\n"):
+        raise ValueError("that is not a whole record (the transcript changed?)")
+    return line
+
+
+def _parts(e):
+    """[(label, text, set(text))] of the texts in one Claude record: what was typed or said, a tool call's input
+    (as JSON) and a tool's output. Thinking is left to the raw record: it is signed, an edit there can be refused."""
+    msg = e.get("message") if isinstance(e, dict) else None
+    if not isinstance(msg, dict):
+        return []
+    c, who = msg.get("content"), msg.get("role") or e.get("type") or "message"
+    if isinstance(c, str):
+        return [(f"{who} text", c, lambda t: msg.__setitem__("content", t))]
+    out = []
+    for blk in c if isinstance(c, list) else []:
+        if not isinstance(blk, dict):
+            continue
+        kind = blk.get("type")
+        if kind == "text" and isinstance(blk.get("text"), str):
+            out.append((f"{who} text", blk["text"], lambda t, b=blk: b.__setitem__("text", t)))
+        elif kind == "tool_use":
+            out.append((f"tool call {blk.get('name') or ''} input (JSON)".replace("  ", " "),
+                        json.dumps(blk.get("input"), indent=1, ensure_ascii=False),
+                        lambda t, b=blk: b.__setitem__("input", json.loads(t))))
+        elif kind == "tool_result":
+            r = blk.get("content")
+            if isinstance(r, str):
+                out.append(("tool output", r, lambda t, b=blk: b.__setitem__("content", t)))
+            for sub in r if isinstance(r, list) else []:
+                if isinstance(sub, dict) and sub.get("type") == "text" and isinstance(sub.get("text"), str):
+                    out.append(("tool output", sub["text"], lambda t, b=sub: b.__setitem__("text", t)))
+    return out
+
+
+def _sig(raw):
+    import hashlib
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def record(hub, aid, sid, at):
+    """One record, ready to edit: its texts as `parts`, and for a jsonl transcript the whole record as `raw`."""
+    a, sid, path = _own(hub, aid, sid)
+    if a["provider"] == "antigravity":
+        got = antigravity.step_texts(sid, at, _agy_home(a))
+        return {"agent": aid, "session": sid, "at": int(at), "raw": None,
+                "sig": _sig("\0".join(got["texts"]).encode()),
+                "parts": [{"label": f"text {i + 1}", "text": t} for i, t in enumerate(got["texts"])]}
+    line = _line_at(path, at)
+    try:
+        e = json.loads(line)
+    except ValueError:
+        e = None
+    parts = _parts(e) if a["provider"] == "claude" else []
+    return {"agent": aid, "session": sid, "at": int(at), "sig": _sig(line),
+            "raw": json.dumps(e, indent=1, ensure_ascii=False) if e is not None else line.decode(errors="replace"),
+            "parts": [{"label": k, "text": t} for k, t, _ in parts]}
+
+
+def edit(hub, aid, b):
+    """Replace texts of one record (b['parts']: {index: new text}) or the whole record (b['raw'], jsonl only) in
+    session b['session'] at b['at']. b['sig'] is record()'s: the edit is refused if the record changed since. The
+    agent's CLI exits first when it is on that conversation, and resumes it with the edit in place."""
+    a, sid, path = _own(hub, aid, b.get("session"))
+    at, sig = int(b.get("at", -1)), b.get("sig")
+    parts = {int(k): v for k, v in (b.get("parts") or {}).items()}
+    raw = b.get("raw")
+    if raw is None and not parts:
+        raise ValueError("nothing to change: give parts or raw")
+    agy = a["provider"] == "antigravity"
+    if agy:
+        if raw is not None:
+            raise ValueError("an Antigravity step is edited by its texts")
+        had = antigravity.step_texts(sid, at, _agy_home(a))["texts"]
+        if sig and sig != _sig("\0".join(had).encode()):
+            raise ValueError("that step changed since it was read; open it again")
+        if any(i < 0 or i >= len(had) or not isinstance(t, str) for i, t in parts.items()):
+            raise ValueError("no such text in that step")
+        changes = [(had[i], t) for i, t in parts.items()]
+    else:
+        line = _line_at(path, at)
+        if sig and sig != _sig(line):
+            raise ValueError("that record changed since it was read; open it again")
+        if raw is not None:
+            e = json.loads(raw)  # ValueError: not JSON
+        else:
+            if a["provider"] != "claude":
+                raise ValueError("a Codex record is edited whole (raw)")
+            e = json.loads(line)
+            had = _parts(e)
+            for i, t in parts.items():
+                if not isinstance(t, str) or i < 0 or i >= len(had):
+                    raise ValueError("no such text in that record")
+                had[i][2](t)
+        new = (json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+    def work():
+        if agy:
+            antigravity.edit_step(sid, at, changes, _agy_home(a))
+        else:
+            if _line_at(path, at) != line:
+                raise ValueError("the record changed while the CLI was exiting; nothing was edited")
+            tmp = path + ".sb-tmp"
+            with open(path, "rb") as src, open(tmp, "wb") as dst:
+                dst.write(src.read(at))
+                dst.write(new)
+                src.seek(at + len(line))
+                shutil.copyfileobj(src, dst)
+            shutil.copymode(path, tmp)
+            os.replace(tmp, path)
+            delta = len(new) - len(line)
+            if delta:  # outlines remember the part of the file they cover, in bytes
+                hub.s.x("UPDATE memory_sessions SET start=start+? WHERE session_id=? AND start>?", (delta, sid, at))
+                hub.s.x("UPDATE memory_sessions SET size=size+? WHERE session_id=? AND size>?", (delta, sid, at))
+            _scan.pop(path, None)
+        hub.s.event(aid, "system", f"the owner edited its transcript (session {sid}, record {at})")
+
+    live = sid == a.get("session_id") and a["mode"] == "terminal"
+    relaunch = _cli_down(hub, a, "edit its transcript", work, b.get("confirm")) if live else (work() or False)
+    return {"ok": True, "relaunch": relaunch}
+
+
+def edit_outline(hub, eid, b):
+    """Correct one conversation's outline by hand: its one-line summary and its sections of points."""
+    r = hub.s.one("SELECT id FROM memory_sessions WHERE id=?", (int(eid),))
+    if not r:
+        raise LookupError(f"conversation {eid}")
+    if "summary" in b:
+        hub.s.x("UPDATE memory_sessions SET summary=? WHERE id=?", (memory.redact(str(b["summary"] or "")), r["id"]))
+    if "outline" in b:
+        o = b["outline"]
+        if isinstance(o, str):
+            o = json.loads(o)
+        if o is not None and not (isinstance(o, dict) and isinstance(o.get("sections"), list) and all(
+                isinstance(x, dict) and isinstance(x.get("h"), str) and isinstance(x.get("points"), list) and all(
+                    isinstance(p, dict) and isinstance(p.get("t"), str) and isinstance(p.get("m"), list)
+                    for p in x["points"]) for x in o["sections"])):
+            raise ValueError('an outline is {"sections": [{"h": heading, "points": [{"t": text, "m": [message numbers]}]}]}')
+        hub.s.x("UPDATE memory_sessions SET outline=? WHERE id=?", (memory.redact(json.dumps(o)) if o else None, r["id"]))
+    return {"ok": True}
+
+
 # ---------- memory files: edit and delete from the app ----------
 def _memfile(path):
     rp = os.path.realpath(path or "")
-    roots = [os.path.realpath(r) for r in [discovery.CLAUDE_PROJECTS] + list(discovery.EXTRA_PROJECTS)]
+    roots = [os.path.realpath(r) for r in [discovery.CLAUDE_PROJECTS] + discovery.endpoint_projects() + list(discovery.EXTRA_PROJECTS)]
     rel = next((os.path.relpath(rp, r) for r in roots if rp.startswith(r + os.sep)), None)
     parts = rel.split(os.sep) if rel else []
     if len(parts) < 3 or parts[1] != "memory" or not rp.endswith(".md") or ".." in parts:

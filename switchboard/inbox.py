@@ -32,7 +32,7 @@ def items(hub, project=None):
         if project and p != project:
             continue
         item = {"kind": "need", "id": n["id"], "project": p, "agent": n["agent"], "text": n["text"], "options": [],
-                "created_at": n["created_at"]}
+                "created_at": n["created_at"], "source": n.get("source")}
         if n.get("kind") == "waiting":  # the hub noticed a dialog: offer its options right here
             ch = live_choices(hub, n["agent"])
             if ch:

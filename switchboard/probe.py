@@ -72,6 +72,7 @@ def cpu():
         if some:
             psi[k] = {"some10": float(some.group(1)), "full10": float(full.group(1)) if full else None}
     return {"threads": threads, "cores": len(siblings) or threads, "model": m.group(1).strip() if m else None,
+            "siblings": sorted(sorted(_cpulist(s)) for s in siblings if "," in s or "-" in s),
             "load": [float(x) for x in load] if len(load) == 3 else None, "psi": psi or None}
 
 
@@ -119,6 +120,68 @@ def gpus():
 
 
 UNIT_RE = re.compile(r"/([^/]+\.(?:service|scope))(?:/|$)")
+
+
+def _cpulist(text):
+    out = set()
+    for part in (text or "").strip().split(","):
+        if part:
+            a, _, b = part.partition("-")
+            try:
+                out.update(range(int(a), int(b or a) + 1))
+            except ValueError:
+                pass
+    return out
+
+
+def _allowed(status_path):
+    m = re.search(r"^Cpus_allowed_list:\s*(\S+)", read(status_path), re.M)
+    return _cpulist(m.group(1)) if m else set()
+
+
+def pins():
+    """Who is really on which CPU: every user process confined to fewer CPUs than init is, whoever started it and
+    however it was pinned (AllowedCPUs, taskset inside a command, an OpenMP runtime). One row per unit, or per
+    process outside any unit: the union of its threads' CPUs and its average CPU use since it started. This is what
+    the hub hands CPUs out from; a job's own label is only what it was told."""
+    everything = _allowed("/proc/1/status") or set(range(os.cpu_count() or 1))
+    tick = os.sysconf("SC_CLK_TCK") or 100
+    try:
+        up = float(read("/proc/uptime").split()[0])
+    except (ValueError, IndexError):
+        up = 0.0
+    rows = {}
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = d[6:]
+        if not read(d + "/cmdline"):
+            continue  # a kernel thread: pinned per CPU by design
+        main = _allowed(d + "/status")
+        if not main or main >= everything:
+            continue
+        cpus = set(main)
+        for st in glob.glob(d + "/task/*/status")[:512]:
+            cpus |= _allowed(st)
+        stat = read(d + "/stat").rsplit(")", 1)[-1].split()
+        try:  # fields after the comm: utime and stime are the 12th and 13th, starttime the 20th
+            used = (int(stat[11]) + int(stat[12])) / tick
+            age = max(1.0, up - int(stat[19]) / tick)
+        except (ValueError, IndexError):
+            used, age = 0.0, 1.0
+        unit = unit_of(pid)
+        key = unit or "pid:" + pid
+        r = rows.setdefault(key, {"unit": unit, "pid": int(pid), "comm": read(d + "/comm").strip(), "cpus": set(),
+                                  "cpu": 0.0})
+        r["cpus"] |= cpus
+        r["cpu"] += 100.0 * used / age
+    return [{**r, "cpus": sorted(r["cpus"]), "cpu": round(r["cpu"], 1)}
+            for r in sorted(rows.values(), key=lambda r: -r["cpu"])][:200]
+
+
+def cpuset():
+    """Does this user's systemd manager have the cpuset controller? Without it AllowedCPUs on a user unit is
+    accepted and does nothing."""
+    return "cpuset" in read(f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/"
+                            "cgroup.controllers").split()
 
 
 def unit_of(pid):
@@ -265,6 +328,8 @@ def main():
            "memory": section(memory, {}),
            "gpus": section(gpus, []),
            "processes": section(processes, []),
+           "pins": section(pins, []),
+           "cpuset": section(cpuset, False),
            "units": section(units, []),
            "jobs": section(jobs, []),
            "timers": section(timers, []),

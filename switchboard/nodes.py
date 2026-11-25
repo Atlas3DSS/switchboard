@@ -51,12 +51,54 @@ SEATS = tuple(ROLES)
 # runs in Hermes with a DeepSeek model.
 PROVIDERS = {
     "claude": {"cli": "claude", "models": {r: ROLES[r]["model"] for r in ROLES}},
-    "codex": {"cli": "codex", "models": {"architect": "gpt-6-astra", "tasker": "gpt-6.1-terra", "janitor": "gpt-6.1-terra"}},
+    "codex": {"cli": "codex", "models": {"lead": "gpt-6-astra", "architect": "gpt-6-astra", "tasker": "gpt-6.1-terra",
+                                         "janitor": "gpt-6.1-terra"}},
+    "antigravity": {"cli": "antigravity", "models": {"lead": "gemini-pro-orchestrator-neon",
+                                                     "architect": "gemini-4-neon-high",
+                                                     "tasker": "gemini-4-hydrogen-high",
+                                                     "janitor": "gemini-3.8-flash-medium"}},
     "deepseek": {"cli": "hermes", "models": {r: "deepseek/deepseek-v4-pro" for r in ROLES}},
     "hermes": {"cli": "hermes", "models": {}},
 }
-FALLBACK = ("claude", "codex", "deepseek", "hermes")  # setting "node_fallback" replaces this order
-BRIEF_CAP = {"claude": 60000, "codex": 30000, "deepseek": 12000, "hermes": 8000}
+FALLBACK = ("claude", "codex", "antigravity", "deepseek", "hermes")  # setting "node_fallback" replaces this order
+BRIEF_CAP = {"claude": 60000, "codex": 30000, "antigravity": 30000, "deepseek": 12000, "hermes": 8000}
+RESERVE = "_reserve"  # in a project's stored seats: the agents kept outside them
+ILLUSTRATOR = "_illustrator"  # in a project's stored seats: the agent the owner marked as its illustrator
+MARKS = ("lead", "illustrator", "architect")  # what the owner can pin on an agent from its pane
+DEFAULT_SETTING = "node_provider"  # the account type every seat starts on unless the owner set that seat's own
+
+
+def default_provider(hub):
+    """The account type a seat with no choice of its own starts on: the owner's setting (sb nodes --default-provider),
+    else each seat's built-in one (Claude). One switch moves every project's new seats, dispatch included, to another
+    provider; a seat the owner set by hand keeps its own."""
+    v = hub.s.setting(DEFAULT_SETTING)
+    return v if v in PROVIDERS else None
+
+
+def set_default_provider(hub, provider):
+    provider = (provider or "").strip()
+    if provider and provider not in PROVIDERS:
+        raise ValueError(f"{provider} is not an account type ({', '.join(PROVIDERS)})")
+    hub.s.set_setting(DEFAULT_SETTING, provider or None)
+    return {"default_provider": default_provider(hub)}
+
+
+def seat_title(role, model):
+    """A seat's name. The lead is named after the model it runs on (Lead Opus, Lead Carbon, Lead Astra): the seat is
+    the same on any provider."""
+    if role != "lead":
+        return ROLES[role]["title"]
+    word = _model_word(model)
+    return f"Lead {word}" if word else "Lead"
+
+
+def seat_default(hub, role):
+    """(provider, model) a seat starts on when the owner chose nothing for it."""
+    d, base = ROLES[role], default_provider(hub)
+    if base and base != d["provider"] and PROVIDERS[base]["models"].get(role):
+        return base, PROVIDERS[base]["models"][role]
+    return d["provider"], d["model"]
 
 
 def deepseek_key():
@@ -84,9 +126,11 @@ def pick_account(hub, provider, model, use=None):
     cfg = handoff.settings(hub.s)
     room, last = [], []
     for a in discovery.accounts():
-        if a["kind"] != cli:
+        if a["kind"] != cli or a["name"] in cfg.get("parked", ()):
             continue
         u, res = use.get(a["name"]), a["name"] in cfg["reserve"]
+        if (u or {}).get("error"):
+            continue  # its reading failed (a login that no longer works, a lapsed subscription): never "has room"
         if not (u or {}).get("limits"):
             room.append((0, a["name"]))
         elif handoff.trusted(u, res) and handoff.used(u, model) < cfg["at"]:
@@ -111,9 +155,13 @@ def _stored(hub, pid):
     return ((hub.s.setting(SETTING, {}) or {}).get(pid)) or {}
 
 
+def reserved(hub, pid):
+    return set(_stored(hub, pid).get(RESERVE) or ())
+
+
 def _usable(a):
     return not a.get("gone") and a["provider"] != "shell" and a.get("role") not in ("desk", "helper") \
-        and a.get("mode") != "observed"
+        and a.get("mode") != "observed" and not a.get("ghost")
 
 
 def seats(hub, pid, now=None):
@@ -135,16 +183,20 @@ def seats(hub, pid, now=None):
             return "small"
         return None  # model not recorded: no seat is guessed for it
 
-    def give(role, aid):
-        if aid in mine and aid not in taken and role not in picked:
+    held_back = set(stored.get(RESERVE) or ())  # agents the owner keeps outside the seats (sb nodes --reserve)
+    illus = stored.get(ILLUSTRATOR) if stored.get(ILLUSTRATOR) in mine else None  # no seat fills itself with it
+
+    def give(role, aid, share=False):  # share: the owner's lead may also be the owner's architect
+        if aid in mine and (share or aid not in taken) and aid not in held_back and role not in picked:
             picked[role] = aid
             taken.add(aid)
 
     for role in SEATS:  # the owner's own choices first
-        give(role, (stored.get(role) or {}).get("agent"))
-    give("lead", (hub.s.project(pid) or {}).get("lead"))  # the lead set on the project card
+        give(role, (stored.get(role) or {}).get("agent"), share=role in ("lead", "architect"))
+    give("lead", (hub.s.project(pid) or {}).get("lead"), share=True)  # the lead set on the project card
     for role, want in (("architect", "architect"), ("lead", "lead"), ("tasker", "small"), ("janitor", "small")):
-        fit = [a for a in mine.values() if a["id"] not in taken and kind(a) == want]
+        fit = [a for a in mine.values() if a["id"] not in taken and a["id"] not in held_back and a["id"] != illus
+               and kind(a) == want]
         if fit:
             give(role, max(fit, key=recent)["id"])
     out = []
@@ -152,8 +204,10 @@ def seats(hub, pid, now=None):
         d, cfg, a = ROLES[role], stored.get(role) or {}, mine.get(picked.get(role))
         idle_h = (now - epoch(a["last_activity"])) / 3600 if a and a.get("last_activity") else None
         state = "empty" if not a else "live" if idle_h is not None and idle_h <= INHERIT_HOURS else "stale"
-        out.append({"role": role, "title": d["title"], "provider": cfg.get("provider") or d["provider"],
-                    "model": cfg.get("model") or d["model"], "default_model": d["model"],
+        dprov, dmodel = seat_default(hub, role)
+        out.append({"role": role, "title": seat_title(role, cfg.get("model") or dmodel),
+                    "provider": cfg.get("provider") or dprov,
+                    "model": cfg.get("model") or dmodel, "default_model": dmodel,
                     "agent": a["id"] if a else None, "chosen": bool(a and cfg.get("agent") == a["id"]),
                     "running_model": a["model"] if a else None, "running_provider": a["provider"] if a else None,
                     "account": a["account"] if a else None, "session_id": a["session_id"] if a else None,
@@ -161,9 +215,103 @@ def seats(hub, pid, now=None):
                     "idle_hours": round(idle_h, 1) if idle_h is not None else None, "state": state,
                     # live: the seat's session is picked up as it is; stale or empty: a clean start from brief()
                     "pickup": "inherit session" if state == "live" else "clean start"})
-    extras = [{"agent": a["id"], "provider": a["provider"], "model": a["model"], "last_activity": a["last_activity"]}
+    extras = [{"agent": a["id"], "provider": a["provider"], "model": a["model"], "last_activity": a["last_activity"],
+               "reserve": a["id"] in held_back, "illustrator": a["id"] == illus}
               for a in sorted(mine.values(), key=recent, reverse=True) if a["id"] not in taken]
-    return {"project": pid, "seats": out, "extras": extras, "inherit_hours": INHERIT_HOURS}
+    return {"project": pid, "seats": out, "extras": extras, "illustrator": illus, "inherit_hours": INHERIT_HOURS,
+            "default_provider": default_provider(hub)}
+
+
+def marks(hub, pid, st=None, lead=...):
+    """Per agent, the marks the owner sees on its pane: lead (where a message to the project lands), architect and
+    illustrator. 'on' is the owner's own choice; 'auto' is one the hub made because nobody was chosen."""
+    p = hub.s.project(pid)
+    if not p:
+        return {}
+    st, stored, out = st or seats(hub, pid), _stored(hub, pid), {}
+    lead = hub.lead_of(pid) if lead is ... else lead
+    if lead:
+        pinned = p.get("lead") == lead or (stored.get("lead") or {}).get("agent") == lead
+        out.setdefault(lead, {})["lead"] = "on" if pinned else "auto"
+    arch = next((x for x in st["seats"] if x["role"] == "architect" and x["agent"]), None)
+    if arch:
+        out.setdefault(arch["agent"], {})["architect"] = "on" if arch["chosen"] else "auto"
+    if st.get("illustrator"):
+        out.setdefault(st["illustrator"], {})["illustrator"] = "on"
+    return out
+
+
+def set_mark(hub, pid, role, agent, on=True):
+    """The owner pins or unpins a mark on an agent. Lead: the agent messages to the project go to (the project's
+    lead and its lead seat together, so routing and the seats agree). Architect: the architect seat. Illustrator:
+    a mark only; the agent keeps out of the seats that fill themselves and is not retired by a fold. One agent may
+    be both lead and architect; a pin takes it out of the tasker and janitor seats. Unpinning leaves the hub's own
+    choice in place, shown as 'auto'."""
+    if role not in MARKS:
+        raise ValueError(f"{role} is not a mark ({', '.join(MARKS)})")
+    p = hub.s.project(pid)
+    if not p:
+        raise LookupError(pid)
+    a = hub.s.agent(agent or "")
+    if not a or a["project"] != pid or not _usable(a):
+        raise ValueError(f"{agent} is not an agent on {pid} that can be marked")
+    every = hub.s.setting(SETTING, {}) or {}
+    cur = dict(every.get(pid) or {})
+
+    def unseat(r):
+        if (cur.get(r) or {}).get("agent") == agent:
+            cur[r] = {k: v for k, v in cur[r].items() if k != "agent"}
+            if not cur[r]:
+                cur.pop(r)
+
+    if role == "illustrator":
+        if on:
+            cur[ILLUSTRATOR] = agent
+        elif cur.get(ILLUSTRATOR) == agent:
+            cur.pop(ILLUSTRATOR)
+    elif on:
+        for r in ("tasker", "janitor"):
+            unseat(r)
+        cur[role] = {**(cur.get(role) or {}), "agent": agent}
+        if agent in (cur.get(RESERVE) or ()):  # a held-back agent cannot hold a seat
+            cur[RESERVE] = [x for x in cur[RESERVE] if x != agent]
+            if not cur[RESERVE]:
+                cur.pop(RESERVE)
+    else:
+        unseat(role)
+    if role == "lead":
+        if on:
+            hub.s.upsert_project({"id": pid, "lead": agent})
+        elif p.get("lead") == agent:
+            hub.s.upsert_project({"id": pid, "lead": ""})
+    every[pid] = cur
+    hub.s.set_setting(SETTING, {k: v for k, v in every.items() if v})
+    return {"project": pid, "lead": hub.lead_of(pid), "marks": marks(hub, pid)}
+
+
+def set_reserve(hub, pid, agent, on=True):
+    """Keep an agent outside the seats (or let it back in): it stays on the project and can be written to by name,
+    but no seat fills itself with it, so a message to the project never lands on it. For an agent the owner holds
+    back for later."""
+    if not hub.s.project(pid):
+        raise LookupError(pid)
+    a = hub.s.agent(agent or "")
+    if not a or a["project"] != pid:
+        raise ValueError(f"{agent} is not an agent on {pid}")
+    every = hub.s.setting(SETTING, {}) or {}
+    cur = dict(every.get(pid) or {})
+    ids = [x for x in cur.get(RESERVE) or [] if x != agent] + ([agent] if on else [])
+    for role in SEATS:  # a seat the owner had given it is taken back with it
+        if on and (cur.get(role) or {}).get("agent") == agent:
+            cur[role] = {k: v for k, v in cur[role].items() if k != "agent"}
+            if not cur[role]:
+                cur.pop(role)
+    cur[RESERVE] = ids
+    if not ids:
+        cur.pop(RESERVE)
+    every[pid] = cur
+    hub.s.set_setting(SETTING, {p: v for p, v in every.items() if v})
+    return seats(hub, pid)
 
 
 def set_seat(hub, pid, role, b):
@@ -203,6 +351,8 @@ def wiki(hub, pid, viewer=None, talk=True):
     s = hub.s
     st = seats(hub, pid)
     role_of = {x["agent"]: x["role"] for x in st["seats"] if x["agent"]}
+    if st["illustrator"]:
+        role_of.setdefault(st["illustrator"], "illustrator")
     done = s.one("SELECT id, title, agent, done_at FROM work WHERE project=? AND status='done' AND done_at IS NOT NULL "
                  "ORDER BY done_at DESC LIMIT 1", (pid,))
     open_work = sorted(fleet.work_list(hub, project=pid)["items"], key=lambda w: (w["priority"], w["id"]))
@@ -298,9 +448,11 @@ def brief(hub, pid, role, viewer=None, provider=None):
     d = ROLES[role]
     w = wiki(hub, pid, viewer)
     provider = provider or next(n["provider"] for n in w["nodes"] if n["role"] == role)
-    others = "; ".join(f"{ROLES[r]['title']} = {next((n['agent'] for n in w['nodes'] if n['role'] == r), None) or 'empty'}"
+    title = {n["role"]: n["title"] for n in w["nodes"]}
+    others = "; ".join(f"{title.get(r, ROLES[r]['title'])} = "
+                       f"{next((n['agent'] for n in w['nodes'] if n['role'] == r), None) or 'empty'}"
                        for r in SEATS if r != role)
-    who = f"You are the {d['title']} of project {w['name']} ({pid}) in the owner's Switchboard."
+    who = f"You are the {title.get(role, d['title'])} of project {w['name']} ({pid}) in the owner's Switchboard."
     more = "`sb wiki` prints the project's live wiki again; `sb memory` and `sb context` go deeper."
     if provider in ("deepseek", "hermes"):
         w = dict(w, memory={"text": "", "updated_at": None}, notes=[], extras=[],
@@ -343,8 +495,8 @@ def pickup(hub, pid, role, by="owner"):
         return {"project": pid, "role": role, "agent": a["id"], "action": "cleared" if cleared else "rebriefed"}
     prov, model, acct = place(hub, role, seat["provider"], seat["model"])
     if not acct:
-        raise ValueError(f"no account of any type has room for the {ROLES[role]['title']} seat right now")
-    made = hub.create_agent({"provider": PROVIDERS[prov]["cli"], "project": pid, "title": ROLES[role]["title"],
+        raise ValueError(f"no account of any type has room for the {seat['title']} seat right now")
+    made = hub.create_agent({"provider": PROVIDERS[prov]["cli"], "project": pid, "title": seat_title(role, model),
                              "id": f"{pid}-{role}", "model": model, "account": acct, "permission_mode": "auto",
                              "prompt": brief(hub, pid, role, provider=prov), "from": by,
                              "idem": f"node-start:{pid}:{role}:{stamp}"})
@@ -355,7 +507,7 @@ def pickup(hub, pid, role, by="owner"):
 
 def _model_word(model):
     m = (model or "").lower()
-    return next((w.capitalize() for w in ("fable", "mythos", "opus", "sonnet", "haiku", "astra", "terra", "luna",
+    return next((w.capitalize() for w in ("fable", "mythos", "opus", "sonnet", "haiku", "astra", "terra", "luna", "sol", "argon", "carbon", "hydrogen", "neon",
                                           "deepseek") if w in m), None)
 
 
@@ -405,7 +557,8 @@ def brief_if_new(hub, agent, by="owner"):
     """A seat that has never run (a Lead Opus made by standardize) gets its brief ahead of its first message."""
     if agent.get("last_activity") or agent.get("gone"):
         return False
-    role = next((r for r, c in _stored(hub, agent["project"]).items() if c.get("agent") == agent["id"]), None)
+    role = next((r for r, c in _stored(hub, agent["project"]).items()
+                 if isinstance(c, dict) and c.get("agent") == agent["id"]), None)
     if not role:
         return False
     prov = "deepseek" if agent["provider"] == "hermes" and "deepseek" in (agent.get("model") or "") else agent["provider"]
@@ -426,6 +579,8 @@ def fold(hub, pid, by="owner"):
     lead = next((s["agent"] for s in st["seats"] if s["role"] == "lead"), None)
     folded, busy = [], []
     for x in st["extras"]:
+        if x["illustrator"]:
+            continue
         a = hub.s.agent(x["agent"])
         if hub.t.status(a)["state"] == "busy" or hub.s.one(
                 "SELECT COUNT(*) n FROM messages WHERE to_agent=? AND state IN ('queued','delivered')", (a["id"],))["n"]:

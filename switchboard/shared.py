@@ -73,12 +73,44 @@ def grant_text(grants):
             "call it from your own project or copy what you need into it. Every other project stays closed.")
 
 
+def _antigravity_launch_note(agent, pid, grant):
+    """Concise launch note for Antigravity (agy): sent as -i on a fresh conversation, so keep it short,
+    Antigravity-native, and free of Claude-only instructions (general sb rules live in GEMINI.md + switchboard-cli)."""
+    scope = ("This project is the owner's Switchboard terminal: on the owner's direct request, you may read, message, "
+             "start, stop and change any project's agents, jobs, notes and files, and Switchboard itself. "
+             if barrier.unlimited(pid) else
+             ("Projects are separate. What your project may do across them is exactly what the owner opened, "
+              "stated next; nothing beyond it, through Switchboard or any other channel. "
+              if outside(pid).get("read") or outside(pid).get("write") else
+              "Projects are isolated. Do not contact, relay to, or read context from other projects. "))
+    note = (f"You are agent '{agent['id']}' on project '{pid}' in the owner's Switchboard. {scope}{grant}"
+            "Use Antigravity's native tools (read_file, edit_file, run_command, invoke_subagent) for normal coding "
+            "and research. Use `sb` (open the `switchboard-cli` skill when needed) for Switchboard coordination "
+            "(`sb context`, `sb send`, `sb memory`, `sb note`, `sb work`), heavy or GPU fleet jobs (`sb run`, never "
+            "background shells), and owner questions (`sb ask`, `sb notify`).")
+    try:
+        src = (json.loads(agent.get("fork_from") or "null") or {}).get("agent")
+    except (ValueError, AttributeError):
+        src = None
+    if src:
+        note += (f" You were forked from agent '{src}' as a side agent: do the side task without undoing or redoing "
+                 "its work.")
+    return (note + " " + OWNER_RELAY_POLICY
+            + " Reply in one short line confirming your agent name and project; wait for your first task before "
+              "running commands.")
+
+
 def launch_note(agent):
     """Appended to the system prompt of every Claude/Codex terminal agent on a project."""
+    if agent.get("ghost"):  # sealed off: told nothing of the project (switchboard/ghost.py)
+        from . import ghost
+        return ghost.note(agent)
     pid = agent.get("project") or "unsorted"
     grant = grant_text(read_grants(pid))
     grant = grant + " " if grant else ""
     grant += outside_text(outside(pid))
+    if agent.get("provider") == "antigravity":
+        return _antigravity_launch_note(agent, pid, grant)
     note = (f"You are agent '{agent['id']}' on project '{pid}' in the owner's Switchboard. Other agents may be "
             "working on this project too. Their context is shared on demand, never pushed: `sb context` lists them "
             "(what each was last asked and said) plus the project's shared notes; `sb context <agent>` shows one "

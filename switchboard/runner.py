@@ -275,6 +275,7 @@ class Runner:
             f.write(prompt + ("\n" + "\n".join(p for p, _ in images) if images else ""))
         argv = turn_command(agent, prompt_file, first_turn, images if agent["provider"] == "codex" else ())
         env = discovery.account_env(agent["account"], agent["provider"])
+        env.update(discovery.endpoint_env(agent))  # a model on its own endpoint, with its own home
         env["SB_AGENT"] = agent["id"]
         env["SB_HUB"] = hub_url()
         env["SB_TURN"] = turn

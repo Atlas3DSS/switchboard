@@ -54,6 +54,14 @@ class TalkOutTests(unittest.TestCase):
             self.h.send({"to": "other", "body": "hi", "from": "a1"})
         self.assertIn("beta", str(e.exception))
 
+    def test_gone_agent_with_project_id_does_not_shadow_project_routing(self):
+        # A removed agent whose id matches a project id (e.g. gone 'ops') must not block `sb send ops`
+        self.h.s.add_agent({"id": "beta", "project": "beta", "title": "old", "provider": "claude", "account": "one",
+                            "mode": "terminal", "session_id": None, "cwd": TMP, "state": "stopped"})
+        self.h.s.set_agent("beta", gone=1)
+        self.h.s.set_outside("alpha", write=True)
+        self.assertEqual(self.h.send({"to": "beta", "body": "still reaches lead", "from": "a1"})["message"]["to"], "b-lead")
+
     def test_outside_read_reads_another_projects_context(self):
         self.h.s.set_outside("alpha", read=True)
         self.assertEqual(self.h.project_context("beta", "a1")["project"], "beta")
