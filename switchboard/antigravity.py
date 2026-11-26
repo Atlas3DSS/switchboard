@@ -14,6 +14,7 @@ Same shapes as hermes.py: read_chat / last_reply / has_user_text / new_session /
 import json
 import os
 import re
+import threading
 import time
 
 from .store import epoch
@@ -45,6 +46,17 @@ def home(d=None):
 _labels = {}  # agy binary -> (read at, {slug: label})
 
 
+def _headless_env(d=None):
+    """Environment for background agy queries: never pop a desktop browser if OAuth needs re-login."""
+    env = dict(os.environ)
+    for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"):
+        env.pop(k, None)
+    env["BROWSER"] = "/bin/false"
+    if d:
+        env["ANTIGRAVITY_HOME"] = home(d)
+    return env
+
+
 def model_arg(model, exe="agy", now=None):
     """What to pass as --model. agy lists each model as a slug and a label ("gemini-pro-orchestrator",
     "Orchestrator (Carbon)") and accepts either, but the two are not the same request: given the slug of a model
@@ -58,7 +70,8 @@ def model_arg(model, exe="agy", now=None):
     at, known = _labels.get(exe, (0, {}))
     if now - at > 86400:
         try:
-            out = subprocess.run([exe, "models"], capture_output=True, text=True, timeout=20).stdout
+            out = subprocess.run([exe, "models"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                 timeout=20, env=_headless_env()).stdout
             found = dict(l.split("\t", 1) for l in out.splitlines() if "\t" in l)
             if found:
                 known = {k.strip(): v.strip() for k, v in found.items()}
@@ -475,7 +488,58 @@ def parse_usage(text):
 
 
 _usage = {}  # agy home -> (read at, limits or None)
+_usage_last_good = {}  # agy home -> (read at, limits) kept across transient refresh failures
+_usage_ttl = {}  # agy home -> ttl seconds for current cache entry
+_usage_lock = threading.Lock()
+_usage_inflight = set()  # agy homes currently being polled
 USAGE_TTL_S = 300
+USAGE_AUTH_TTL_S = 300  # headless check exits quickly with zero browser popups; recover promptly once keyring/auth is back
+USAGE_LAST_GOOD_S = 6 * 3600  # keep showing last known limits across brief agy/keyring hiccups
+
+
+def _run_usage(d, timeout=15):
+    """Run `agy -p "/usage"` headlessly and kill it immediately if it asks for interactive OAuth login."""
+    import select
+    import subprocess
+    import tempfile
+    p = subprocess.Popen(["agy", "-p", "/usage"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, cwd=tempfile.gettempdir(), env=_headless_env(d))
+    buf = bytearray()
+    err = bytearray()
+    deadline = time.monotonic() + timeout
+    fds = [p.stdout.fileno(), p.stderr.fileno()]
+    try:
+        while fds:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                p.kill()
+                break
+            ready, _, _ = select.select(fds, [], [], min(rem, 0.5))
+            if not ready:
+                if p.poll() is not None:
+                    break
+                continue
+            for fd in ready:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    fds.remove(fd)
+                    continue
+                if fd == p.stdout.fileno():
+                    buf.extend(chunk)
+                else:
+                    err.extend(chunk)
+                if b"Authentication required" in buf or b"Authentication required" in err:
+                    p.kill()
+                    return "", True
+    finally:
+        try:
+            p.wait(timeout=2)
+        except subprocess.SubprocessError:
+            p.kill()
+            p.wait()
+        p.stdout.close()
+        p.stderr.close()
+    return buf.decode("utf-8", "replace"), False
 
 
 def subscription_usage(d=None, now=None, run=None):
@@ -484,23 +548,47 @@ def subscription_usage(d=None, now=None, run=None):
     One reading is kept USAGE_TTL_S, a failed one too, so the account cards never wait on agy more than once."""
     now = time.time() if now is None else now
     h = home(d)
-    at, got = _usage.get(h, (0, None))
-    if h in _usage and now - at < USAGE_TTL_S:
-        return (got, at) if got else (None, None)
+    with _usage_lock:
+        at, got = _usage.get(h, (0, None))
+        ttl = _usage_ttl.get(h, USAGE_TTL_S)
+        last = _usage_last_good.get(h)
+        if h in _usage and now - at < ttl:
+            if got:
+                return (got, at)
+            if last and now - last[0] < USAGE_LAST_GOOD_S:
+                return (last[1], last[0])
+            return (None, None)
+        if h in _usage_inflight:
+            if got:
+                return (got, at)
+            if last and now - last[0] < USAGE_LAST_GOOD_S:
+                return (last[1], last[0])
+            return (None, None)
+        _usage_inflight.add(h)
     import subprocess
-    import tempfile
+    auth_needed = False
     try:
         if run:
             text = run()
+            auth_needed = "Authentication required" in (text or "")
         else:
-            env = dict(os.environ, ANTIGRAVITY_HOME=h) if d else None
-            text = subprocess.run(["agy", "-p", "/usage"], capture_output=True, text=True, timeout=30,
-                                  cwd=tempfile.gettempdir(), env=env).stdout
-        got = parse_usage(text) or None
+            text, auth_needed = _run_usage(d)
+        got = None if auth_needed else (parse_usage(text) or None)
     except (OSError, ValueError, subprocess.SubprocessError):
         got = None
-    _usage[h] = (now, got)
-    return (got, now) if got else (None, None)
+    finally:
+        with _usage_lock:
+            _usage[h] = (now, got)
+            _usage_ttl[h] = USAGE_AUTH_TTL_S if auth_needed else USAGE_TTL_S
+            if got:
+                _usage_last_good[h] = (now, got)
+            last = _usage_last_good.get(h)
+            _usage_inflight.discard(h)
+    if got:
+        return (got, now)
+    if last and now - last[0] < USAGE_LAST_GOOD_S:
+        return (last[1], last[0])
+    return (None, None)
 
 
 # ---------- rewind and edit (switchboard/rewind.py) ----------

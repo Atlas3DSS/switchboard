@@ -385,6 +385,9 @@ class Term:
         self.alive = True
         self.exit_code = None
         self.size = (120, 40)
+        self._text_cache = None
+        self._view_cache = None
+        self._dialog_cache = None
 
     def send(self, kind, payload):
         with self.lock:
@@ -408,7 +411,13 @@ class Term:
     # ---- screen reading ----
     def text(self):
         with self.lock:
-            return "\n".join(self.screen.lines(dim=False))
+            key = (id(self.screen), self.screen.rev)
+            c = self._text_cache
+            if c is not None and c[0] == key:
+                return c[1]
+            txt = "\n".join(self.screen.lines(dim=False))
+            self._text_cache = (key, txt)
+            return txt
 
     def _composer(self):
         """(screen lines, index of the composer line or None). Gemini draws its composer in a box: "│ > text │"."""
@@ -429,25 +438,34 @@ class Term:
     def view(self):
         """(ready, busy, composer text) from the mirrored screen. busy = a turn is running; background shells and
         monitors under an idle composer do not count (a message can be typed in), see background()."""
-        title = self.screen.title
-        if title.startswith("sb:") and title != "sb:idle":  # the built-in agent says when it is working
-            return True, True, ""
-        lines, idx = self._composer()
-        if idx is None:
-            return False, False, ""
-        tail = "\n".join(lines[max(0, idx - 6):])
-        busy = any(rx.search(tail) for rx, _ in TURN_MARKERS)
-        if self.provider == "antigravity" and busy:
-            below = [l.strip() for l in lines[idx + 1:] if l.strip()]
-            above = "\n".join(lines[max(0, idx - 6):idx])
-            if below and below[-1] == "? for shortcuts" and "(alt+m to send immediately)" not in above.lower():
-                busy = False  # idle footer won over any stale scrollback line above it
-        comp = composer_text("\n".join(lines[:idx + 1]))
-        if comp and self.provider == "hermes":  # Hermes greys a suggestion in after the cursor of an empty composer
-            y, x = self.screen.cursor
-            if y == idx and x <= len(lines[idx]) - len(lines[idx].lstrip()) + 2:
-                comp = ""
-        return True, busy, comp
+        with self.lock:
+            key = (id(self.screen), self.screen.rev, self.screen.title, self.provider)
+            c = self._view_cache
+            if c is not None and c[0] == key:
+                return c[1]
+            title = self.screen.title
+            if title.startswith("sb:") and title != "sb:idle":  # the built-in agent says when it is working
+                res = (True, True, "")
+            else:
+                lines, idx = self._composer()
+                if idx is None:
+                    res = (False, False, "")
+                else:
+                    tail = "\n".join(lines[max(0, idx - 6):])
+                    busy = any(rx.search(tail) for rx, _ in TURN_MARKERS)
+                    if self.provider == "antigravity" and busy:
+                        below = [l.strip() for l in lines[idx + 1:] if l.strip()]
+                        above = "\n".join(lines[max(0, idx - 6):idx])
+                        if below and below[-1] == "? for shortcuts" and "(alt+m to send immediately)" not in above.lower():
+                            busy = False  # idle footer won over any stale scrollback line above it
+                    comp = composer_text("\n".join(lines[:idx + 1]))
+                    if comp and self.provider == "hermes":  # Hermes greys a suggestion in after the cursor of an empty composer
+                        y, x = self.screen.cursor
+                        if y == idx and x <= len(lines[idx]) - len(lines[idx].lstrip()) + 2:
+                            comp = ""
+                    res = (True, busy, comp)
+            self._view_cache = (key, res)
+            return res
 
     def steady_for(self):
         """Seconds the screen's (ready, busy, composer) reading has stayed the same. A footer clock or spinner that
@@ -461,15 +479,23 @@ class Term:
         """What the CLI is asking, if a choice is open right now: the selected line is a numbered option
         ("❯ 1. Yes, I trust this folder") or the footer says Enter to confirm / Esc to cancel. Only the lines around
         that choice name it, so old text in the scrollback never looks like a dialog."""
-        lines, idx = self._composer()
-        tail = [l for l in lines if l.strip()][-6:]
-        footer = any(re.search(r"Enter to (confirm|select)\s*·\s*Esc to (cancel|exit)|Navigate\s*·\s*enter Confirm", l, re.I)
-                     for l in tail)
-        menu = idx is not None and re.match(r"^\s*[❯›»]\s*\d+\.\s", lines[idx])
-        if not menu and not footer:
-            return None
-        near = "\n".join(lines[max(0, idx - 15):idx + 6] if idx is not None else tail)
-        return next((why for rx, why in Terminals.WAITING if rx.search(near)), "has a choice open")
+        with self.lock:
+            key = (id(self.screen), self.screen.rev, self.provider)
+            c = self._dialog_cache
+            if c is not None and c[0] == key:
+                return c[1]
+            lines, idx = self._composer()
+            tail = [l for l in lines if l.strip()][-6:]
+            footer = any(re.search(r"Enter to (confirm|select)\s*·\s*Esc to (cancel|exit)|Navigate\s*·\s*enter Confirm", l, re.I)
+                         for l in tail)
+            menu = idx is not None and re.match(r"^\s*[❯›»]\s*\d+\.\s", lines[idx])
+            if not menu and not footer:
+                res = None
+            else:
+                near = "\n".join(lines[max(0, idx - 15):idx + 6] if idx is not None else tail)
+                res = next((why for rx, why in Terminals.WAITING if rx.search(near)), "has a choice open")
+            self._dialog_cache = (key, res)
+            return res
 
     BOX = re.compile(r"[─│╭╮╰╯┌┐└┘├┤═║]")
 
@@ -576,6 +602,8 @@ class Terminals:
         self.launched_at = {}
         self.retried_enter = {}  # turn_id -> ts of the one extra Enter before failing an unaccepted push
         self._procs_cache = (0.0, [])
+        self._session_probe = {}  # aid -> (last_output, checked_at) for unclaimed codex/hermes/agy terminals
+        self._confirm_checked = {}  # message id -> (path, size, mtime_ns) last read with no reply >= since
         # agents the owner stopped: opening their terminal shows the scrollback and a Start button instead of
         # launching the CLI again (which made Stop look like it did nothing). Cleared by any launch.
         self.held = set(self.s.setting("held_terminals", []) or [])
@@ -981,10 +1009,15 @@ class Terminals:
                     if t.last_output and t.last_output > epoch(cur.get("last_activity")) + 1:
                         upd["last_activity"] = iso_from_epoch(t.last_output)
                     self.s.set_agent(t.aid, **upd)
-                    if cur["provider"] == "codex" and not cur.get("session_id"):
-                        self._find_codex_thread(cur, t)
-                    elif cur["provider"] in ("hermes", "antigravity") and not cur.get("session_id"):
-                        self._find_hermes_session(cur, t)
+                    if not cur.get("session_id") and cur["provider"] in ("codex", "hermes", "antigravity"):
+                        now_t = time.time()
+                        prev_out, prev_at = self._session_probe.get(t.aid, (-1, 0.0))
+                        if t.last_output != prev_out or now_t - prev_at >= 15.0:
+                            self._session_probe[t.aid] = (t.last_output, now_t)
+                            if cur["provider"] == "codex":
+                                self._find_codex_thread(cur, t)
+                            else:
+                                self._find_hermes_session(cur, t)
                     self._check_waiting(t)
                     self._heal_trust(t, cur)
                     try:
@@ -1272,7 +1305,15 @@ class Terminals:
                 os.remove(p)
 
     def _confirm(self):
-        for m in self.s.q("SELECT * FROM messages WHERE state IN ('delivering','delivered') AND turn_id LIKE 'pty-%'"):
+        rows = self.s.q(
+            "SELECT m.* FROM messages m JOIN agents a ON a.id=m.to_agent "
+            "WHERE m.state IN ('delivering','delivered') AND m.turn_id LIKE 'pty-%' AND a.gone=0"
+        )
+        active_ids = {m["id"] for m in rows}
+        for mid in list(self._confirm_checked):
+            if mid not in active_ids:
+                self._confirm_checked.pop(mid, None)
+        for m in rows:
             try:  # one unreadable transcript must not stop every other agent's queue
                 self._confirm_one(m)
             except Exception as e:
@@ -1347,16 +1388,27 @@ class Terminals:
             if busy or not ready or comp or t.dialog():
                 return
         if path:
+            try:
+                st = os.stat(path)
+                fsig = (path, st.st_size, st.st_mtime_ns)
+            except OSError:
+                fsig = None
+            if fsig is not None and self._confirm_checked.get(m["id"]) == fsig:
+                return
             from . import transcript
             text, ts = transcript.last_reply(path, agent["provider"])
-            if ts and epoch(ts) >= since - 1 and (not t or t.steady_for() > 2):  # not "no output": footers repaint
-                answered = m["turn_id"].startswith("pty-batch-") and self.s.one(  # one reply per sender per batch
-                    "SELECT 1 n FROM messages WHERE turn_id=? AND from_agent IS ? AND state='done' AND id<>?",
-                    (m["turn_id"], m["from_agent"], m["id"]))
-                self.s.x("UPDATE messages SET state='done', finished_at=?, reply=? WHERE id=?",
-                         (now(), (text or "")[:20000], m["id"]))
-                if self.on_reply and not answered:
-                    self.on_reply(agent, m, text or "")
+            if ts and epoch(ts) >= since - 1:
+                if not t or t.steady_for() > 2:  # not "no output": footers repaint
+                    answered = m["turn_id"].startswith("pty-batch-") and self.s.one(  # one reply per sender per batch
+                        "SELECT 1 n FROM messages WHERE turn_id=? AND from_agent IS ? AND state='done' AND id<>?",
+                        (m["turn_id"], m["from_agent"], m["id"]))
+                    self.s.x("UPDATE messages SET state='done', finished_at=?, reply=? WHERE id=?",
+                             (now(), (text or "")[:20000], m["id"]))
+                    self._confirm_checked.pop(m["id"], None)
+                    if self.on_reply and not answered:
+                        self.on_reply(agent, m, text or "")
+            elif fsig is not None:
+                self._confirm_checked[m["id"]] = fsig
         elif not t:
             self.s.x("UPDATE messages SET state='done', finished_at=? WHERE id=?", (now(), m["id"]))
 

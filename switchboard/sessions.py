@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS sess (
   n_asks INTEGER DEFAULT 0, first_ask TEXT, last_ask TEXT, size INTEGER, offset INTEGER,
   interactive INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS sess_last ON sess(last_ts);
+CREATE INDEX IF NOT EXISTS sess_path ON sess(path, size, offset);
 CREATE VIRTUAL TABLE IF NOT EXISTS sess_fts USING fts5(id UNINDEXED, title, cwd, asks, tokenize='unicode61');
 """
 

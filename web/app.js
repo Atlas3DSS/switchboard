@@ -2553,7 +2553,7 @@ function setOnline(on) {
   c.classList.toggle('off', !on);
   setText(c.lastElementChild, on ? 'live' : 'hub unreachable');
 }
-let tickTimer = null, ticking = false, firstLoad = true;
+let tickTimer = null, ticking = false, firstLoad = true, ovEtag = null, ovSameTicks = 0;
 const INBOX = makeInbox();
 const HALT = haltBanner();
 $('#stale-banner').after(HALT.el);  // the HALT banner sits under the stale-code banner, above the page
@@ -2562,7 +2562,26 @@ async function tick() {
   if (ticking) { tickTimer = setTimeout(tick, 300); return; }
   ticking = true;
   try {
-    const ov = await api('GET', '/overview');
+    const hdrs = ovEtag ? { 'If-None-Match': ovEtag } : {};
+    const resp = await fetch('/api/overview', { method: 'GET', cache: 'no-store', headers: hdrs });
+    if (resp.status === 401 && resp.headers.get('X-Gate')) {
+      location.href = '/gate/?next=' + encodeURIComponent(location.pathname + location.search + location.hash);
+    }
+    if (resp.status === 304 && S.ov) {
+      setOnline(true);
+      ovSameTicks += 1;
+      if (ovSameTicks >= 10) {  // refresh relative "X m ago" timestamps every ~30s while state is idle
+        ovSameTicks = 0;
+        if (S.view) S.view.update();
+      }
+      return;
+    }
+    const txt = await resp.text();
+    let ov = null;
+    try { ov = txt ? JSON.parse(txt) : null; } catch (e) { /* non-JSON */ }
+    if (!resp.ok || !ov) throw new Error((ov && ov.error) || `HTTP ${resp.status}`);
+    ovEtag = resp.headers.get('ETag') || null;
+    ovSameTicks = 0;
     S.ov = ov;
     if (ov.ts) clockSkew = parseTime(ov.ts) - Date.now();
     // Something (POST /api/focus) asks to open an agent: follow fresh requests only (never jump on a reload).

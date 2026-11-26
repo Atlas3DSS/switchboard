@@ -13,6 +13,9 @@ OUT = ("Gemini Models\tWeekly Limit Remaining\t87%\t2026-11-24T23:28:09Z\n"
 class Usage(unittest.TestCase):
     def setUp(self):
         antigravity._usage.clear()
+        antigravity._usage_last_good.clear()
+        antigravity._usage_ttl.clear()
+        antigravity._usage_inflight.clear()
 
     def test_parse(self):
         got = antigravity.parse_usage("Quota:\n" + OUT + "not a limit\tx\ty\tz\n")
@@ -38,6 +41,37 @@ class Usage(unittest.TestCase):
         self.assertEqual(antigravity.subscription_usage("/y", now=1000, run=fail), (None, None))
         self.assertEqual(antigravity.subscription_usage("/y", now=1001, run=fail), (None, None))
         self.assertEqual(len(calls), 3)  # the failure was kept: agy was not run again
+
+    def test_headless_env_blocks_browser_popup_and_keeps_last_good(self):
+        import os
+        with mock.patch.dict(os.environ, {"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0",
+                                          "XDG_CURRENT_DESKTOP": "XFCE", "BROWSER": "firefox"}):
+            env = antigravity._headless_env("/tmp/agy-test")
+        for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"):
+            self.assertNotIn(k, env)
+        self.assertEqual(env["BROWSER"], "/bin/false")
+        self.assertEqual(env["ANTIGRAVITY_HOME"], "/tmp/agy-test")
+
+        calls = []
+        auth_prompt = lambda: calls.append(1) or "Authentication required. Please visit the URL to log in:"
+        self.assertEqual(antigravity.subscription_usage("/z", now=1000, run=auth_prompt), (None, None))
+        self.assertEqual(antigravity.subscription_usage("/z", now=1001, run=auth_prompt), (None, None))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(antigravity.subscription_usage("/z", now=1000 + antigravity.USAGE_AUTH_TTL_S + 1, run=auth_prompt),
+                         (None, None))
+        self.assertEqual(len(calls), 2)
+
+        got, at = antigravity.subscription_usage("/keep", now=1000, run=lambda: OUT)
+        self.assertEqual((len(got), at), (4, 1000))
+        got2, at2 = antigravity.subscription_usage("/keep", now=1000 + antigravity.USAGE_TTL_S + 1, run=auth_prompt)
+        self.assertEqual((len(got2), at2), (4, 1000))
+
+        antigravity._usage_inflight.add("/busy")
+        try:
+            self.assertEqual(antigravity.subscription_usage("/busy", now=2000, run=auth_prompt), (None, None))
+            self.assertEqual(len(calls), 3)
+        finally:
+            antigravity._usage_inflight.discard("/busy")
 
     def card(self, out, hit=None):
         acct = [{"name": "antigravity", "kind": "antigravity", "config_dir": "/x"}]

@@ -1,4 +1,6 @@
 """Switchboard hub: HTTP API + dashboard + delivery loop. Run: python3 -m switchboard.hub"""
+import gzip
+import hashlib
 import json
 import mimetypes
 import os
@@ -1650,11 +1652,19 @@ def make_handler(hub):
         def log_message(self, *a):
             pass
 
-        def _json(self, code, obj):
-            data = json.dumps(obj, default=str).encode()
+        def _json(self, code, obj, etag=None, raw_bytes=None):
+            data = raw_bytes if raw_bytes is not None else json.dumps(obj, default=str).encode()
+            use_gzip = len(data) > 4096 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+            if use_gzip:
+                data = gzip.compress(data, compresslevel=1)
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
+                if use_gzip:
+                    self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Vary", "Accept-Encoding")
+                if etag:
+                    self.send_header("ETag", etag)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
@@ -1844,7 +1854,21 @@ def make_handler(hub):
                         ids = {a["id"] for a in view["agents"]}
                         view["accounts"] = [{**x, "agents": [i for i in x.get("agents", []) if i in ids]}
                                             for x in view.get("accounts", [])]
-                    return 200, view
+                    ts = view.pop("ts", None) or now()
+                    rest = json.dumps(view, default=str).encode()
+                    etag = '"' + hashlib.blake2b(rest, digest_size=12).hexdigest() + '"'
+                    if (self.headers.get("If-None-Match") or "").strip() == etag:
+                        try:
+                            self.send_response(304)
+                            self.send_header("ETag", etag)
+                            self.send_header("Cache-Control", "no-store")
+                            self.end_headers()
+                        except (BrokenPipeError, ConnectionResetError):
+                            self.close_connection = True
+                        return None
+                    tail = (b"," + rest[1:]) if len(rest) > 2 else b"}"
+                    self._json(200, None, etag=etag, raw_bytes=b'{"ts":' + json.dumps(ts).encode() + tail)
+                    return None
                 if path == "/api/notifications":
                     return 200, hub.notifications()
                 if path == "/api/setup":

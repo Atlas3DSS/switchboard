@@ -48,6 +48,7 @@ class Screen:
         self._state, self._seq = GROUND, ""
         self.title = ""  # last window title (OSC 0/2); the built-in agent reports busy/idle through it
         self._osc = ""
+        self.rev = 0
         self._reset()
 
     # ----------------------------------------------------------------- public API
@@ -60,6 +61,7 @@ class Screen:
             data = self._decoder.decode(bytes(data))
         if data:
             self._parse(data)
+            self.rev += 1
 
     def lines(self, dim=True):
         out = []
@@ -104,6 +106,7 @@ class Screen:
         self.top, self.bot = 0, rows - 1
         self.x, self.y = min(self.x, cols - 1), max(0, min(self.y, rows - 1))
         self.wrap = False
+        self.rev += 1
 
     # ----------------------------------------------------------------- state helpers
     def _blank(self):

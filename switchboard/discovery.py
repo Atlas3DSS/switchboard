@@ -331,25 +331,34 @@ def transcript_path(provider, sid, account=None):
     return None
 
 
+_rollout_meta_cache = {}  # path -> (ino, mtime_ns, meta)
+
+
 def recent_codex_rollouts(days=7):
     """[(mtime, path, meta)] for rollouts touched recently, newest first."""
     cutoff = time.time() - days * 86400
     out = []
     for path in glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl")):
         try:
-            m = os.path.getmtime(path)
+            st = os.stat(path)
         except OSError:
             continue
+        m = st.st_mtime
         if m < cutoff:
             continue
-        meta = {}
-        try:
-            with open(path, errors="replace") as f:
-                first = json.loads(f.readline())
-            if first.get("type") == "session_meta":
-                meta = first.get("payload") or {}
-        except (OSError, ValueError):
-            pass
+        cached = _rollout_meta_cache.get(path)
+        if cached and cached[0] == st.st_ino and (cached[2] or cached[1] == st.st_mtime_ns):
+            meta = cached[2]
+        else:
+            meta = {}
+            try:
+                with open(path, errors="replace") as f:
+                    first = json.loads(f.readline())
+                if first.get("type") == "session_meta":
+                    meta = first.get("payload") or {}
+            except (OSError, ValueError):
+                pass
+            _rollout_meta_cache[path] = (st.st_ino, st.st_mtime_ns, meta)
         out.append((m, path, meta))
     out.sort(key=lambda t: -t[0])
     return out
