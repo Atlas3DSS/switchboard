@@ -836,8 +836,24 @@ function agentRow() {
     },
   };
 }
+const PIN_SVG = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 2.5h5l-.8 4.2 2.3 2v1.3H4V8.7l2.3-2-.8-4.2zM8 10v4"/></svg>';
+async function toggleProjectPin(pid, on) {
+  const p = S.projects.get(pid);
+  const res = await api('PATCH', `/projects/${enc(pid)}`, { pinned: on });
+  if (p) p.pinned = !!(res && res.pinned);
+  toast(`${on ? 'Pinned' : 'Unpinned'} ${(p && p.name) || pid}`);
+  tick();
+}
 function projectCard(p0) {
   const pid = p0.id;
+  const pinBtn = h('button', { class: 'pin-btn', type: 'button', 'aria-pressed': 'false' });
+  pinBtn.innerHTML = PIN_SVG;
+  pinBtn.hidden = pid === 'unsorted';
+  pinBtn.addEventListener('click', async (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const p = S.projects.get(pid);
+    try { await toggleProjectPin(pid, !(p && p.pinned)); } catch (err) { toast(err.message, 'err'); }
+  });
   const name = h('a', { class: 'pc-name', href: '#/p/' + enc(pid) });
   const flags = h('span', { class: 'pc-flags' });
   const last = h('span', { class: 'pc-last' });
@@ -882,7 +898,7 @@ function projectCard(p0) {
     catch (err) { toast(err.message, 'err'); }
   });
   const el = h('article', { class: 'pcard' },
-    h('div', { class: 'pc-head' }, name, flags, h('span', { class: 'spacer' }), last),
+    h('div', { class: 'pc-head' }, pinBtn, name, flags, h('span', { class: 'spacer' }), last),
     goal, nodeBox, agBox, none, h('div', { class: 'pc-foot' }, addBtn));
   el.addEventListener('click', (e) => {
     if (e.target.closest('a,button,input,select,textarea,form,label')) return;
@@ -892,6 +908,10 @@ function projectCard(p0) {
   return {
     el,
     update(p) {
+      const pinned = !!p.pinned;
+      pinBtn.classList.toggle('on', pinned);
+      setAttr(pinBtn, 'aria-pressed', pinned ? 'true' : 'false');
+      setAttr(pinBtn, 'title', pinned ? 'Pinned to top — click to unpin' : 'Pin project to top');
       setText(name, p.name || p.id);
       setText(flags, [p.paused && 'paused', p.outside_read && 'reads out', p.outside_write && 'writes out', p.stale && 'quiet', p.archived && 'archived'].filter(Boolean).join(' · '));
       setText(last, ago(p.last_activity)); setAttr(last, 'title', absTime(p.last_activity));
@@ -909,7 +929,7 @@ function projectCard(p0) {
       setText(addBtn, `Fold ${addBtn._extras.length} outside the seats`); addBtn.hidden = !addBtn._extras.length;
       const list = projectAgents(pid);
       ags.sync(list); none.hidden = list.length > 0;
-      setCls(el, 'pcard' + (list.some((a) => a.state === 'busy') ? ' busy' : '') + (p.archived ? ' arch' : ''));
+      setCls(el, 'pcard' + (list.some((a) => a.state === 'busy') ? ' busy' : '') + (pinned ? ' pinned' : '') + (p.archived ? ' arch' : ''));
     },
   };
 }
@@ -953,8 +973,9 @@ function workRow(w0) {
   return { el, update(w) { cur = w; render(); } };
 }
 function projectOptions(sel, first) {
-  const ps = [...S.projects.values()].filter((p) => !p.archived && p.id !== 'unsorted').sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
-  const sig = ps.map((p) => p.id + '=' + p.name).join('|');
+  const ps = [...S.projects.values()].filter((p) => !p.archived && p.id !== 'unsorted')
+    .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (a.name || a.id).localeCompare(b.name || b.id));
+  const sig = ps.map((p) => p.id + '=' + p.name + ':' + (p.pinned ? 1 : 0)).join('|');
   if (sel.dataset.sig === sig) return;
   const keep = sel.value;
   sel.replaceChildren(h('option', { value: '', text: first }), ...ps.map((p) => h('option', { value: p.id, text: p.name || p.id })));
@@ -1337,7 +1358,9 @@ function overviewView() {
     pOk.disabled = true;
     try {
       const p = await api('POST', '/projects', { name: n });
-      toast('Created ' + (p.name || p.id)); closeAdd(); tick();
+      toast('Created ' + (p.name || p.id)); closeAdd();
+      await tick();
+      location.hash = '#/p/' + enc(p.id);
     } catch (err) { toast(err.message, 'err'); } finally { pOk.disabled = false; }
   });
   const noProj = h('p', { class: 'muted small', text: 'No projects yet. "+ Project" makes one (with its own folder in your workspace); then "+ Agent" on its card starts an agent there.' });
@@ -1359,7 +1382,7 @@ function overviewView() {
       pools.sync(S.accounts);
       const ps = [...S.projects.values()];
       const act = (p) => -(parseTime(p.last_activity) || 0);
-      cards.sync(ps.filter((p) => !p.archived).sort((a, b) => act(a) - act(b)));
+      cards.sync(ps.filter((p) => !p.archived).sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || act(a) - act(b)));
       noProj.hidden = ps.some((p) => !p.archived);
       const ar = ps.filter((p) => p.archived);
       archCards.sync(ar); setText(archN, ar.length); arch.hidden = !ar.length;
@@ -1908,6 +1931,14 @@ function projectView(pid, initialAgent) {
   let showLim = lsGet('sb.lim') !== '0';
   function save() { lsSet('sb.panes.' + pid, JSON.stringify({ n: count, picks, f: focus })); }
 
+  const pinBtn = h('button', { class: 'pin-btn pv-pin', type: 'button', 'aria-pressed': 'false' });
+  pinBtn.innerHTML = PIN_SVG;
+  pinBtn.hidden = pid === 'unsorted';
+  guarded(pinBtn, async () => {
+    const p = S.projects.get(pid);
+    await toggleProjectPin(pid, !(p && p.pinned));
+    v.update();
+  });
   const name = h('h1', { class: 'pv-name' });
   const goal = h('div', { class: 'pv-goal' });
   const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Panes' }, h('span', { class: 'seg-l', text: 'panes' }),
@@ -1992,7 +2023,7 @@ function projectView(pid, initialAgent) {
   const srcSec = h('section', { class: 'side-sec' }, h('div', { class: 'side-h' }, h('h2', { text: 'Sources' }), h('span', { class: 'spacer' }), srcRefresh), srcBox, srcEmpty);
   const side = h('aside', { class: 'side' }, shareSec, limSec, srcSec);
   const el = h('div', { class: 'pv' },
-    h('div', { class: 'pv-head' }, h('a', { class: 'back', href: '#/', text: '← Projects', title: 'Back to all projects' }), name, goal,
+    h('div', { class: 'pv-head' }, h('a', { class: 'back', href: '#/', text: '← Projects', title: 'Back to all projects' }), pinBtn, name, goal,
       h('span', { class: 'spacer' }), seg, addBtn, summonBtn, shellBtn, outRead, outWrite, teamBtn, insBtn, memFilesBtn, shareBtn, limBtn, srcBtn, killBtn),
     form.el, summonForm,
     h('div', { class: 'pv-bar' }, tabsBox, h('span', { class: 'spacer' }), ctl.el),
@@ -2149,6 +2180,10 @@ function projectView(pid, initialAgent) {
         const g = [p.goal, p.next_step && 'Next: ' + p.next_step].filter(Boolean).join(' · ');
         setText(goal, g); setAttr(goal, 'title', [p.goal, p.next_step && 'Next: ' + p.next_step, p.status_note].filter(Boolean).join('\n'));
       }
+      const pinned = !!(p && p.pinned);
+      pinBtn.classList.toggle('on', pinned);
+      setAttr(pinBtn, 'aria-pressed', pinned ? 'true' : 'false');
+      setAttr(pinBtn, 'title', pinned ? 'Pinned to top of Projects — click to unpin' : 'Pin project to top of Projects');
       for (const [btn, key, verb] of [[outRead, 'outside_read', 'read'], [outWrite, 'outside_write', 'write']]) {
         const on = !!(p && p[key]);
         setAttr(btn, 'aria-pressed', on ? 'true' : 'false');

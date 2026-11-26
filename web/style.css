@@ -165,9 +165,18 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
   padding: 9px 12px 10px; cursor: pointer; min-width: 0; display: flex; flex-direction: column; gap: 5px;
 }
 .pcard:hover { border-color: #b6cf93; }
+.pcard.pinned { border-color: rgba(134, 194, 50, .45); }
 .pcard.busy { box-shadow: inset 3px 0 0 #86c232, var(--shadow); }
 .pcard.arch { opacity: .75; }
-.pc-head { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.pc-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pin-btn {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 22px; height: 22px; padding: 0; border-radius: 5px; border: 1px solid transparent;
+  background: none; color: var(--muted); opacity: .45; cursor: pointer;
+}
+.pcard:hover .pin-btn, .pin-btn:hover, .pv-pin { opacity: .85; }
+.pin-btn:hover { border-color: #86c232; color: var(--ink); opacity: 1; }
+.pin-btn.on { background: #86c232; border-color: #86c232; color: #222629; opacity: 1; }
 .pc-name { font-weight: 650; font-size: 15px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pc-flags { font-size: 11.5px; color: var(--warn); }
 .pc-last { font-size: 11.5px; color: var(--muted); white-space: nowrap; }

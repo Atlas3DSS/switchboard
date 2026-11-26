@@ -267,6 +267,20 @@ class MarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             nodes.set_mark(self.h, "alpha", "lead", "nobody")
 
+    def test_project_pin_persists_and_orders_pinned_first(self):
+        self.h.s.upsert_project({"id": "zebra", "name": "Zebra"})
+        self.assertFalse(self.h.s.project("zebra")["pinned"])
+        self.h.s.upsert_project({"id": "zebra", "pinned": True})
+        self.assertTrue(self.h.s.project("zebra")["pinned"])
+        self.h.s.upsert_project({"id": "zebra", "goal": "keep pin"})
+        self.assertTrue(self.h.s.project("zebra")["pinned"])
+        ids = [p["id"] for p in self.h.s.projects()]
+        self.assertEqual(ids[0], "zebra")
+        pv = self.h.project_view(self.h.s.project("zebra"), [])
+        self.assertTrue(pv["pinned"])
+        self.h.s.upsert_project({"id": "zebra", "pinned": False})
+        self.assertFalse(self.h.s.project("zebra")["pinned"])
+
 
 if __name__ == "__main__":
     unittest.main()

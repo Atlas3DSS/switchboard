@@ -152,18 +152,49 @@ def trust(cwd, d=None):
     return True
 
 
-def new_session(cwd, since, taken=(), d=None):
-    """The newest unclaimed conversation whose prompt was typed in cwd since launch (history.jsonl)."""
-    real, taken = os.path.realpath(cwd), set(taken or ())
+_hist_cache = {}  # path -> (mtime_ns, size, parsed_rows_newest_first)
+_HIST_TAIL_BYTES = 512 << 10  # last 512 KB of history.jsonl easily holds >500 recent prompts
+
+
+def _history_rows(d=None, limit=500):
+    """Newest-first parsed JSON rows from the tail of history.jsonl, cached by (mtime_ns, size)."""
+    path = os.path.join(home(d), "history.jsonl")
     try:
-        lines = open(os.path.join(home(d), "history.jsonl"), errors="replace").read().splitlines()[-500:]
+        st = os.stat(path)
     except OSError:
-        return None
-    for line in reversed(lines):
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _hist_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1][:limit]
+    try:
+        with open(path, "rb") as f:
+            if st.st_size > _HIST_TAIL_BYTES:
+                f.seek(st.st_size - _HIST_TAIL_BYTES)
+                f.readline()  # discard partial first line
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    rows = []
+    for line in reversed(raw.splitlines()):
+        if not line:
+            continue
         try:
             r = json.loads(line)
         except ValueError:
             continue
+        if isinstance(r, dict):
+            rows.append(r)
+        if len(rows) >= 600:
+            break
+    _hist_cache[path] = (key, rows)
+    return rows[:limit]
+
+
+def new_session(cwd, since, taken=(), d=None):
+    """The newest unclaimed conversation whose prompt was typed in cwd since launch (history.jsonl)."""
+    real, taken = os.path.realpath(cwd), set(taken or ())
+    for r in _history_rows(d, 500):
         cid, ws = r.get("conversationId"), r.get("workspace") or ""
         if not cid or cid in taken or (r.get("timestamp") or 0) / 1000 < (since or 0) - 5:
             continue
@@ -189,16 +220,7 @@ def follow_session(cwd, current_sid, screen_text="", since=0, taken=(), d=None):
                 cur_mtime = os.path.getmtime(cur_p)
             except OSError:
                 pass
-    try:
-        with open(os.path.join(home(d), "history.jsonl"), errors="replace") as f:
-            lines = f.read().splitlines()[-200:]
-    except OSError:
-        return None
-    for line in reversed(lines):
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
+    for r in _history_rows(d, 200):
         cid, ws = r.get("conversationId"), r.get("workspace") or ""
         ts_s = (r.get("timestamp") or 0) / 1000
         if not cid or ts_s < (since or 0) - 5:
@@ -272,6 +294,38 @@ def entries(line):
     return []
 
 
+_TAIL_BLOCK = 256 << 10
+
+
+def _reverse_lines(path, max_bytes=32 << 20):
+    """Yield non-empty transcript lines newest-first in bounded chunks from EOF (never loads whole 30+ MB files)."""
+    if not path:
+        return
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            stop = max(0, pos - max_bytes)
+            tail = b""
+            while pos > stop:
+                step = min(_TAIL_BLOCK, pos - stop)
+                pos -= step
+                f.seek(pos)
+                chunk = f.read(step) + tail
+                lines = chunk.split(b"\n")
+                tail = lines.pop(0) if pos > 0 else b""
+                for raw in reversed(lines):
+                    s = raw.strip()
+                    if s:
+                        yield s.decode("utf-8", "replace")
+                if pos == 0 and tail:
+                    s = tail.strip()
+                    if s:
+                        yield s.decode("utf-8", "replace")
+    except (OSError, TypeError):
+        return
+
+
 def _lines(path):
     try:
         with open(path, errors="replace") as f:
@@ -281,13 +335,40 @@ def _lines(path):
 
 
 def lines_newest_first(path, limit=5000):
-    return list(reversed(_lines(path)))[:limit]
+    out = []
+    for line in _reverse_lines(path):
+        out.append(line)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def read_chat(path, limit=40, before=None, after=None):
-    """Same shape and paging as hermes.read_chat: ids are line_no * 8 + part."""
+    """Same shape and paging as hermes.read_chat: ids are byte-or-line offsets."""
     limit = max(1, min(int(limit), 400))
     before, after = (int(before) if before is not None else None), (int(after) if after is not None else None)
+    if before is None and after is None:
+        try:
+            size = os.path.getsize(path) if path else 0
+        except OSError:
+            size = 0
+        if size > (1 << 20):
+            collected = []
+            for idx, line in enumerate(_reverse_lines(path), start=1):
+                ents = entries(line)
+                for k in range(len(ents) - 1, -1, -1):
+                    role, text, ts, imgs = ents[k]
+                    collected.append({"id": (size - idx) * 8 + k, "role": role, "text": text[:TEXT_CAP],
+                                      "ts": ts, "n_images": imgs})
+                    if len(collected) >= limit + 1:
+                        break
+                if len(collected) >= limit + 1:
+                    break
+            collected.reverse()
+            has_more = len(collected) > limit
+            out = collected[-limit:]
+            return {"entries": out, "before": None if not has_more else out[0]["id"],
+                    "latest": out[-1]["id"] if out else None}
     rows = []
     for n, line in enumerate(_lines(path), start=1):
         for k, (role, text, ts, imgs) in enumerate(entries(line)):
@@ -304,10 +385,20 @@ def read_chat(path, limit=40, before=None, after=None):
 
 
 def last_reply(path):
-    for e in reversed(read_chat(path, 40)["entries"]):
-        if e["role"] == "assistant":
-            return e["text"], e["ts"]
-    return "", None
+    """Newest user-facing assistant reply from the tail of transcript.jsonl (reads backwards from EOF)."""
+    parts, ts = [], None
+    for line in _reverse_lines(path):
+        for role, text, et, _ in reversed(entries(line)):
+            if role == "assistant":
+                if ts is None:
+                    ts = et
+                if text:
+                    parts.append(text[:TEXT_CAP])
+            elif parts:
+                return "\n\n".join(reversed(parts))[:TEXT_CAP], ts
+    if not parts:
+        return "", None
+    return "\n\n".join(reversed(parts))[:TEXT_CAP], ts
 
 
 def last_model(path):

@@ -242,6 +242,8 @@ class Hub:
         antigravity.NO_XHIGH.update(self.s.setting("agy_no_xhigh", []) or [])  # models the API refused XHigh for
         self.source_cache = {}
         self._model_checked = {}  # agent id -> (transcript, size) last read for its model
+        self._reply_checked = {}  # agent id -> (path, size, mtime_ns) last read for last_reply
+        self._usage_checked = {}  # agent id -> (path, size, mtime_ns, checked_at) last read for usage_stats
         self.stop_flag = threading.Event()
         self.seed()
         self.ensure_project_dirs()
@@ -862,22 +864,28 @@ class Hub:
         hosts.retry_pending_halt(self)
 
     def refresh_replies(self):
-        """Newest assistant message per agent, straight from its transcript (both modes)."""
+        """Newest assistant message per agent, straight from its transcript (both modes). Skips unchanged files."""
         for a in self.s.agents():
             if not a["session_id"]:
                 continue
             path = discovery.transcript_path(a["provider"], a["session_id"])
             if not path:
                 continue
+            try:
+                st = os.stat(path)
+                fsig = (path, st.st_size, st.st_mtime_ns)
+            except OSError:
+                fsig = None  # hermes: not a file; check each pass
+            if fsig is not None and self._reply_checked.get(a["id"]) == fsig:
+                continue
             text, ts = transcript.last_reply(path, a["provider"])
+            if fsig is not None:
+                self._reply_checked[a["id"]] = fsig
             if ts and ts != a.get("last_reply_at"):
                 self.s.set_agent(a["id"], last_reply_at=ts, last_text=text[-400:])
             # /model inside the terminal: look again whenever the transcript grows, since the switch itself
             # writes no reply and the tag (and any relaunch's --model) must follow it at once
-            try:
-                sig = (path, os.path.getsize(path))
-            except OSError:
-                sig = (path, ts)  # hermes: not a file; follow its replies
+            sig = (path, fsig[1]) if fsig is not None else (path, ts)
             if self._model_checked.get(a["id"]) != sig and a["mode"] == "terminal" and a.get("role") != "desk":
                 self._model_checked[a["id"]] = sig
                 m = discovery.last_model(path, a["provider"])
@@ -900,14 +908,25 @@ class Hub:
         return v
 
     def refresh_usage(self):
-        since = time.time() - 86400
+        now_t = time.time()
+        since = now_t - 86400
         for a in self.s.agents():
             if not a["session_id"]:
                 continue
             path = discovery.transcript_path(a["provider"], a["session_id"])
             if not path:
                 continue
+            try:
+                st = os.stat(path)
+                fsig = (path, st.st_size, st.st_mtime_ns)
+            except OSError:
+                fsig = None
+            prev_u = self._usage_checked.get(a["id"])
+            if fsig is not None and prev_u and prev_u[:3] == fsig and now_t - prev_u[3] < 600:
+                continue  # unchanged transcript: avoid re-scanning large logs every 30s (still rolls 24h every 10m)
             u = transcript.usage_stats(path, a["provider"], since)
+            if fsig is not None:
+                self._usage_checked[a["id"]] = (*fsig, now_t)
             upd = {"context_tokens": u["context_tokens"], "context_window": u["context_window"],
                    "tokens_24h": u["tokens_24h"]}
             prev = json.loads(a.get("last_turn") or "null")
@@ -935,21 +954,26 @@ class Hub:
         hosts.retry_pending_halt(self)
 
     # ---------- views ----------
-    def lead_of(self, pid):
-        p = self.s.project(pid) if pid else None
-        if p and p.get("lead") and (self.s.agent(p["lead"]) or {}).get("gone") is False:
-            return p["lead"]
+    def lead_of(self, pid, proj=None, agents=None, seat_info=None, stored_all=None):
+        p = proj if proj is not None else (self.s.project(pid) if pid else None)
+        by_id = {a["id"]: a for a in agents} if agents is not None else None
+        if p and p.get("lead"):
+            la = by_id.get(p["lead"]) if by_id is not None else self.s.agent(p["lead"])
+            if la and la.get("gone") is False:
+                return p["lead"]
         if p:  # the project's Lead Opus seat (switchboard/nodes.py), when an agent holds it
-            seat = next((s["agent"] for s in nodes.seats(self, pid)["seats"] if s["role"] == "lead"), None)
+            st = seat_info if seat_info is not None else nodes.seats(self, pid, agents=agents, stored_all=stored_all, proj=p)
+            seat = next((s["agent"] for s in st["seats"] if s["role"] == "lead"), None)
             if seat:
                 return seat
         # no lead set: the most recently used agent of the project's highest model class answers for it, so a
         # message addressed to the project always lands (an unpaused agent before a paused one)
-        mine = [a for a in self.s.agents() if a["project"] == pid and not a.get("gone") and a["provider"] != "shell"
+        pool = agents if agents is not None else self.s.agents()
+        mine = [a for a in pool if a["project"] == pid and not a.get("gone") and a["provider"] != "shell"
                 and a.get("role") not in ("desk", "helper") and a.get("mode") != "observed" and not a.get("ghost")]
         if not mine:
             return None
-        held = nodes.reserved(self, pid)  # an agent the owner holds in reserve answers only when nobody else is there
+        held = set(((stored_all or {}).get(pid) or {}).get(nodes.RESERVE) or ()) if stored_all is not None else nodes.reserved(self, pid)
         mine = [a for a in mine if a["id"] not in held] or mine
         cls = lambda a: helpers.rank(a.get("model")) or (3 if a["provider"] != "claude" else 0)
         return max(mine, key=lambda a: (not a.get("paused"), cls(a), a.get("last_activity") or "",
@@ -995,37 +1019,57 @@ class Hub:
         order = {aid: i for i, aid in enumerate(self.tab_order(pid))}
         return sorted(agents, key=lambda a: (order.get(a["id"], len(order)), 0))
 
-    def project_view(self, p, agents):
+    def project_view(self, p, agents, lead=..., seat_info=None, open_dec=None):
         agents = self.ordered(p["id"], agents)
         srcs = self.source_cache.get(p["id"], [])
         times = [epoch(x["mtime"]) for x in srcs if x.get("mtime") and x.get("kind") != "cmd"]
         times += [epoch(a["last_activity"]) for a in agents if a["last_activity"]]
         last = max(times) if times else 0
-        open_dec = len(self.s.decisions(p["id"], open_only=True))
+        if open_dec is None:
+            open_dec = len(self.s.decisions(p["id"], open_only=True))
+        st = seat_info if seat_info is not None else nodes.seats(self, p["id"])
         return {"id": p["id"], "name": p["name"], "goal": p["goal"], "next_step": p["next_step"],
-                "paused": bool(p.get("paused")), "reads": p.get("reads") or [],
+                "paused": bool(p.get("paused")), "pinned": bool(p.get("pinned")), "reads": p.get("reads") or [],
                 "outside_read": bool(p.get("outside_read")), "outside_write": bool(p.get("outside_write")),
                 "status_note": p["status_note"], "archived": p["archived"], "updated_at": p["updated_at"],
                 "last_activity": iso_from_epoch(last) if last else None,
                 "stale": bool(last) and time.time() - last > STALE_S and not p["archived"],
-                "agent_ids": [a["id"] for a in agents], "open_decisions": open_dec, "lead": self.lead_of(p["id"]),
-                **(lambda st: {"nodes": st["seats"], "node_extras": [x["agent"] for x in st["extras"] if not x["illustrator"]]})(nodes.seats(self, p["id"])),
+                "agent_ids": [a["id"] for a in agents], "open_decisions": open_dec,
+                "lead": self.lead_of(p["id"]) if lead is ... else lead,
+                "nodes": st["seats"], "node_extras": [x["agent"] for x in st["extras"] if not x["illustrator"]],
                 "cwd": self.project_dir(p),
                 "sources": p.get("sources") or []}
 
     def overview(self):
         raw = self.s.agents()
-        leads = {p["id"]: self.lead_of(p["id"]) for p in self.s.projects()}
-        marks = {pid: nodes.marks(self, pid, lead=lead) for pid, lead in leads.items()}
+        projs = self.s.projects()
+        stored_all = self.s.setting(nodes.SETTING, {}) or {}
+        def_prov = nodes.default_provider(self)
+        now_t = time.time()
+        by_proj = {}
+        for a in raw:
+            by_proj.setdefault(a["project"], []).append(a)
+        seats_map = {p["id"]: nodes.seats(self, p["id"], now=now_t, agents=by_proj.get(p["id"], ()),
+                                          stored_all=stored_all, proj=p, def_prov=def_prov) for p in projs}
+        leads = {p["id"]: self.lead_of(p["id"], proj=p, agents=by_proj.get(p["id"], ()),
+                                       seat_info=seats_map[p["id"]], stored_all=stored_all) for p in projs}
+        marks = {p["id"]: nodes.marks(self, p["id"], st=seats_map[p["id"]], lead=leads[p["id"]],
+                                      proj=p, stored_all=stored_all) for p in projs}
         agents = [self.agent_view(a, leads, marks) for a in raw]
-        projects = []
-        for p in self.s.projects():
-            mine = [a for a in agents if a["project"] == p["id"]]
-            projects.append(self.project_view(p, mine))
+        open_decs = self.s.decisions(open_only=True)
+        dec_counts = {}
+        for d in open_decs:
+            dec_counts[d.get("project")] = dec_counts.get(d.get("project"), 0) + 1
+        ag_by_proj = {}
+        for a in agents:
+            ag_by_proj.setdefault(a["project"], []).append(a)
+        projects = [self.project_view(p, ag_by_proj.get(p["id"], ()), lead=leads[p["id"]],
+                                      seat_info=seats_map[p["id"]], open_dec=dec_counts.get(p["id"], 0)) for p in projs]
         if any(a["project"] == "unsorted" for a in agents) and not self.s.project("unsorted"):
             projects.append({"id": "unsorted", "name": "Unsorted sessions", "goal": "Sessions not matched to a project",
-                             "next_step": "", "status_note": "", "archived": False, "paused": False, "updated_at": None,
-                             "last_activity": None, "stale": False, "open_decisions": 0, "sources": [], "lead": None,
+                             "next_step": "", "status_note": "", "archived": False, "paused": False, "pinned": False,
+                             "updated_at": None, "last_activity": None, "stale": False, "open_decisions": 0,
+                             "sources": [], "lead": None,
                              "agent_ids": [a["id"] for a in agents if a["project"] == "unsorted"]})
         use = accounts.usage()  # limits, when a usage cache exists (switchboard/accounts.py)
         accts = [{**{k: x[k] for k in ("name", "kind", "label", "model", "auth")},
@@ -1036,7 +1080,7 @@ class Hub:
                 "started_at": iso_from_epoch(STARTED_AT)}
         work = fleet.work_list(self, status="all")["items"]
         return {"ts": now(), "code": code, "router": None, "setup_needed": not config.configured(), "focus": self.focus, "projects": projects, "agents": agents, "accounts": accts,
-                "fleet": hosts.summary(self), "inbox": inbox.badge(self), "decisions": self.s.decisions(open_only=True),
+                "fleet": hosts.summary(self), "inbox": inbox.badge(self), "decisions": open_decs,
                 "work": [w for w in work if w["open"]] + [w for w in work if not w["open"]][:30]}
 
     def pending_messages(self, aid):
@@ -2408,7 +2452,7 @@ def make_handler(hub):
                     if "tab_order" in b:
                         hub.set_tab_order(m.group(1), b["tab_order"])
                     allowed = {k: b[k] for k in ("name", "goal", "next_step", "status_note", "sources", "archived", "paused",
-                                                 "lead") if k in b}
+                                                 "pinned", "lead") if k in b}
                     if allowed.get("lead"):
                         la = hub.s.agent(allowed["lead"])
                         if not la or la["project"] != m.group(1):

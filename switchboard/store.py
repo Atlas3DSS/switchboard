@@ -19,7 +19,7 @@ IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, goal TEXT DEFAULT '', next_step TEXT DEFAULT '',
-  status_note TEXT DEFAULT '', archived INTEGER DEFAULT 0, sources TEXT DEFAULT '[]',
+  status_note TEXT DEFAULT '', archived INTEGER DEFAULT 0, pinned INTEGER DEFAULT 0, sources TEXT DEFAULT '[]',
   match TEXT DEFAULT '{}', updated_at TEXT);
 CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY, project TEXT, title TEXT, provider TEXT, account TEXT, model TEXT,
@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS messages (
   turn_id TEXT,
   pid INTEGER, created_at TEXT, delivered_at TEXT, finished_at TEXT, reply TEXT, error TEXT);
 CREATE INDEX IF NOT EXISTS messages_to_state ON messages(to_agent, state);
+CREATE INDEX IF NOT EXISTS messages_state ON messages(state, to_agent);
+CREATE INDEX IF NOT EXISTS agents_gone ON agents(gone, project);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT, ts TEXT, kind TEXT, text TEXT, turn_id TEXT);
 CREATE INDEX IF NOT EXISTS events_agent ON events(agent, id);
@@ -56,6 +58,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   exit_code INTEGER, created_at TEXT, started_at TEXT, finished_at TEXT, last_seen TEXT, host_pref TEXT, stopped_by TEXT,
   board_id TEXT, cpus TEXT, protected INTEGER DEFAULT 0, lane TEXT, placer TEXT);
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state, host);
+CREATE INDEX IF NOT EXISTS jobs_board ON jobs(board_id);
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, project TEXT, agent TEXT, question TEXT, options TEXT DEFAULT '[]',
   state TEXT DEFAULT 'open', answer TEXT, created_at TEXT, answered_at TEXT);
@@ -74,6 +77,9 @@ CREATE TABLE IF NOT EXISTS memory_sessions (
   first_ask TEXT, last_ask TEXT, last_said TEXT, last_tail TEXT, summary TEXT, note TEXT, in_tokens INTEGER, out_tokens INTEGER,
   cost_usd REAL, created_at TEXT, done_at TEXT);
 CREATE INDEX IF NOT EXISTS memory_sessions_project ON memory_sessions(project, id);
+CREATE INDEX IF NOT EXISTS memory_sessions_state ON memory_sessions(state, id);
+CREATE INDEX IF NOT EXISTS memory_sessions_agent ON memory_sessions(agent, project, id);
+CREATE INDEX IF NOT EXISTS memory_sessions_sid ON memory_sessions(session_id, id);
 CREATE TABLE IF NOT EXISTS memory_versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, text TEXT, written_at TEXT, replaced_at TEXT, replaced_by TEXT);
 CREATE INDEX IF NOT EXISTS memory_versions_project ON memory_versions(project, id);
@@ -141,6 +147,8 @@ class Store:
         pcols = {r[1] for r in self.db.execute("PRAGMA table_info(projects)")}
         if "paused" not in pcols:
             self.db.execute("ALTER TABLE projects ADD COLUMN paused INTEGER DEFAULT 0")
+        if "pinned" not in pcols:
+            self.db.execute("ALTER TABLE projects ADD COLUMN pinned INTEGER DEFAULT 0")
         if "lead" not in pcols:
             self.db.execute("ALTER TABLE projects ADD COLUMN lead TEXT")
         if "reads" not in pcols:  # projects the owner lets this one read (switchboard/shared.py read grants)
@@ -226,29 +234,30 @@ class Store:
             r["reads"] = json.loads(r.get("reads") or "[]")
             r["archived"] = bool(r["archived"])
             r["paused"] = bool(r.get("paused"))
+            r["pinned"] = bool(r.get("pinned"))
             r["outside_read"] = bool(r.get("outside_read"))
             r["outside_write"] = bool(r.get("outside_write"))
         return r
 
     def projects(self):
-        return [self.project(r["id"]) for r in self.q("SELECT id FROM projects ORDER BY archived, name")]
+        return [self.project(r["id"]) for r in self.q("SELECT id FROM projects ORDER BY archived, pinned DESC, name")]
 
     def upsert_project(self, p, overwrite=True):
         cur = self.project(p["id"])
         if cur and not overwrite:
             return cur
-        merged = dict(cur or {"goal": "", "next_step": "", "status_note": "", "archived": False,
+        merged = dict(cur or {"goal": "", "next_step": "", "status_note": "", "archived": False, "pinned": False,
                               "sources": [], "match": {}})
         merged.update({k: v for k, v in p.items() if v is not None})
-        self.x("""INSERT INTO projects(id,name,goal,next_step,status_note,archived,sources,match,updated_at,paused,lead)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, goal=excluded.goal,
+        self.x("""INSERT INTO projects(id,name,goal,next_step,status_note,archived,pinned,sources,match,updated_at,paused,lead)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, goal=excluded.goal,
                   next_step=excluded.next_step, status_note=excluded.status_note, archived=excluded.archived,
-                  sources=excluded.sources, match=excluded.match, updated_at=excluded.updated_at,
+                  pinned=excluded.pinned, sources=excluded.sources, match=excluded.match, updated_at=excluded.updated_at,
                   paused=excluded.paused, lead=excluded.lead""",
                (merged["id"], merged.get("name") or merged["id"], merged.get("goal", ""), merged.get("next_step", ""),
-                merged.get("status_note", ""), int(bool(merged.get("archived"))), json.dumps(merged.get("sources", [])),
-                json.dumps(merged.get("match", {})), now(), int(bool(merged.get("paused"))),
-                merged.get("lead") or None))
+                merged.get("status_note", ""), int(bool(merged.get("archived"))), int(bool(merged.get("pinned"))),
+                json.dumps(merged.get("sources", [])), json.dumps(merged.get("match", {})), now(),
+                int(bool(merged.get("paused"))), merged.get("lead") or None))
         return self.project(merged["id"])
 
     def set_reads(self, pid, reads):

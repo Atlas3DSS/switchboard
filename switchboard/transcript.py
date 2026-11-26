@@ -222,6 +222,9 @@ def read_chat(path, provider, limit=40, before=None, after=None):
 
 def last_reply(path, provider):
     """(text, ts) of the newest user-facing assistant reply from the transcript tail (joining split trailing text blocks)."""
+    if provider == "antigravity" and path:
+        from . import antigravity
+        return antigravity.last_reply(path)
     r = read_chat(path, provider, limit=40)
     parts, ts = [], None
     for ent in reversed(r["entries"]):

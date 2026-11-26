@@ -164,11 +164,12 @@ def _usable(a):
         and a.get("mode") != "observed" and not a.get("ghost")
 
 
-def seats(hub, pid, now=None):
+def seats(hub, pid, now=None, agents=None, stored_all=None, proj=None, def_prov=...):
     """The three model seats of a project, each with who fills it and whether that session would be inherited."""
     now = now or time.time()
-    stored = _stored(hub, pid)
-    mine = {a["id"]: a for a in hub.s.agents() if a["project"] == pid and _usable(a)}
+    stored = (stored_all.get(pid) or {}) if stored_all is not None else _stored(hub, pid)
+    pool = agents if agents is not None else hub.s.agents()
+    mine = {a["id"]: a for a in pool if a["project"] == pid and _usable(a)}
     recent = lambda a: (a.get("last_activity") or "", a.get("created_at") or "")
     taken, picked = set(), {}
 
@@ -193,18 +194,23 @@ def seats(hub, pid, now=None):
 
     for role in SEATS:  # the owner's own choices first
         give(role, (stored.get(role) or {}).get("agent"), share=role in ("lead", "architect"))
-    give("lead", (hub.s.project(pid) or {}).get("lead"), share=True)  # the lead set on the project card
+    p = proj if proj is not None else hub.s.project(pid)
+    give("lead", (p or {}).get("lead"), share=True)  # the lead set on the project card
     for role, want in (("architect", "architect"), ("lead", "lead"), ("tasker", "small"), ("janitor", "small")):
         fit = [a for a in mine.values() if a["id"] not in taken and a["id"] not in held_back and a["id"] != illus
                and kind(a) == want]
         if fit:
             give(role, max(fit, key=recent)["id"])
+    base_prov = default_provider(hub) if def_prov is ... else def_prov
     out = []
     for role in SEATS:
         d, cfg, a = ROLES[role], stored.get(role) or {}, mine.get(picked.get(role))
         idle_h = (now - epoch(a["last_activity"])) / 3600 if a and a.get("last_activity") else None
         state = "empty" if not a else "live" if idle_h is not None and idle_h <= INHERIT_HOURS else "stale"
-        dprov, dmodel = seat_default(hub, role)
+        if base_prov and base_prov != d["provider"] and PROVIDERS[base_prov]["models"].get(role):
+            dprov, dmodel = base_prov, PROVIDERS[base_prov]["models"][role]
+        else:
+            dprov, dmodel = d["provider"], d["model"]
         out.append({"role": role, "title": seat_title(role, cfg.get("model") or dmodel),
                     "provider": cfg.get("provider") or dprov,
                     "model": cfg.get("model") or dmodel, "default_model": dmodel,
@@ -219,16 +225,18 @@ def seats(hub, pid, now=None):
                "reserve": a["id"] in held_back, "illustrator": a["id"] == illus}
               for a in sorted(mine.values(), key=recent, reverse=True) if a["id"] not in taken]
     return {"project": pid, "seats": out, "extras": extras, "illustrator": illus, "inherit_hours": INHERIT_HOURS,
-            "default_provider": default_provider(hub)}
+            "default_provider": base_prov}
 
 
-def marks(hub, pid, st=None, lead=...):
+def marks(hub, pid, st=None, lead=..., proj=None, stored_all=None):
     """Per agent, the marks the owner sees on its pane: lead (where a message to the project lands), architect and
     illustrator. 'on' is the owner's own choice; 'auto' is one the hub made because nobody was chosen."""
-    p = hub.s.project(pid)
+    p = proj if proj is not None else hub.s.project(pid)
     if not p:
         return {}
-    st, stored, out = st or seats(hub, pid), _stored(hub, pid), {}
+    st = st or seats(hub, pid, proj=p, stored_all=stored_all)
+    stored = (stored_all.get(pid) or {}) if stored_all is not None else _stored(hub, pid)
+    out = {}
     lead = hub.lead_of(pid) if lead is ... else lead
     if lead:
         pinned = p.get("lead") == lead or (stored.get("lead") or {}).get("agent") == lead
