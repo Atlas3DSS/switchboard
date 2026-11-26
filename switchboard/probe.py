@@ -95,7 +95,20 @@ def _num(s):
         return None
 
 
+def _nvidia_smi_wedged():
+    """True when an existing nvidia-smi is stuck in uninterruptible D-state (e.g. WSL /dev/dxg deadlock):
+    spawning another would hang forever behind misc_open and leak another unkillable process."""
+    for p in glob.glob("/proc/[0-9]*/stat"):
+        s = read(p)
+        if "(nvidia-smi) D " in s:
+            return True
+    return False
+
+
 def gpus():
+    if _nvidia_smi_wedged():
+        ERRORS.append("nvidia-smi: wedged in D-state (GPU driver hung; skipped to avoid piling up processes)")
+        return []
     rc, out = run(["nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,"
                    "temperature.gpu,display_active", "--format=csv,noheader,nounits"], 12)
     if rc != 0 or not (out or "").strip():
